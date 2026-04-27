@@ -1,0 +1,129 @@
+# PenguinCAM-config.yaml
+# STEPCRAFT D.600 + UCCNC
+# Conservative starter profile for FTC-style flat plates.
+# Units in this file are inches / IPM unless PenguinCAM states otherwise.
+
+version: 2
+default_machine: stepcraft_d600
+
+team:
+  number: 0
+  name: "STEPCRAFT D600"
+
+machines:
+  stepcraft_d600:
+    name: "STEPCRAFT D.600"
+    machine:
+      name: "STEPCRAFT D.600"
+      manufacturer: "STEPCRAFT"
+      model: "D.600"
+      controller: "UCCNC"
+
+      # STEPCRAFT 600 working travel: 420 x 600 x 140 mm
+      # Converted to inches: 16.54 x 23.62 x 5.51
+      dimensions:
+        x_max: 16.54
+        y_max: 23.62
+        z_max: 5.51
+
+      park_position:
+        x: 0.5
+        y: 0.5
+        z: -0.5
+
+      standard_work_offset: "G54"
+      tube_jig_work_offset: "G55"
+      coolant: "None"
+
+    default_tool:
+      diameter: 0.0625   # 1/16 inch end mill
+
+    machining:
+      z_reference:
+        sacrifice_board_depth: 0.005
+        clearance_height: 0.250
+
+      tabs:
+        enabled: true
+        width: 0.20
+        height: 0.05
+        remove_tabs: false
+
+      holes:
+        detection_tolerance: 0.001
+        min_millable_multiplier: 1.20
+
+      fixturing:
+        pause_before_perimeter: true
+
+    tube_facing:
+      depth_margin: 0.003
+      max_roughing_depth: 0.040
+      max_finishing_depth: 0.060
+      phase_1:
+        roughing_tool_edge: 0.020
+        finishing_tool_edge: 0.030
+      phase_2:
+        roughing_tool_edge: -0.005
+        finishing_tool_edge: 0.000
+      arc_advance: 0.020
+      arc_radius: 0.030
+
+    materials:
+      polycarbonate:
+        name: "Polycarbonate"
+        description: "Conservative STEPCRAFT D.600 profile for 1/8 in FTC plates"
+        spindle_speed: 14000
+        feed_rate: 24.0
+        ramp_feed_rate: 16.0
+        plunge_rate: 6.0
+        traverse_rate: 90.0
+        approach_rate: 15.0
+        ramp_angle: 8.0
+        ramp_start_clearance: 0.060
+        stepover_percentage: 0.35
+        helix_radius_multiplier: 0.60
+        max_slotting_depth: 0.040
+        peck_drill_depth: 0.040
+        tab_width: 0.20
+        tab_height: 0.05
+
+      plywood:
+        name: "Plywood"
+        description: "Conservative STEPCRAFT D.600 plywood profile"
+        spindle_speed: 16000
+        feed_rate: 35.0
+        ramp_feed_rate: 22.0
+        plunge_rate: 10.0
+        traverse_rate: 90.0
+        approach_rate: 18.0
+        ramp_angle: 10.0
+        ramp_start_clearance: 0.100
+        stepover_percentage: 0.45
+        helix_radius_multiplier: 0.60
+        max_slotting_depth: 0.080
+        peck_drill_depth: 0.050
+        tab_width: 0.20
+        tab_height: 0.06
+
+      aluminum:
+        name: "Aluminum"
+        description: "Very conservative STEPCRAFT D.600 aluminum profile"
+        spindle_speed: 12000
+        feed_rate: 12.0
+        ramp_feed_rate: 8.0
+        plunge_rate: 4.0
+        traverse_rate: 70.0
+        approach_rate: 10.0
+        ramp_angle: 3.0
+        ramp_start_clearance: 0.040
+        stepover_percentage: 0.20
+        helix_radius_multiplier: 0.45
+        max_slotting_depth: 0.025
+        peck_drill_depth: 0.030
+        tab_width: 0.20
+        tab_height: 0.05
+
+    integrations:
+      google_drive:
+        enabled: false

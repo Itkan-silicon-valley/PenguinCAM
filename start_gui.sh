@@ -83,6 +83,9 @@ echo ""
 echo "=========================================="
 echo ""
 
+export PENGUINCAM_LOCAL_MODE=1
+export PENGUINCAM_CONFIG="${PENGUINCAM_CONFIG:-yaml/PenguinCAM-config.yaml}"
+
 # Function to cleanup on exit
 cleanup() {
     echo ""

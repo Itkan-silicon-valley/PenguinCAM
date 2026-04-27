@@ -326,41 +326,41 @@ penguincam/
 
 ### Local Testing
 
-We use [uv](https://docs.astral.sh/uv/) for fast Python dependency management. This works well with git worktrees since packages are cached globally.
+Use [Pixi](https://pixi.sh/) for a reproducible local environment across macOS, Linux, and Windows. The Pixi server task starts PenguinCAM in manual DXF upload mode and loads `yaml/PenguinCAM-config.yaml`.
 
 1. **Clone repository:**
    ```bash
-   git clone https://github.com/your-team/penguincam.git
+   git clone https://github.com/Itkan-silicon-valley/PenguinCAM.git
    cd penguincam
    ```
 
-2. **Install dependencies:**
+2. **Install Pixi** (if needed):
    ```bash
-   make install
+   curl -fsSL https://pixi.sh/install.sh | sh
    ```
-   This installs `uv` if needed, creates a `.venv`, and installs all dependencies.
-
-3. **Run G-code tests:**
-   ```bash
-   make test
+   On Windows PowerShell:
+   ```powershell
+   powershell -ExecutionPolicy Bypass -c "irm -useb https://pixi.sh/install.ps1 | iex"
    ```
 
-4. **Set environment variables** (for running the web app):
+3. **Launch the local server:**
    ```bash
-   export GOOGLE_CLIENT_ID=your-client-id
-   export GOOGLE_CLIENT_SECRET=your-secret
-   export ONSHAPE_CLIENT_ID=your-onshape-id
-   export ONSHAPE_CLIENT_SECRET=your-onshape-secret
+   pixi run server
+   ```
+
+4. **Visit:** http://localhost:6238
+
+5. **Upload files from your laptop:**
+   Drag and drop a `.dxf` file into the upload area. Local mode uses `yaml/PenguinCAM-config.yaml` for machine bounds, feeds/speeds, and controller settings.
+
+For direct Python development, `uv` is still supported:
+   ```bash
+   export PENGUINCAM_LOCAL_MODE=1
+   export PENGUINCAM_CONFIG=yaml/PenguinCAM-config.yaml
    export BASE_URL=http://localhost:6238
-   export AUTH_ENABLED=false  # Skip auth for local testing
-   ```
-
-5. **Run locally:**
-   ```bash
+   export AUTH_ENABLED=false  # Skip Google auth for local testing
    uv run python frc_cam_gui_app.py
    ```
-
-6. **Visit:** http://localhost:6238
 
 ### Deployment
 

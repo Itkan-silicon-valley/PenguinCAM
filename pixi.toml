@@ -1,0 +1,28 @@
+[workspace]
+name = "penguincam"
+version = "0.1.0"
+description = "PenguinCAM local development environment"
+channels = ["conda-forge"]
+platforms = ["osx-arm64", "osx-64", "linux-64", "win-64"]
+
+[dependencies]
+python = ">=3.10,<3.13"
+
+[pypi-dependencies]
+ezdxf = ">=1.0.0"
+shapely = ">=2.0.0"
+Flask = "==3.0.0"
+flask-limiter = ">=4.0.0"
+PyYAML = ">=6.0"
+requests = "==2.31.0"
+gunicorn = "==21.2.0"
+google-auth = "==2.23.0"
+google-auth-oauthlib = "==1.1.0"
+google-auth-httplib2 = "==0.1.1"
+google-api-python-client = "==2.100.0"
+pygcode = ">=0.2.0"
+termcolor = ">=2.0.0"
+
+[tasks.server]
+cmd = "python frc_cam_gui_app.py"
+env = { PENGUINCAM_LOCAL_MODE = "1", PENGUINCAM_CONFIG = "yaml/PenguinCAM-config.yaml", BASE_URL = "http://localhost:6238", AUTH_ENABLED = "false" }

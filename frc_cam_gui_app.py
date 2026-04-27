@@ -269,10 +269,73 @@ os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 # Path to the post-processor script (assumed to be in same directory)
 SCRIPT_DIR = Path(__file__).parent
 POST_PROCESSOR = SCRIPT_DIR / 'frc_cam_postprocessor.py'
+DEFAULT_LOCAL_CONFIG_PATH = SCRIPT_DIR / 'yaml' / 'PenguinCAM-config.yaml'
 
 # ============================================================================
 # Helper Functions
 # ============================================================================
+
+def env_flag(name, default=False):
+    """Return True when an environment variable is set to a truthy value."""
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.lower() in ('1', 'true', 'yes', 'on')
+
+def is_local_mode():
+    """Local mode allows manual laptop DXF uploads without Onshape OAuth."""
+    return env_flag('PENGUINCAM_LOCAL_MODE', False)
+
+def get_local_config_path():
+    """Return the local YAML config path, allowing env override."""
+    configured_path = os.environ.get('PENGUINCAM_CONFIG')
+    if not configured_path:
+        return DEFAULT_LOCAL_CONFIG_PATH
+
+    path = Path(configured_path)
+    if not path.is_absolute():
+        path = SCRIPT_DIR / path
+    return path
+
+def load_local_team_config_into_session():
+    """
+    Load the local YAML config for standalone localhost/manual-upload usage.
+
+    This keeps hosted Onshape behavior unchanged while letting local runs use
+    yaml/PenguinCAM-config.yaml without storing it in Onshape.
+    """
+    if not is_local_mode():
+        return False
+
+    config_path = get_local_config_path()
+    if not config_path.exists():
+        if not session.get('team_config_data'):
+            team_config = TeamConfig()
+            session['team_config_data'] = {}
+            session['team_config'] = team_config.to_dict()
+            session['team_number'] = team_config.team_number
+            session['using_default_config'] = True
+        log(f"⚠️  Local config not found at {config_path}; using defaults")
+        return False
+
+    try:
+        config_yaml = config_path.read_text()
+        team_config = TeamConfig.from_yaml(config_yaml)
+        session['team_config_data'] = team_config._data
+        session['team_config'] = team_config.to_dict()
+        session['team_number'] = team_config.team_number
+        session['team_name'] = team_config.team_name
+        session['using_default_config'] = False
+        log(f"✅ Local config loaded: {team_config.team_name} (#{team_config.team_number}) from {config_path}")
+        return True
+    except Exception as e:
+        team_config = TeamConfig()
+        session['team_config_data'] = {}
+        session['team_config'] = team_config.to_dict()
+        session['team_number'] = team_config.team_number
+        session['using_default_config'] = True
+        log(f"⚠️  Failed to load local config from {config_path}: {e}; using defaults")
+        return False
 
 def get_current_user_id():
     """Get the current user ID from session"""
@@ -404,13 +467,15 @@ def index():
     # TO MAKE APP WIDE OPEN (allow anonymous browser access):
     # Simply comment out or remove the code block below (lines until "End gate")
     # ========================================================================
-    if ONSHAPE_AVAILABLE:
+    if ONSHAPE_AVAILABLE and not is_local_mode():
         user_id = get_current_user_id()
         client = session_manager.get_client(user_id)
         if not client:
             # No Onshape session - redirect to OAuth
             log("⛔ Access denied: No Onshape authentication, redirecting to /onshape/auth")
             return redirect('/onshape/auth')
+    elif is_local_mode():
+        load_local_team_config_into_session()
     # ========================================================================
     # End authentication gate
     # ========================================================================
@@ -470,6 +535,9 @@ def index():
 def process_file():
     """Process uploaded DXF file and generate G-code"""
     try:
+        if is_local_mode() and not session.get('team_config_data'):
+            load_local_team_config_into_session()
+
         # Get uploaded file
         if 'file' not in request.files:
             return jsonify({'error': 'No file uploaded'}), 400
@@ -2083,6 +2151,9 @@ if not IS_SERVERLESS:
     atexit.register(cleanup)
 
 if __name__ == '__main__':
+    # Direct script execution is intended for local/manual DXF upload workflows.
+    os.environ.setdefault('PENGUINCAM_LOCAL_MODE', '1')
+
     # Get port from environment variable (Railway) or default to 6238 for local dev
     port = int(os.environ.get('PORT', 6238))
     
