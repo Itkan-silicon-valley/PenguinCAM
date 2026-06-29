@@ -1733,5 +1733,340 @@ class TestConcentricCircleDepths(unittest.TestCase):
                 os.remove(dxf_path)
 
 
+class TestSimplePartFundamentals(unittest.TestCase):
+    """End-to-end coverage of the basics on a plain plate: the sacrifice-board Z
+    convention, perimeter tabs, and origin-corner translation."""
+
+    def _square_pp(self, size=4.0, thickness=0.25, tool=0.157):
+        pp = FRCPostProcessor(thickness, tool)
+        pp.apply_material_preset('plywood')
+        pp.circles = []
+        pp.lines = []
+        pp.arcs = []
+        pp.splines = []
+        pp.polylines = [[(0.0, 0.0), (size, 0.0), (size, size), (0.0, size), (0.0, 0.0)]]
+        return pp
+
+    @staticmethod
+    def _motion_axis_values(gcode, axis):
+        """Extract work-coordinate values for an axis from G0/G1/G2/G3 motion lines,
+        skipping G53 machine-coordinate moves and inline/standalone comments."""
+        import re
+        values = []
+        for line in gcode.split('\n'):
+            code = line.split(';', 1)[0]
+            code = re.sub(r'\([^)]*\)', '', code).strip()
+            if not code or 'G53' in code:
+                continue
+            if not re.match(r'^\s*G[0123]\b', code):
+                continue
+            m = re.search(axis + r'(-?\d+\.?\d*)', code)
+            if m:
+                values.append(float(m.group(1)))
+        return values
+
+    @classmethod
+    def _z_values(cls, gcode):
+        return cls._motion_axis_values(gcode, 'Z')
+
+    def test_z_coordinate_convention(self):
+        """Z=0 at sacrifice board: cut depth negative, material top = thickness,
+        safe/retract height = thickness + clearance, and the G-code stays within
+        [cut_depth, retract_height]."""
+        pp = self._square_pp(thickness=0.25)
+        pp.tabs_enabled = False
+        pp.transform_coordinates('bottom-left', 0)
+        pp.identify_perimeter_and_pockets()
+        pp.classify_holes()
+        result = pp.generate_gcode()
+        self.assertTrue(result.success, f"Generation should succeed: {result.errors}")
+
+        self.assertAlmostEqual(pp.material_top, 0.25, places=4)
+        self.assertAlmostEqual(pp.cut_depth, -pp.sacrifice_board_depth, places=4)
+        self.assertAlmostEqual(pp.retract_height, 0.25 + pp.clearance_height, places=4)
+
+        zs = self._z_values(result.gcode)
+        self.assertTrue(zs, "G-code should contain Z moves")
+        # Deepest cut reaches the sacrifice board; nothing rises above the safe height.
+        self.assertAlmostEqual(min(zs), pp.cut_depth, places=3,
+                               msg="Deepest Z should reach the cut depth")
+        self.assertLessEqual(max(zs), pp.retract_height + 1e-6,
+                             "No Z move should exceed the retract/safe height")
+
+    def test_perimeter_tabs_left_at_tab_height(self):
+        """With tabs enabled, the perimeter cut lifts to cut_depth + tab_height to
+        leave holding tabs."""
+        pp = self._square_pp(thickness=0.25)
+        pp.tabs_enabled = True
+        pp.transform_coordinates('bottom-left', 0)
+        pp.identify_perimeter_and_pockets()
+        pp.classify_holes()
+        result = pp.generate_gcode()
+        self.assertTrue(result.success, f"Generation should succeed: {result.errors}")
+
+        expected_tab_z = pp.cut_depth + pp.tab_height
+        zs = self._z_values(result.gcode)
+        self.assertTrue(
+            any(abs(z - expected_tab_z) < 1e-3 for z in zs),
+            f"Expected a tab-height Z near {expected_tab_z:.4f} in the perimeter cut")
+
+    def test_origin_corner_translation(self):
+        """Selecting the bottom-right corner maps that corner to (0,0): all X<=0, Y>=0."""
+        pp = self._square_pp(size=4.0)
+        # Shift the square away from origin so the translation is observable.
+        pp.polylines = [[(2.0, 2.0), (6.0, 2.0), (6.0, 6.0), (2.0, 6.0), (2.0, 2.0)]]
+        pp.tabs_enabled = False
+        pp.transform_coordinates('bottom-right', 0)
+        pp.identify_perimeter_and_pockets()
+        pp.classify_holes()
+        result = pp.generate_gcode()
+        self.assertTrue(result.success, f"Generation should succeed: {result.errors}")
+
+        xs = self._motion_axis_values(result.gcode, 'X')
+        self.assertTrue(xs, "G-code should contain X moves")
+        # Bottom-right corner at origin -> part lies to the left (X<=0, within tool clearance).
+        self.assertLessEqual(max(xs), pp.tool_diameter,
+                             "Bottom-right origin should place the part at X<=0 (+tool offset)")
+
+
+class TestMultiTier25D(unittest.TestCase):
+    """Three stacked rectangular pockets at decreasing depths. Each layer should
+    machine only its own frame (current minus the next-deeper region); the shallow
+    layer must avoid the innermost region while the innermost layer machines it."""
+
+    def _create_dxf(self, filename, layers):
+        import ezdxf
+        doc = ezdxf.new('R2010')
+        msp = doc.modelspace()
+        for name, rects in layers.items():
+            if name not in doc.layers:
+                doc.layers.new(name=name)
+            for (x, y, w, h) in rects:
+                pts = [(x, y), (x + w, y), (x + w, y + h), (x, y + h)]
+                hatch = msp.add_hatch(color=7, dxfattribs={'layer': name})
+                hatch.paths.add_polyline_path(pts + [pts[0]], is_closed=True)
+        doc.saveas(filename)
+
+    def test_three_tier_nested_pockets(self):
+        import tempfile
+        import re
+        with tempfile.NamedTemporaryFile(suffix='.dxf', delete=False) as f:
+            dxf_path = f.name
+        try:
+            # 6x6x0.5 plate; concentric pockets at Z=0.375, 0.250, 0.125.
+            self._create_dxf(dxf_path, {
+                'Z_0p500': [(0, 0, 6, 6)],
+                'Z_0p375': [(1.0, 1.0, 4.0, 4.0)],   # outer pocket
+                'Z_0p250': [(1.5, 1.5, 3.0, 3.0)],   # mid pocket
+                'Z_0p125': [(2.0, 2.0, 2.0, 2.0)],   # inner pocket
+                'Z_0p000': [(0, 0, 6, 6)],
+            })
+            pp = FRCPostProcessor(material_thickness=0.5, tool_diameter=0.125)
+            pp.apply_material_preset('plywood')
+            pp.load_dxf(dxf_path)
+            pp.transform_coordinates('bottom-left', 0)
+            result = pp.generate_gcode()
+            self.assertTrue(result.success, f"Generation should succeed: {result.errors}")
+
+            lines = result.gcode.split('\n')
+
+            def cut_points_in_layer(layer_marker):
+                start = end = None
+                for i, line in enumerate(lines):
+                    if f'LAYER: {layer_marker}' in line:
+                        start = i
+                    elif start is not None and i > start and ('===== LAYER:' in line or 'PERIMETER' in line):
+                        end = i
+                        break
+                section = lines[start:end] if start is not None else []
+                pts = []
+                for line in section:
+                    if re.match(r'^\s*G[123]\b', line):
+                        xm = re.search(r'X(-?\d+\.?\d*)', line)
+                        ym = re.search(r'Y(-?\d+\.?\d*)', line)
+                        if xm and ym:
+                            pts.append((float(xm.group(1)), float(ym.group(1))))
+                return pts
+
+            from shapely.geometry import Point, box
+            inner_2x2 = box(2.0, 2.0, 4.0, 4.0)
+
+            shallow_pts = cut_points_in_layer('Z_0p375')
+            self.assertGreater(len(shallow_pts), 0, "Shallow layer should machine its frame")
+            for (px, py) in shallow_pts:
+                self.assertFalse(inner_2x2.contains(Point(px, py)),
+                                 f"Shallow-layer cut ({px:.3f},{py:.3f}) entered the inner region")
+
+            inner_pts = cut_points_in_layer('Z_0p125')
+            self.assertTrue(
+                any(inner_2x2.buffer(-pp.tool_radius).contains(Point(px, py)) for px, py in inner_pts),
+                "Innermost layer should machine inside the 2x2 pocket")
+        finally:
+            if os.path.exists(dxf_path):
+                os.remove(dxf_path)
+
+
+class TestIslandBosses(unittest.TestCase):
+    """2.5D parts with raised bosses (islands) fully enclosed by a shallower pocket.
+
+    These guard the N-boundary nesting fix in _convert_to_shapely_polygons: a pocket
+    face whose HATCH carries multiple interior boundaries (one per boss) must become a
+    single polygon-with-holes, so the boss footprints are preserved as no-go islands
+    rather than flattened into overlapping solids and machined through.
+    """
+
+    PLATE_W = 6.0
+    PLATE_H = 4.0
+    PLATE_THICKNESS = 0.5
+    POCKET_DEPTH = 0.15
+    TOOL_DIAMETER = 0.125
+
+    # Pocket and bosses (all at the pocket-floor layer)
+    POCKET = (0.5, 0.5, 5.0, 3.0)              # x, y, w, h
+    BOSS_1 = (1.5, 1.5, 1.0, 1.0)
+    BOSS_2 = (3.5, 1.5, 1.0, 1.0)
+
+    def _create_island_dxf(self, filename, boss_rects):
+        """Create a multilayer DXF mirroring the production solid-HATCH format:
+        a full-plate bottom face and top surface, plus a pocket-floor layer whose
+        HATCH has the pocket as its exterior boundary and each boss as a flags=0
+        interior hole."""
+        import ezdxf
+
+        def rect_coords(r):
+            x, y, w, h = r
+            return [(x, y), (x + w, y), (x + w, y + h), (x, y + h)]
+
+        doc = ezdxf.new('R2010')
+        msp = doc.modelspace()
+        for name in ('Z_0p500', 'Z_0p150', 'Z_0p000'):
+            if name not in doc.layers:
+                doc.layers.new(name=name)
+
+        plate = rect_coords((0, 0, self.PLATE_W, self.PLATE_H))
+        for name in ('Z_0p500', 'Z_0p000'):
+            h = msp.add_hatch(color=7, dxfattribs={'layer': name})
+            h.paths.add_polyline_path(plate + [plate[0]], is_closed=True)
+
+        pocket = rect_coords(self.POCKET)
+        h = msp.add_hatch(color=7, dxfattribs={'layer': 'Z_0p150'})
+        h.paths.add_polyline_path(pocket + [pocket[0]], is_closed=True)
+        for boss in boss_rects:
+            bc = rect_coords(boss)
+            h.paths.add_polyline_path(bc + [bc[0]], is_closed=True, flags=0)
+
+        doc.saveas(filename)
+
+    def _make_pp(self):
+        config = TeamConfig()
+        pp = FRCPostProcessor(
+            material_thickness=self.PLATE_THICKNESS,
+            tool_diameter=self.TOOL_DIAMETER,
+            config=config,
+        )
+        pp.apply_material_preset('plywood')
+        return pp
+
+    def _pocket_layer_cut_points(self, gcode):
+        """Return (x, y) of every cutting move (G1/G2/G3) in the pocket-floor section."""
+        import re
+        lines = gcode.split('\n')
+        start = end = None
+        for i, line in enumerate(lines):
+            if 'LAYER: Z_0p150' in line:
+                start = i
+            elif start is not None and ('===== LAYER:' in line or 'PERIMETER' in line) and i > start:
+                end = i
+                break
+        section = lines[start:end] if start is not None else []
+        pts = []
+        cut_re = re.compile(r'^\s*G[123]\b')
+        x_re = re.compile(r'X(-?\d+\.?\d*)')
+        y_re = re.compile(r'Y(-?\d+\.?\d*)')
+        for line in section:
+            if not cut_re.match(line):
+                continue
+            xm, ym = x_re.search(line), y_re.search(line)
+            if xm and ym:
+                pts.append((float(xm.group(1)), float(ym.group(1))))
+        return pts
+
+    def test_convert_polygons_nests_multiple_islands(self):
+        """Pocket polyline + two boss polylines -> one polygon with two interior holes."""
+        pp = self._make_pp()
+        pocket = [(0.5, 0.5), (5.5, 0.5), (5.5, 3.5), (0.5, 3.5)]
+        boss1 = [(1.5, 1.5), (2.5, 1.5), (2.5, 2.5), (1.5, 2.5)]
+        boss2 = [(3.5, 1.5), (4.5, 1.5), (4.5, 2.5), (3.5, 2.5)]
+        polys = pp._convert_to_shapely_polygons([], [pocket, boss1, boss2])
+        self.assertEqual(len(polys), 1, "Three nested loops should yield one polygon")
+        self.assertEqual(len(polys[0].interiors), 2, "Both bosses should be interior holes")
+        self.assertAlmostEqual(polys[0].area, 5.0 * 3.0 - 2 * 1.0, places=3)
+
+    def test_two_bosses_machined_as_island_aware_pocket(self):
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix='.dxf', delete=False) as f:
+            dxf_path = f.name
+        try:
+            self._create_island_dxf(dxf_path, [self.BOSS_1, self.BOSS_2])
+            pp = self._make_pp()
+            pp.load_dxf(dxf_path)
+            pp.transform_coordinates('bottom-left', 0)
+            result = pp.generate_gcode()
+
+            self.assertTrue(result.success, f"Generation should succeed: {result.errors}")
+            self.assertIn('islands', result.gcode.lower(),
+                          "Pocket with bosses should be machined island-aware")
+        finally:
+            if os.path.exists(dxf_path):
+                os.remove(dxf_path)
+
+    def test_toolpath_avoids_boss_footprints(self):
+        """The pocket-floor toolpath must never enter either boss footprint."""
+        import tempfile
+        from shapely.geometry import Point, box
+        with tempfile.NamedTemporaryFile(suffix='.dxf', delete=False) as f:
+            dxf_path = f.name
+        try:
+            self._create_island_dxf(dxf_path, [self.BOSS_1, self.BOSS_2])
+            pp = self._make_pp()
+            pp.load_dxf(dxf_path)
+            pp.transform_coordinates('bottom-left', 0)
+            result = pp.generate_gcode()
+            self.assertTrue(result.success, f"Generation should succeed: {result.errors}")
+
+            boss_polys = []
+            for (x, y, w, h) in (self.BOSS_1, self.BOSS_2):
+                boss_polys.append(box(x, y, x + w, y + h))
+
+            pts = self._pocket_layer_cut_points(result.gcode)
+            self.assertGreater(len(pts), 0, "Should have cutting moves at the pocket layer")
+            for (px, py) in pts:
+                p = Point(px, py)
+                for i, bp in enumerate(boss_polys):
+                    self.assertFalse(
+                        bp.contains(p),
+                        f"Cutting move ({px:.3f}, {py:.3f}) entered boss {i + 1} footprint")
+        finally:
+            if os.path.exists(dxf_path):
+                os.remove(dxf_path)
+
+    def test_single_boss_still_preserved(self):
+        """Regression: a single boss (the old 2-loop path) still nests correctly."""
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix='.dxf', delete=False) as f:
+            dxf_path = f.name
+        try:
+            self._create_island_dxf(dxf_path, [self.BOSS_1])
+            pp = self._make_pp()
+            pp.load_dxf(dxf_path)
+            pp.transform_coordinates('bottom-left', 0)
+            result = pp.generate_gcode()
+            self.assertTrue(result.success, f"Generation should succeed: {result.errors}")
+            self.assertIn('islands', result.gcode.lower())
+        finally:
+            if os.path.exists(dxf_path):
+                os.remove(dxf_path)
+
+
 if __name__ == '__main__':
     unittest.main()

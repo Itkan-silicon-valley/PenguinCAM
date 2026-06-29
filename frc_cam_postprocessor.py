@@ -1365,7 +1365,7 @@ class FRCPostProcessor:
             gcode.append("(===== HOLES =====)")
 
             # Get pocket contouring threshold from config (applies to circular holes too)
-            contour_threshold = self.config._get('machining', 'pockets', 'contour_threshold', default=50)
+            contour_threshold = self.config._get('machining', 'pockets', 'contour_threshold', default=510)
 
             # Check if this is a through-cut (to sacrifice board)
             # Only contour through-cuts; partial-depth features must be fully cleared
@@ -1444,7 +1444,7 @@ class FRCPostProcessor:
             gcode.append("(===== POCKETS =====)")
 
             # Get pocket contouring threshold from config
-            contour_threshold = self.config._get('machining', 'pockets', 'contour_threshold', default=50)
+            contour_threshold = self.config._get('machining', 'pockets', 'contour_threshold', default=510)
 
             # Check if this is a through-cut (to sacrifice board)
             # Only contour through-cuts; partial-depth features must be fully cleared
@@ -1719,6 +1719,9 @@ class FRCPostProcessor:
             List of Shapely Polygon objects (may have interior holes)
         """
         polygons = []
+        # Simple (single-loop) shapes that still need containment/nesting resolution.
+        # Concentric-circle rings are resolved directly into `polygons` below.
+        simple_polys = []
 
         # Detect concentric circles (same center, different radii)
         # These should become ring polygons (donut shapes with holes)
@@ -1752,9 +1755,11 @@ class FRCPostProcessor:
 
             # Create polygon(s) from this group
             if len(concentric_group) == 1:
-                # Single circle - simple filled polygon
+                # Single circle - simple filled polygon.
+                # Defer to nesting so a circle that sits inside a polygonal pocket
+                # (or vice versa) becomes an island/hole rather than an overlapping solid.
                 poly = Point(center1).buffer(radius1)
-                polygons.append(poly)
+                simple_polys.append(poly)
             else:
                 # Multiple concentric circles - create ring with holes
                 # Sort by radius (largest first)
@@ -1779,42 +1784,105 @@ class FRCPostProcessor:
                     polygons.append(ring_poly)
                     print(f"      Detected concentric circles: outer r={outer_circle['radius']:.3f}\", {len(holes)} inner hole(s)")
 
-        # Convert polylines to polygons
-        # Special handling: if we have exactly 2 polylines and one is inside the other,
-        # create a polygon with a hole (e.g., from HATCH with island)
-        if len(polylines) == 2:
-            try:
-                poly1 = Polygon(polylines[0])
-                poly2 = Polygon(polylines[1])
-
-                if poly1.is_valid and poly2.is_valid:
-                    # Check if one contains the other
-                    if poly1.contains(poly2):
-                        # poly1 is outer, poly2 is inner hole
-                        poly_with_hole = Polygon(polylines[0], holes=[polylines[1]])
-                        if poly_with_hole.is_valid:
-                            polygons.append(poly_with_hole)
-                            return polygons
-                    elif poly2.contains(poly1):
-                        # poly2 is outer, poly1 is inner hole
-                        poly_with_hole = Polygon(polylines[1], holes=[polylines[0]])
-                        if poly_with_hole.is_valid:
-                            polygons.append(poly_with_hole)
-                            return polygons
-            except:
-                pass
-
-        # Default: treat each polyline as separate polygon
+        # Add polyline loops to the simple-shape pool.
         for polyline in polylines:
             if len(polyline) >= 3:
                 try:
                     poly = Polygon(polyline)
-                    if poly.is_valid:
-                        polygons.append(poly)
-                except:
+                    if poly.is_valid and not poly.is_empty:
+                        simple_polys.append(poly)
+                except Exception:
                     pass
 
+        # Resolve containment across all simple loops at once: an enclosed loop
+        # becomes an interior hole of its parent, and a loop enclosed by a hole
+        # becomes a solid island. Handles HATCH faces with any number of boundaries
+        # (e.g. a pocket containing two raised bosses), which the old 2-loop
+        # special case flattened into overlapping solids.
+        polygons.extend(self._nest_polygons(simple_polys))
+
         return polygons
+
+    def _nest_polygons(self, polys):
+        """Resolve a flat list of single-loop polygons into solids-with-holes using
+        even/odd containment depth.
+
+        Loops at even nesting depth (0, 2, ...) are solid regions; loops at odd
+        depth are holes in their enclosing solid. A solid's holes are its direct
+        children; grandchildren (islands within a hole) are emitted as their own
+        solids. Falls back to treating a loop as a separate solid if its nested
+        construction is invalid.
+
+        Args:
+            polys: list of valid Shapely Polygons (exterior loops only)
+
+        Returns:
+            List of Shapely Polygons, some carrying interior holes.
+        """
+        candidates = [p for p in polys if p is not None and p.is_valid and not p.is_empty]
+        if not candidates:
+            return []
+
+        # Largest first so a polygon's potential parents are already indexed.
+        candidates.sort(key=lambda p: p.area, reverse=True)
+
+        n = len(candidates)
+        parent = [None] * n  # index of immediate (smallest) enclosing polygon
+        for i in range(n):
+            inner = candidates[i]
+            # representative_point is guaranteed inside the polygon, robust for containment
+            probe = inner.representative_point()
+            best_parent = None
+            best_area = None
+            for j in range(n):
+                if j == i:
+                    continue
+                outer = candidates[j]
+                if outer.area <= inner.area:
+                    continue
+                if outer.contains(probe):
+                    if best_area is None or outer.area < best_area:
+                        best_area = outer.area
+                        best_parent = j
+            parent[i] = best_parent
+
+        # Nesting depth = number of ancestors.
+        def depth_of(idx):
+            d = 0
+            cur = parent[idx]
+            while cur is not None:
+                d += 1
+                cur = parent[cur]
+            return d
+
+        depth = [depth_of(i) for i in range(n)]
+
+        results = []
+        for i in range(n):
+            if depth[i] % 2 != 0:
+                # Odd depth -> this loop is a hole, consumed by its even-depth parent.
+                continue
+            # Even depth -> solid. Its holes are direct children (odd depth).
+            hole_rings = [
+                list(candidates[c].exterior.coords)
+                for c in range(n)
+                if parent[c] == i
+            ]
+            exterior = list(candidates[i].exterior.coords)
+            if hole_rings:
+                try:
+                    solid = Polygon(exterior, holes=hole_rings)
+                    if solid.is_valid and not solid.is_empty:
+                        results.append(solid)
+                        continue
+                except Exception:
+                    pass
+                # Fallback: emit the exterior solid without holes rather than lose it.
+                results.append(Polygon(exterior))
+            else:
+                results.append(candidates[i])
+
+        return results
 
     def _geometries_to_shapely(self, circles, polylines):
         """Convert circles and polylines to shapely geometries"""
