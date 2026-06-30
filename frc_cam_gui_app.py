@@ -525,15 +525,13 @@ def wizard_app():
                            onshape_ctx={}, **_app_template_context())
 
 
-@app.route('/onshape-panel')
-def onshape_panel():
-    """Multi-part wizard, embedded in the Onshape right-side panel (iframe). Same
-    template/JS as /app, with the Onshape selection source. Sets framing + cookie
-    headers so the iframe and its OAuth/session work inside Onshape.
+def _serve_onshape_panel():
+    """Render the multi-part wizard for embedding in the Onshape right-side panel.
 
     Does NOT hard-redirect to OAuth when unauthenticated (the iframe cannot frame
     Onshape's login). Instead it passes an `authenticated` flag and the wizard shows
-    a Connect button that runs OAuth in a popup."""
+    a Connect button that runs OAuth in a popup. Sets framing + cookie headers so the
+    iframe and its OAuth/session work inside Onshape."""
     onshape_ctx = {
         'documentId': request.args.get('documentId', ''),
         'workspaceId': request.args.get('workspaceId', ''),
@@ -549,6 +547,12 @@ def onshape_panel():
     resp.headers['Content-Security-Policy'] = "frame-ancestors https://*.onshape.com"
     resp.headers.pop('X-Frame-Options', None)
     return resp
+
+
+@app.route('/onshape-panel')
+def onshape_panel():
+    """Canonical wizard panel route."""
+    return _serve_onshape_panel()
 
 @app.route('/process', methods=['POST'])
 @limiter.limit("10 per minute")  # Strict limit - CPU intensive operation
@@ -2384,22 +2388,10 @@ def onshape_save_dxf():
 
 @app.route('/onshape/element-panel')
 def onshape_element_panel():
-    """
-    Serve the Onshape element right panel extension
-    This page will be embedded as an iframe in Onshape
-    """
-    # Get Onshape context from query parameters
-    # These are passed by Onshape when the iframe loads
-    document_id = request.args.get('documentId', '')
-    workspace_id = request.args.get('workspaceId', '')
-    element_id = request.args.get('elementId', '')
-    server = request.args.get('server', 'https://cad.onshape.com')
-
-    return render_template('onshape_panel.html',
-                         document_id=document_id,
-                         workspace_id=workspace_id,
-                         element_id=element_id,
-                         server=server)
+    """Legacy panel URL that existing Onshape app configs point at. Now serves the
+    new multi-part wizard (same handler as /onshape-panel), so no Onshape-side
+    reconfiguration is needed. The old onshape_panel.html is no longer used."""
+    return _serve_onshape_panel()
 
 # ============================================================================
 # ADMIN ENDPOINTS (Metrics)
