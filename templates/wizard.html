@@ -10,6 +10,22 @@
     <div id="wizard">
         <header id="wiz-header">
             <div class="brand">PenguinCAM</div>
+            <!-- Loaded team configuration (so the user can confirm it resolved correctly,
+                 even in the Onshape panel). Clickable when we know the config file URL. -->
+            <div class="config-info">
+                {% if session.get('team_config') and session.get('team_config').get('team_number') %}
+                {% set _config_url = session.get('team_config_url') %}
+                <p class="config-status">Config:
+                    {% if _config_url %}
+                    <a href="{{ _config_url }}" target="_blank" rel="noopener">{{ session.get('team_config').get('team_number') }} ({{ session.get('team_config').get('team_name', 'Unknown') }})</a>
+                    {% else %}
+                    {{ session.get('team_config').get('team_number') }} ({{ session.get('team_config').get('team_name', 'Unknown') }})
+                    {% endif %}
+                </p>
+                {% else %}
+                <p class="config-status config-status-default">Using default configuration</p>
+                {% endif %}
+            </div>
             <ol id="stepbar" aria-label="Steps">
                 <li data-step="setup" class="active">Setup</li>
                 <li data-step="parts">Parts</li>
@@ -106,8 +122,34 @@
                 <button type="button" id="btn-generate" class="btn primary">Generate G-code</button>
                 <div id="gen-status" class="hint"></div>
                 <div id="preview-result" hidden>
-                    <canvas id="preview-canvas" width="600" height="400"></canvas>
                     <div id="preview-stats"></div>
+                    <div id="viewer-container">
+                        <div class="empty-state" id="viewer-empty">G-code preview will appear here</div>
+                        <canvas id="gcode-canvas"></canvas>
+                    </div>
+                    <div class="scrubber-container" id="scrubber-container" style="display:none">
+                        <div class="scrubber-header">
+                            <span id="scrubber-label">Move 1 of 1</span>
+                            <span id="scrubber-op" class="scrubber-op"></span>
+                        </div>
+                        <input type="range" id="toolpath-scrubber" min="0" max="100" value="0" step="1">
+                    </div>
+                    <div class="playback-controls" id="playback-controls" style="display:none">
+                        <button type="button" class="btn small" id="play-button" title="Play/Pause">&#9654; / &#10073;&#10073;</button>
+                        <button type="button" class="btn small" id="restart-button" title="Restart">&#9198;</button>
+                        <label class="speed">Speed
+                            <select id="playback-speed">
+                                <option value="10">0.25x</option>
+                                <option value="20">0.5x</option>
+                                <option value="40" selected>1x</option>
+                                <option value="80">2x</option>
+                                <option value="160">4x</option>
+                                <option value="320">8x</option>
+                            </select>
+                        </label>
+                        <button type="button" class="btn small" id="reset-view">Reset view</button>
+                    </div>
+                    <p class="hint">Origin (0,0,0) = lower-left, sacrifice board. Drag to orbit, scroll to zoom.</p>
                     <a id="download-link" class="btn primary" href="#" download>Download .nc</a>
                 </div>
                 <div id="preview-errors" class="errors" aria-live="polite"></div>
@@ -132,6 +174,9 @@
         defaultTool: {{ default_tool_diameter|tojson }},
       };
     </script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+    <script src="{{ url_for('static', filename='gcode_viewer.js') }}"></script>
     {% if source == 'onshape' %}
     <script src="{{ url_for('static', filename='source_onshape.js') }}"></script>
     {% endif %}

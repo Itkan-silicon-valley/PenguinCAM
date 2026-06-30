@@ -145,6 +145,43 @@ fieldset.field { border: 1px solid var(--line); border-radius: 6px; padding: 8px
 #preview-stats { margin: 10px 0; color: var(--muted); font-size: 13px; }
 #download-link { display: inline-block; text-align: center; text-decoration: none; }
 
+.config-info { margin-top: 6px; }
+.config-status { margin: 0; font-size: 12px; color: var(--muted); }
+.config-status a { color: var(--accent); text-decoration: none; }
+.config-status a:hover { text-decoration: underline; }
+.config-status-default { color: #d29922; }
+
+#viewer-container {
+  position: relative;
+  width: 100%;
+  height: 320px;
+  background: #0a0e14;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  overflow: hidden;
+}
+#gcode-canvas { display: block; width: 100%; height: 100%; }
+.empty-state {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--muted);
+  font-size: 13px;
+  pointer-events: none;
+}
+
+.scrubber-container { margin-top: 10px; }
+.scrubber-header { display: flex; justify-content: space-between; font-size: 12px; color: var(--muted); margin-bottom: 4px; gap: 8px; }
+.scrubber-op { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 60%; }
+#toolpath-scrubber { width: 100%; }
+
+.playback-controls { display: flex; align-items: center; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+.playback-controls .speed { font-size: 12px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
+.playback-controls .speed select { width: auto; padding: 4px 6px; }
+.btn.small.playing { background: var(--ok); border-color: var(--ok); color: #08130b; }
+
 #debug-overlay {
   position: fixed;
   right: 6px;

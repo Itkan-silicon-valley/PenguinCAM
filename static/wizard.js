@@ -27,6 +27,7 @@
   };
   var partSeq = 0;
   var debugEvents = [];
+  var viewer = null;
 
   /* ----------------------------------------------------------------- utils */
   function $(sel, root) { return (root || document).querySelector(sel); }
@@ -501,37 +502,35 @@
   function showResult(resp) {
     $('#gen-status').textContent = '';
     $('#preview-result').hidden = false;
-    var stats = $('#preview-stats');
     var t = resp.cycle_time ? ('Estimated cycle time: ' + resp.cycle_time) : '';
     var n = resp.parts ? (resp.parts.length + ' part(s)') : '1 part';
-    stats.textContent = [n, t].filter(Boolean).join(' · ');
-    var link = $('#download-link');
-    link.href = '/download/' + resp.filename;
-    drawPreview(resp);
+    $('#preview-stats').textContent = [n, t].filter(Boolean).join(' · ');
+    $('#download-link').href = '/download/' + resp.filename;
+    show3DPreview(resp);
   }
 
-  function drawPreview(resp) {
-    var canvas = $('#preview-canvas');
-    var ctx = canvas.getContext('2d');
-    // Reuse layout transform against the sheet (fall back to part bounds for single).
+  function show3DPreview(resp) {
+    if (typeof THREE === 'undefined' || typeof GcodeViewer === 'undefined') {
+      $('#viewer-empty').textContent = '3D preview unavailable (three.js failed to load).';
+      return;
+    }
+    if (!viewer) {
+      viewer = new GcodeViewer({
+        canvas: $('#gcode-canvas'), container: $('#viewer-container'),
+        scrubber: $('#toolpath-scrubber'), scrubberContainer: $('#scrubber-container'),
+        scrubberLabel: $('#scrubber-label'), scrubberOp: $('#scrubber-op'),
+        playbackControls: $('#playback-controls'), playButton: $('#play-button'),
+        restartButton: $('#restart-button'), speedSelect: $('#playback-speed'),
+        resetButton: $('#reset-view'), emptyState: $('#viewer-empty'),
+      });
+    }
     var W = (resp.stock && resp.stock.width) || state.sheet.width;
-    var H = (resp.stock && resp.stock.height) || state.sheet.height;
-    var savedSheet = state.sheet;
-    state.sheet = { width: W, height: H };
-    fitTransform(canvas);
-    state.sheet = savedSheet;
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-    var o = worldToCanvas(0, 0), tr = worldToCanvas(W, H);
-    ctx.fillStyle = '#11161d'; ctx.fillRect(o[0], tr[1], tr[0] - o[0], o[1] - tr[1]);
-    ctx.strokeStyle = '#3b4654'; ctx.strokeRect(o[0], tr[1], tr[0] - o[0], o[1] - tr[1]);
-    // Draw placed part outlines from current state (authoritative bbox echoed by server).
-    state.parts.forEach(function (p) {
-      var s = placedShape(p);
-      ctx.beginPath();
-      s.pts.forEach(function (pt, i) { var c = worldToCanvas(p.place_x + pt[0], p.place_y + pt[1]); if (i) ctx.lineTo(c[0], c[1]); else ctx.moveTo(c[0], c[1]); });
-      ctx.closePath();
-      ctx.strokeStyle = '#3fb950'; ctx.lineWidth = 1.5; ctx.stroke();
+    var D = (resp.stock && resp.stock.height) || state.sheet.height;
+    viewer.load(resp.gcode, {
+      stockWidth: W, stockDepth: D,
+      stockHeight: state.thickness, toolDiameter: state.tool_diameter,
     });
+    dbg('preview', { w: W, d: D });
   }
 
   /* ----------------------------------------------------------------- init */
