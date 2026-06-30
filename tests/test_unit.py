@@ -11,7 +11,9 @@ import os
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from frc_cam_postprocessor import FRCPostProcessor, MATERIAL_PRESETS
+from frc_cam_postprocessor import (
+    FRCPostProcessor, MATERIAL_PRESETS, assemble_job_gcode, validate_job_layout,
+)
 from team_config import TeamConfig
 
 
@@ -2066,6 +2068,135 @@ class TestIslandBosses(unittest.TestCase):
         finally:
             if os.path.exists(dxf_path):
                 os.remove(dxf_path)
+
+
+class TestMultiPartEngine(unittest.TestCase):
+    """Multi-part job engine: placement offset, body-only generation, job stitching,
+    and layout validation."""
+
+    def _square_part(self, size=4.0, offset=(0.0, 0.0)):
+        pp = FRCPostProcessor(0.25, 0.157)
+        pp.apply_material_preset('plywood')
+        pp.tabs_enabled = False
+        pp.circles = []
+        pp.lines = []
+        pp.arcs = []
+        pp.splines = []
+        pp.polylines = [[(0.0, 0.0), (size, 0.0), (size, size), (0.0, size), (0.0, 0.0)]]
+        pp.transform_coordinates('bottom-left', 0, placement_offset=offset, enforce_bounds=False)
+        pp.identify_perimeter_and_pockets()
+        pp.classify_holes()
+        return pp
+
+    def test_placement_offset_translates_geometry(self):
+        pp = self._square_part(size=4.0, offset=(10.0, 5.0))
+        minx, miny, maxx, maxy = pp.bounding_box()
+        self.assertAlmostEqual(minx, 10.0, places=3)
+        self.assertAlmostEqual(miny, 5.0, places=3)
+        self.assertAlmostEqual(maxx, 14.0, places=3)
+        self.assertAlmostEqual(maxy, 9.0, places=3)
+
+    def test_body_only_has_no_header_or_footer(self):
+        pp = self._square_part()
+        body = pp.generate_gcode(include_header_footer=False).gcode
+        self.assertNotIn('M30', body, "Body should not contain program-end")
+        self.assertNotIn('(PenguinCAM', body, "Body should not contain the header title")
+        self.assertNotIn('G54', body, "Body should not set the work coordinate system")
+
+    def test_assemble_emits_single_header_and_footer(self):
+        import re
+        p1 = self._square_part(size=4.0, offset=(0.0, 0.0))
+        p2 = self._square_part(size=4.0, offset=(6.0, 0.0))
+        part_jobs = [
+            {'name': 'A', 'place_x': 0.0, 'place_y': 0.0, 'rotation': 0,
+             'body': p1.generate_gcode(include_header_footer=False).gcode.split('\n')},
+            {'name': 'B', 'place_x': 6.0, 'place_y': 0.0, 'rotation': 0,
+             'body': p2.generate_gcode(include_header_footer=False).gcode.split('\n')},
+        ]
+        result = assemble_job_gcode(part_jobs, header_pp=p1, timestamp='2026-06-30 12:00:00')
+        self.assertTrue(result.success)
+        g = result.gcode
+
+        def command_lines_with(token):
+            # Count G-code command lines containing token as a whole word, ignoring comments.
+            pat = re.compile(r'\b' + re.escape(token) + r'\b')
+            count = 0
+            for l in g.split('\n'):
+                code = re.sub(r'\([^)]*\)', '', l.split(';', 1)[0])
+                if pat.search(code):
+                    count += 1
+            return count
+
+        self.assertEqual(command_lines_with('M3'), 1, "Job should start the spindle exactly once")
+        self.assertEqual(command_lines_with('M30'), 1, "Job should end exactly once")
+        self.assertEqual(command_lines_with('G54'), 1, "Job should set WCS exactly once")
+        self.assertIn('PART 1: A', g)
+        self.assertIn('PART 2: B', g)
+        self.assertIn('MULTI-PART JOB', g)
+        self.assertEqual(result.stats['num_parts'], 2)
+
+    def test_assembled_parts_are_offset(self):
+        import re
+        p1 = self._square_part(size=4.0, offset=(0.0, 0.0))
+        p2 = self._square_part(size=4.0, offset=(6.0, 0.0))
+        part_jobs = [
+            {'name': 'A', 'place_x': 0.0, 'place_y': 0.0, 'rotation': 0,
+             'body': p1.generate_gcode(include_header_footer=False).gcode.split('\n')},
+            {'name': 'B', 'place_x': 6.0, 'place_y': 0.0, 'rotation': 0,
+             'body': p2.generate_gcode(include_header_footer=False).gcode.split('\n')},
+        ]
+        g = assemble_job_gcode(part_jobs, header_pp=p1, timestamp='2026-06-30 12:00:00').gcode
+        lines = g.split('\n')
+
+        def section_x(marker):
+            start = next(i for i, l in enumerate(lines) if marker in l)
+            end = len(lines)
+            for j in range(start + 1, len(lines)):
+                if '===== PART' in lines[j] or '===== FINISH' in lines[j]:
+                    end = j
+                    break
+            xs = []
+            for l in lines[start:end]:
+                code = re.sub(r'\([^)]*\)', '', l.split(';', 1)[0])
+                if re.match(r'^\s*G[0123]\b', code) and 'G53' not in code:
+                    m = re.search(r'X(-?\d+\.?\d*)', code)
+                    if m:
+                        xs.append(float(m.group(1)))
+            return xs
+
+        xs_a = section_x('PART 1: A')
+        xs_b = section_x('PART 2: B')
+        self.assertTrue(xs_a and xs_b)
+        self.assertLess(max(xs_a), 5.0, "Part A should be near the origin")
+        self.assertGreater(max(xs_b), 6.0, "Part B should be shifted right by its offset")
+
+    def test_validate_detects_overlap(self):
+        parts = [
+            {'name': 'A', 'bbox': (0, 0, 4, 4)},
+            {'name': 'B', 'bbox': (2, 2, 6, 6)},
+        ]
+        errors = validate_job_layout(parts, 24, 24, 24, 24)
+        self.assertTrue(any('overlap' in e['error'].lower() for e in errors))
+
+    def test_validate_detects_out_of_bounds(self):
+        parts = [{'name': 'A', 'bbox': (20, 20, 30, 30)}]
+        errors = validate_job_layout(parts, 24, 24, 48, 48)
+        self.assertTrue(any('outside the stock' in e['error'].lower() for e in errors))
+
+    def test_validate_passes_clean_layout(self):
+        parts = [
+            {'name': 'A', 'bbox': (0, 0, 4, 4)},
+            {'name': 'B', 'bbox': (6, 0, 10, 4)},
+        ]
+        self.assertEqual(validate_job_layout(parts, 24, 24, 24, 24), [])
+
+    def test_validate_min_gap_kerf(self):
+        parts = [
+            {'name': 'A', 'bbox': (0, 0, 4, 4)},
+            {'name': 'B', 'bbox': (4.1, 0, 8.1, 4)},
+        ]
+        self.assertEqual(validate_job_layout(parts, 24, 24, 24, 24, min_gap=0.0), [])
+        self.assertTrue(validate_job_layout(parts, 24, 24, 24, 24, min_gap=0.25))
 
 
 if __name__ == '__main__':

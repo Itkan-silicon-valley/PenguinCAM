@@ -4,7 +4,7 @@ PenguinCAM - FRC Team 6238 CAM Tool
 A Flask-based web interface for generating G-code from DXF files
 """
 
-from flask import Flask, render_template, request, jsonify, send_file, session, send_from_directory, redirect
+from flask import Flask, render_template, request, jsonify, send_file, session, send_from_directory, redirect, make_response
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -75,7 +75,9 @@ except ImportError:
     log("⚠️  Onshape integration not available")
 
 # Import postprocessor directly (for API calls instead of subprocess)
-from frc_cam_postprocessor import FRCPostProcessor, PostProcessorResult
+from frc_cam_postprocessor import (
+    FRCPostProcessor, PostProcessorResult, assemble_job_gcode, validate_job_layout,
+)
 
 # Import team config management
 from team_config import TeamConfig
@@ -390,6 +392,63 @@ def generate_onshape_filename(doc_name, part_name):
 # Routes
 # ============================================================================
 
+def _app_template_context():
+    """Build the shared template context (machines, materials, tool, bed size) used by
+    both the legacy single-part page and the multi-part wizard."""
+    user_name = session.get('user_name')
+    team_name = session.get('team_name')
+
+    team_config_data = session.get('team_config_data', {})
+    team_config = TeamConfig(team_config_data)
+
+    machines = team_config.get_available_machines()
+    current_machine_id = session.get('machine_id', team_config.default_machine_id)
+
+    team_config_dict = team_config.to_dict(current_machine_id)
+    drive_enabled = team_config_dict.get('google_drive_enabled', False)
+    default_tool_diameter = team_config_dict.get('default_tool_diameter', 0.157)
+    machine_x_max = team_config_dict.get('machine_x_max', 48.0)
+    machine_y_max = team_config_dict.get('machine_y_max', 96.0)
+
+    available_materials = team_config.get_available_materials(current_machine_id)
+    available_materials['aluminum_tube'] = {
+        **available_materials.get('aluminum', {}),
+        'name': 'Aluminum Tube'
+    }
+
+    incomplete_materials = {
+        material_id for material_id in available_materials.keys()
+        if not team_config.is_material_complete(material_id, current_machine_id) and material_id != 'aluminum_tube'
+    }
+
+    return {
+        'user_name': user_name,
+        'team_name': team_name,
+        'drive_enabled': drive_enabled,
+        'default_tool_diameter': default_tool_diameter,
+        'machine_x_max': machine_x_max,
+        'machine_y_max': machine_y_max,
+        'using_default_config': session.get('using_default_config', False),
+        'machines': machines,
+        'current_machine_id': current_machine_id,
+        'materials': available_materials,
+        'incomplete_materials': incomplete_materials,
+        'detected_thickness': None,
+    }
+
+
+def _require_onshape_auth():
+    """Apply the Onshape OAuth gate. Returns a redirect response if unauthenticated,
+    else None. Shared by the app pages."""
+    if ONSHAPE_AVAILABLE:
+        user_id = get_current_user_id()
+        client = session_manager.get_client(user_id)
+        if not client:
+            log("⛔ Access denied: No Onshape authentication, redirecting to /onshape/auth")
+            return redirect('/onshape/auth')
+    return None
+
+
 @app.route('/')
 def index():
     """Render the main GUI page"""
@@ -404,66 +463,39 @@ def index():
     # TO MAKE APP WIDE OPEN (allow anonymous browser access):
     # Simply comment out or remove the code block below (lines until "End gate")
     # ========================================================================
-    if ONSHAPE_AVAILABLE:
-        user_id = get_current_user_id()
-        client = session_manager.get_client(user_id)
-        if not client:
-            # No Onshape session - redirect to OAuth
-            log("⛔ Access denied: No Onshape authentication, redirecting to /onshape/auth")
-            return redirect('/onshape/auth')
+    gate = _require_onshape_auth()
+    if gate:
+        return gate
     # ========================================================================
     # End authentication gate
     # ========================================================================
 
-    # Get user/team info from session (if coming from Onshape)
-    user_name = session.get('user_name')
-    team_name = session.get('team_name')
+    return render_template('index.html', **_app_template_context())
 
-    # Reconstruct TeamConfig
-    team_config_data = session.get('team_config_data', {})
-    team_config = TeamConfig(team_config_data)
 
-    # Get available machines
-    machines = team_config.get_available_machines()
+@app.route('/app')
+def wizard_app():
+    """Multi-part wizard, standalone (DXF upload) source. Same backend as everything
+    else; this is also the no-Onshape test vehicle."""
+    gate = _require_onshape_auth()
+    if gate:
+        return gate
+    return render_template('wizard.html', source='upload', **_app_template_context())
 
-    # Get current machine (from session, or use default)
-    current_machine_id = session.get('machine_id', team_config.default_machine_id)
 
-    # Get machine-specific config dict
-    team_config_dict = team_config.to_dict(current_machine_id)
-    drive_enabled = team_config_dict.get('google_drive_enabled', False)
-    default_tool_diameter = team_config_dict.get('default_tool_diameter', 0.157)
-    machine_x_max = team_config_dict.get('machine_x_max', 48.0)
-    machine_y_max = team_config_dict.get('machine_y_max', 96.0)
-
-    # Get available materials for current machine
-    available_materials = team_config.get_available_materials(current_machine_id)
-
-    # Add 'aluminum_tube' as a special UI-only material (uses aluminum preset)
-    available_materials['aluminum_tube'] = {
-        **available_materials.get('aluminum', {}),
-        'name': 'Aluminum Tube'
-    }
-
-    # Check for incomplete materials (custom materials missing required params)
-    incomplete_materials = {
-        material_id for material_id in available_materials.keys()
-        if not team_config.is_material_complete(material_id, current_machine_id) and material_id != 'aluminum_tube'
-    }
-
-    return render_template('index.html',
-                         user_name=user_name,
-                         team_name=team_name,
-                         drive_enabled=drive_enabled,
-                         default_tool_diameter=default_tool_diameter,
-                         machine_x_max=machine_x_max,
-                         machine_y_max=machine_y_max,
-                         using_default_config=session.get('using_default_config', False),
-                         machines=machines,
-                         current_machine_id=current_machine_id,
-                         materials=available_materials,
-                         incomplete_materials=incomplete_materials,
-                         detected_thickness=None)
+@app.route('/onshape-panel')
+def onshape_panel():
+    """Multi-part wizard, embedded in the Onshape right-side panel (iframe). Same
+    template/JS as /app, with the Onshape selection source. Sets framing + cookie
+    headers so the iframe and its OAuth/session work inside Onshape."""
+    gate = _require_onshape_auth()
+    if gate:
+        return gate
+    resp = make_response(render_template('wizard.html', source='onshape', **_app_template_context()))
+    # Allow embedding only within Onshape; allow the session cookie to ride in the iframe.
+    resp.headers['Content-Security-Policy'] = "frame-ancestors https://*.onshape.com"
+    resp.headers.pop('X-Frame-Options', None)
+    return resp
 
 @app.route('/process', methods=['POST'])
 @limiter.limit("10 per minute")  # Strict limit - CPU intensive operation
@@ -737,6 +769,247 @@ def process_file():
     except Exception as e:
         log(traceback.format_exc())
         return jsonify({'error': f'Unexpected error: {str(e)}'}), 500
+
+
+@app.route('/process-job', methods=['POST'])
+@limiter.limit("10 per minute")  # CPU intensive
+def process_job():
+    """Process a multi-part job: several DXF parts placed on one stock sheet, emitted
+    as a single G-code program. 2D standard mode only (2.5D is single-part via /process).
+
+    Request (multipart/form-data):
+      - file_0, file_1, ... : one DXF per distinct part
+      - job : JSON {material, tool_diameter, thickness, tab_spacing, machine_id,
+                    stock:{width,height}, name,
+                    parts:[{file_index, name, place_x, place_y, rotation}]}
+      - timestamp : client-local timestamp string
+
+    Response: {success, filename(token), gcode, cycle_time, stock, parts:[...]}
+              or {success:false, part_errors:[{part_index, name, error}]}.
+    """
+    job_dir = None
+    try:
+        job_raw = request.form.get('job')
+        if not job_raw:
+            return jsonify({'error': 'Missing job specification'}), 400
+        try:
+            job = json.loads(job_raw)
+        except (ValueError, TypeError):
+            return jsonify({'error': 'Invalid job JSON'}), 400
+
+        parts_spec = job.get('parts', [])
+        if not parts_spec:
+            return jsonify({'error': 'Job has no parts'}), 400
+
+        # Shared job parameters (one tool/material per job in v1).
+        material = job.get('material', 'plywood')
+        if str(material).lower() == 'polycarb':
+            material = 'polycarbonate'
+        elif str(material).lower() == 'aluminum_tube':
+            material = 'aluminum'
+        tool_diameter = float(job.get('tool_diameter', 0.157))
+        thickness = float(job.get('thickness', 0.25))
+        tab_spacing = float(job.get('tab_spacing', 6.0))
+        machine_id = job.get('machine_id')
+        timestamp_str = request.form.get('timestamp', '')
+
+        stock = job.get('stock', {})
+        stock_w = float(stock.get('width', 0))
+        stock_h = float(stock.get('height', 0))
+        if stock_w <= 0 or stock_h <= 0:
+            return jsonify({'error': 'Stock sheet width and height are required'}), 400
+
+        # Save each uploaded DXF to a distinct path so parts don't clobber each other.
+        job_dir = tempfile.mkdtemp(prefix='job_', dir=UPLOAD_FOLDER)
+        saved_paths = {}
+        for key in list(request.files.keys()):
+            if not key.startswith('file_'):
+                continue
+            f = request.files[key]
+            if not f.filename.lower().endswith('.dxf'):
+                return jsonify({'error': f'{f.filename} is not a DXF file'}), 400
+            try:
+                idx = int(key.split('_', 1)[1])
+            except (ValueError, IndexError):
+                continue
+            p = os.path.join(job_dir, f'part_{idx}.dxf')
+            f.save(p)
+            saved_paths[idx] = p
+
+        team_config = TeamConfig.from_dict(session.get('team_config_data', {}))
+        user_name = session.get('user_name')
+        machine_x = team_config.machine_x_max
+        machine_y = team_config.machine_y_max
+
+        log(f"[JOB] {len(parts_spec)} parts, stock {stock_w:.1f}x{stock_h:.1f}, "
+            f"tool {tool_diameter}, material {material}, thickness {thickness}")
+
+        # Pass 1: build + place each part; collect footprints for layout validation.
+        prepared = []
+        placed = []
+        gen_errors = []
+        for i, part in enumerate(parts_spec):
+            fidx = part.get('file_index', i)
+            if fidx not in saved_paths:
+                gen_errors.append({'part_index': i, 'name': part.get('name'),
+                                   'error': f"Missing DXF upload for part {i + 1}"})
+                continue
+            name = part.get('name') or Path(saved_paths[fidx]).stem
+            place_x = float(part.get('place_x', 0.0))
+            place_y = float(part.get('place_y', 0.0))
+            rotation = float(part.get('rotation', 0))
+
+            pp = FRCPostProcessor(material_thickness=thickness, tool_diameter=tool_diameter,
+                                  units='inch', config=team_config)
+            pp.apply_material_preset(material, machine_id)
+            if user_name:
+                pp.user_name = user_name
+            pp.tab_spacing = tab_spacing
+            pp.load_dxf(saved_paths[fidx])
+            pp.transform_coordinates('bottom-left', rotation,
+                                     placement_offset=(place_x, place_y), enforce_bounds=False)
+            pp.identify_perimeter_and_pockets()
+            pp.classify_holes()
+            bbox = pp.bounding_box()
+            placed.append({'name': name, 'bbox': bbox})
+            prepared.append({'pp': pp, 'bbox': bbox, 'name': name,
+                             'place_x': place_x, 'place_y': place_y, 'rotation': rotation})
+
+        if gen_errors:
+            return jsonify({'success': False, 'part_errors': gen_errors}), 400
+
+        # Validate layout before the expensive body generation. Kerf = tool diameter.
+        layout_errors = validate_job_layout(placed, stock_w, stock_h, machine_x, machine_y,
+                                            min_gap=tool_diameter)
+        if layout_errors:
+            log(f"[JOB] layout invalid: {layout_errors}")
+            return jsonify({'success': False, 'part_errors': layout_errors}), 400
+
+        # Pass 2: generate each part's toolpath body, then stitch into one program.
+        part_jobs = []
+        response_parts = []
+        for i, item in enumerate(prepared):
+            body_res = item['pp'].generate_gcode(include_header_footer=False, timestamp=timestamp_str)
+            if not body_res.success:
+                for e in body_res.errors:
+                    gen_errors.append({'part_index': i, 'name': item['name'], 'error': e})
+                continue
+            part_jobs.append({
+                'name': item['name'], 'place_x': item['place_x'],
+                'place_y': item['place_y'], 'rotation': item['rotation'],
+                'body': body_res.gcode.split('\n'),
+            })
+            minx, miny, maxx, maxy = item['bbox']
+            response_parts.append({
+                'index': i, 'name': item['name'],
+                'place_x': item['place_x'], 'place_y': item['place_y'], 'rotation': item['rotation'],
+                'bbox': {'minX': minx, 'minY': miny, 'maxX': maxx, 'maxY': maxy},
+            })
+
+        if gen_errors:
+            return jsonify({'success': False, 'part_errors': gen_errors}), 400
+        if not part_jobs:
+            return jsonify({'error': 'No parts could be generated'}), 400
+
+        result = assemble_job_gcode(part_jobs, header_pp=prepared[0]['pp'],
+                                    timestamp=timestamp_str or None,
+                                    suggested_filename=job.get('name', 'job'))
+
+        output_path = os.path.join(OUTPUT_FOLDER, result.filename)
+        with open(output_path, 'w') as fh:
+            fh.write(result.gcode)
+        output_token = file_token_manager.register_file(output_path, result.filename)
+
+        log(f"[JOB] assembled {result.stats['num_parts']} parts, "
+            f"{result.stats['total_lines']} lines, {result.stats['cycle_time_display']}")
+
+        metrics.log_event('job_generated',
+                          team_number=session.get('team_number'),
+                          user_email=session.get('user_email'),
+                          metadata={'material': material, 'num_parts': len(part_jobs)})
+
+        return jsonify({
+            'success': True,
+            'filename': output_token,
+            'gcode': result.gcode,
+            'cycle_time': result.stats.get('cycle_time_display'),
+            'cycle_time_seconds': result.stats.get('cycle_time_seconds'),
+            'stock': {'width': stock_w, 'height': stock_h},
+            'parts': response_parts,
+        })
+
+    except ValueError as e:
+        return jsonify({'error': f'Invalid parameter value: {str(e)}'}), 400
+    except Exception as e:
+        log(traceback.format_exc())
+        return jsonify({'error': f'Unexpected error: {str(e)}'}), 500
+    finally:
+        if job_dir:
+            shutil.rmtree(job_dir, ignore_errors=True)
+
+
+@app.route('/part-outline', methods=['POST'])
+@limiter.limit("30 per minute")
+def part_outline():
+    """Return the perimeter outline + dimensions of an uploaded DXF, for the layout
+    canvas and parts-list thumbnail. Stateless: the browser keeps the DXF bytes and
+    re-submits them at /process-job time (serverless-safe). Coordinates are normalized
+    so the part's bounding-box minimum sits at (0,0)."""
+    path = None
+    try:
+        if 'file' not in request.files:
+            return jsonify({'error': 'No file uploaded'}), 400
+        f = request.files['file']
+        if not f.filename.lower().endswith('.dxf'):
+            return jsonify({'error': 'File must be a DXF'}), 400
+
+        tmp = tempfile.NamedTemporaryFile(suffix='.dxf', delete=False, dir=UPLOAD_FOLDER)
+        path = tmp.name
+        tmp.close()
+        f.save(path)
+
+        team_config = TeamConfig.from_dict(session.get('team_config_data', {}))
+        pp = FRCPostProcessor(material_thickness=0.25, tool_diameter=0.125,
+                              units='inch', config=team_config)
+        pp.load_dxf(path)
+        pp.transform_coordinates('bottom-left', 0, enforce_bounds=False)
+        pp.identify_perimeter_and_pockets()
+        pp.classify_holes()
+
+        bbox = pp.bounding_box()
+        if not bbox:
+            return jsonify({'error': 'No geometry found in DXF'}), 400
+        minx, miny, maxx, maxy = bbox
+        width, height = maxx - minx, maxy - miny
+
+        outline = []
+        if pp.perimeter:
+            outline = [[round(x - minx, 4), round(y - miny, 4)] for (x, y) in pp.perimeter]
+        if len(outline) < 3:
+            # No closed perimeter (e.g. holes only) - fall back to the bounding rectangle.
+            outline = [[0, 0], [round(width, 4), 0],
+                       [round(width, 4), round(height, 4)], [0, round(height, 4)]]
+
+        holes = [{'cx': round(h['center'][0] - minx, 4),
+                  'cy': round(h['center'][1] - miny, 4),
+                  'r': round(h['diameter'] / 2.0, 4)}
+                 for h in (pp.holes or [])]
+
+        return jsonify({
+            'success': True,
+            'name': Path(f.filename).stem,
+            'width': round(width, 4),
+            'height': round(height, 4),
+            'outline': outline,
+            'holes': holes,
+        })
+    except Exception as e:
+        log(traceback.format_exc())
+        return jsonify({'error': str(e)}), 500
+    finally:
+        if path and os.path.exists(path):
+            os.remove(path)
+
 
 @app.route('/download/<token>')
 @limiter.limit("30 per minute")

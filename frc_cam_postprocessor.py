@@ -783,13 +783,21 @@ class FRCPostProcessor:
             except:
                 return []
         
-    def transform_coordinates(self, origin_corner: str, rotation_angle: int):
+    def transform_coordinates(self, origin_corner: str, rotation_angle: int,
+                              placement_offset: Tuple[float, float] = (0.0, 0.0),
+                              enforce_bounds: bool = True):
         """
         Transform all coordinates based on origin corner and rotation.
-        
+
         Args:
             origin_corner: 'bottom-left', 'bottom-right', 'top-left', 'top-right'
             rotation_angle: 0, 90, 180, 270 degrees clockwise
+            placement_offset: (dx, dy) added after the corner is normalized to (0,0).
+                Used by multi-part job layout to place this part on a shared sheet.
+                Defaults to (0,0), which leaves single-part output unchanged.
+            enforce_bounds: when True (default, single-part), error if the part is
+                larger than the machine envelope. Multi-part jobs pass False and rely
+                on job-level validation (validate_job_layout) against the stock sheet.
         """
         # First, find bounding box of ALL entities
         all_x = []
@@ -963,7 +971,13 @@ class FRCPostProcessor:
             offsetX, offsetY = -minX, -maxY
         elif origin_corner == 'top-right':
             offsetX, offsetY = -maxX, -maxY
-        
+
+        # Apply caller-supplied placement offset (multi-part job layout). After the
+        # selected corner is normalized to (0,0), shift the whole part to its sheet
+        # position. Translation does not affect arc IJK (incremental, G91.1).
+        offsetX += placement_offset[0]
+        offsetY += placement_offset[1]
+
         def translate_point(x, y):
             return x + offsetX, y + offsetY
         
@@ -1041,13 +1055,50 @@ class FRCPostProcessor:
         machine_x_max = self.config.machine_x_max
         machine_y_max = self.config.machine_y_max
 
-        if part_width > machine_x_max or part_height > machine_y_max:
+        if enforce_bounds and (part_width > machine_x_max or part_height > machine_y_max):
             error_msg = (f"Part dimensions ({part_width:.2f}\" × {part_height:.2f}\") exceed machine bounds "
                         f"({machine_x_max:.1f}\" × {machine_y_max:.1f}\"). "
                         f"Try rotating 90° or reduce part size.")
             self._add_error(error_msg)
             print(f"  ❌ {error_msg}")
-    
+
+    def bounding_box(self) -> Optional[Tuple[float, float, float, float]]:
+        """Return (minX, minY, maxX, maxY) of all current geometry, or None if empty.
+        Reflects the current (already-transformed) coordinates, so multi-part job
+        layout can read each placed part's footprint for validation and rendering."""
+        all_x = []
+        all_y = []
+        for circle in self.circles:
+            cx, cy = circle['center']
+            r = circle.get('radius') or (circle.get('diameter', 0) / 2)
+            all_x.extend([cx - r, cx + r])
+            all_y.extend([cy - r, cy + r])
+        for line in self.lines:
+            all_x.extend([line['start'][0], line['end'][0]])
+            all_y.extend([line['start'][1], line['end'][1]])
+        for arc in self.arcs:
+            r = arc['radius']
+            all_x.extend([arc['center'][0] - r, arc['center'][0] + r])
+            all_y.extend([arc['center'][1] - r, arc['center'][1] + r])
+        for polyline in self.polylines:
+            for x, y in polyline:
+                all_x.append(x)
+                all_y.append(y)
+        if self.layer_data:
+            for layer_info in self.layer_data.values():
+                for circle in layer_info['circles']:
+                    cx, cy = circle['center']
+                    r = circle.get('radius') or (circle.get('diameter', 0) / 2)
+                    all_x.extend([cx - r, cx + r])
+                    all_y.extend([cy - r, cy + r])
+                for polyline in layer_info['polylines']:
+                    for x, y in polyline:
+                        all_x.append(x)
+                        all_y.append(y)
+        if not all_x or not all_y:
+            return None
+        return (min(all_x), min(all_y), max(all_x), max(all_y))
+
     def classify_holes(self):
         """Classify holes by diameter"""
         # Classify all circles as holes (apply size check)
@@ -1328,12 +1379,17 @@ class FRCPostProcessor:
         # Sort pockets to minimize travel time
         self._sort_pockets()
     
-    def generate_gcode(self, suggested_filename: str = None, timestamp: str = None) -> PostProcessorResult:
+    def generate_gcode(self, suggested_filename: str = None, timestamp: str = None,
+                       include_header_footer: bool = True) -> PostProcessorResult:
         """
         Generate complete G-code for standard plate operations (single or multi-layer)
 
         Args:
             suggested_filename: Optional filename (without timestamp, will be added)
+            include_header_footer: when False, return only the feature toolpath body
+                (no header/footer). Used by assemble_job_gcode to stitch one part of a
+                multi-part job under a single shared header/footer. Defaults to True
+                (normal single-part output, unchanged).
 
         Returns:
             PostProcessorResult with gcode string and stats
@@ -1356,8 +1412,8 @@ class FRCPostProcessor:
         if not timestamp:
             timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        # Generate header
-        gcode = self._generate_gcode_header(timestamp, is_multilayer=False)
+        # Generate header (skipped for job-body mode; assemble_job_gcode adds one shared header)
+        gcode = self._generate_gcode_header(timestamp, is_multilayer=False) if include_header_footer else []
         warnings = []
 
         # Holes (all circular features - helical entry + spiral clearing, or contouring for large holes)
@@ -1523,8 +1579,9 @@ class FRCPostProcessor:
             gcode.extend(self._generate_perimeter_gcode(self.perimeter))
             gcode.append("")
 
-        # Footer
-        gcode.extend(self._generate_gcode_footer())
+        # Footer (skipped for job-body mode; assemble_job_gcode adds one shared footer)
+        if include_header_footer:
+            gcode.extend(self._generate_gcode_footer())
 
         # Calculate estimated cycle time
         time_estimate = self._estimate_cycle_time(gcode)
@@ -1569,8 +1626,13 @@ class FRCPostProcessor:
             }
         )
 
-    def _generate_gcode_header(self, timestamp: str = None, is_multilayer: bool = False) -> List[str]:
-        """Generate common G-code header (comments + initialization)"""
+    def _generate_gcode_header(self, timestamp: str = None, is_multilayer: bool = False,
+                               is_job: bool = False, job_part_count: int = None) -> List[str]:
+        """Generate common G-code header (comments + initialization).
+
+        is_job: emit a single shared header for a multi-part job (one spindle start,
+        one WCS, one safe-Z) instead of a per-part header. job_part_count is shown
+        in the comments. Multi-part jobs are single-layer (2.5D is single-part)."""
         gcode = []
 
         # Use provided timestamp or generate one
@@ -1582,6 +1644,8 @@ class FRCPostProcessor:
         gcode.append(f"({self.team_name.upper()} - Team {self.team_number})")
         if is_multilayer:
             gcode.append("(PenguinCAM CNC Post-Processor - MULTI-LAYER)")
+        elif is_job:
+            gcode.append("(PenguinCAM CNC Post-Processor - MULTI-PART JOB)")
         else:
             gcode.append("(PenguinCAM CNC Post-Processor)")
 
@@ -1622,6 +1686,9 @@ class FRCPostProcessor:
         gcode.append(f"(Tool: {self.tool_diameter}\" diam Flat End Mill)")
         gcode.append(f"(Spindle: {self.spindle_speed} RPM)")
 
+        if is_job and job_part_count is not None:
+            gcode.append(f"(Parts in job: {job_part_count})")
+
         if is_multilayer:
             if hasattr(self, 'layer_data'):
                 gcode.append(f"(Layers: {len(self.layer_data)} depths)")
@@ -1637,14 +1704,19 @@ class FRCPostProcessor:
             gcode.append("")
 
             # Operations
-            operations = []
-            if self.holes:
-                operations.append("Holes")
-            if self.pockets:
-                operations.append("Pockets")
-            if self.perimeter:
-                operations.append("Profile")
-            operations_str = ", ".join(operations) if operations else "None"
+            if is_job:
+                # Per-part operations are listed in each PART section; the job-level
+                # header just records that this is a multi-part program.
+                operations_str = f"Multi-part job ({job_part_count} parts)"
+            else:
+                operations = []
+                if self.holes:
+                    operations.append("Holes")
+                if self.pockets:
+                    operations.append("Pockets")
+                if self.perimeter:
+                    operations.append("Profile")
+                operations_str = ", ".join(operations) if operations else "None"
 
             helical_angle = f"~{int(self.ramp_angle)} deg"
 
@@ -4976,6 +5048,143 @@ class FRCPostProcessor:
                 gcode.append(f'G0 Z{z_safe:.4f}')
 
         return gcode
+
+
+def validate_job_layout(parts, stock_width, stock_height, machine_x_max, machine_y_max, min_gap=0.0):
+    """Validate a multi-part job layout against the stock sheet and machine.
+
+    Args:
+        parts: list of dicts, each with 'name' and 'bbox' = (minX, minY, maxX, maxY)
+               in sheet coordinates (origin at the sheet's machine-zero corner).
+        stock_width, stock_height: stock sheet size (inches).
+        machine_x_max, machine_y_max: machine travel envelope (inches).
+        min_gap: required clearance between parts (inches). Pass the tool diameter to
+                 reject parts closer than one kerf. Defaults to 0 (touching allowed).
+
+    Returns:
+        List of error dicts: {'part_index': int|None, 'name': str|None, 'error': str}.
+        Empty list means the layout is valid.
+    """
+    errors = []
+    tol = 1e-6
+
+    # Sheet must fit the machine.
+    if stock_width > machine_x_max + tol or stock_height > machine_y_max + tol:
+        errors.append({
+            'part_index': None,
+            'name': None,
+            'error': (f"Stock sheet ({stock_width:.2f}\" x {stock_height:.2f}\") exceeds machine "
+                      f"bounds ({machine_x_max:.1f}\" x {machine_y_max:.1f}\").")
+        })
+
+    # Each part must lie within the sheet.
+    for i, part in enumerate(parts):
+        bbox = part.get('bbox')
+        name = part.get('name', f'part {i + 1}')
+        if bbox is None:
+            errors.append({'part_index': i, 'name': name, 'error': f"{name}: no geometry to place."})
+            continue
+        minx, miny, maxx, maxy = bbox
+        if minx < -tol or miny < -tol or maxx > stock_width + tol or maxy > stock_height + tol:
+            errors.append({
+                'part_index': i,
+                'name': name,
+                'error': (f"{name} extends outside the stock sheet "
+                          f"(part X=[{minx:.2f}, {maxx:.2f}], Y=[{miny:.2f}, {maxy:.2f}]; "
+                          f"sheet {stock_width:.2f}\" x {stock_height:.2f}\").")
+            })
+
+    # Parts must not overlap (or sit closer than min_gap).
+    for i in range(len(parts)):
+        bi = parts[i].get('bbox')
+        if bi is None:
+            continue
+        for j in range(i + 1, len(parts)):
+            bj = parts[j].get('bbox')
+            if bj is None:
+                continue
+            clear_x = (bi[2] + min_gap <= bj[0] + tol) or (bj[2] + min_gap <= bi[0] + tol)
+            clear_y = (bi[3] + min_gap <= bj[1] + tol) or (bj[3] + min_gap <= bi[1] + tol)
+            if not (clear_x or clear_y):
+                ni = parts[i].get('name', f'part {i + 1}')
+                nj = parts[j].get('name', f'part {j + 1}')
+                gap_note = f" (need {min_gap:.3f}\" clearance)" if min_gap else ""
+                errors.append({
+                    'part_index': j,
+                    'name': nj,
+                    'error': f"{ni} and {nj} overlap or are too close{gap_note}."
+                })
+
+    return errors
+
+
+def assemble_job_gcode(part_jobs, header_pp, timestamp=None, suggested_filename=None):
+    """Stitch per-part G-code bodies into one multi-part program.
+
+    Args:
+        part_jobs: ordered list of dicts:
+            {'name': str, 'place_x': float, 'place_y': float, 'rotation': float,
+             'body': [str]}  -- 'body' is the toolpath-only output from
+             generate_gcode(include_header_footer=False).gcode.split('\\n').
+        header_pp: an FRCPostProcessor carrying the shared job parameters (material,
+            tool, thickness, spindle, park Z). Used to build the single header/footer
+            and estimate total cycle time. (v1: one tool/material per job.)
+        timestamp, suggested_filename: as in generate_gcode.
+
+    Returns:
+        PostProcessorResult with the assembled program and aggregate stats.
+    """
+    if not timestamp:
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    gcode = header_pp._generate_gcode_header(timestamp, is_job=True, job_part_count=len(part_jobs))
+
+    for i, pj in enumerate(part_jobs, 1):
+        name = pj.get('name', f'part {i}')
+        px = pj.get('place_x', 0.0)
+        py = pj.get('place_y', 0.0)
+        rot = pj.get('rotation', 0)
+        # Sanitize the name for a comment (no nested parens, ASCII only).
+        safe_name = str(name).replace('(', '[').replace(')', ']')
+        gcode.append("")
+        gcode.append(f"(===== PART {i}: {safe_name} @ X{px:.4f} Y{py:.4f} ROT {rot:g} deg =====)")
+        gcode.append(f"G53 G0 Z{header_pp.machine_park_z:.4f}  ; Safe Z between parts")
+        gcode.extend(pj.get('body', []))
+
+    gcode.extend(header_pp._generate_gcode_footer())
+
+    # Estimate total cycle time across the whole program and insert into the header.
+    time_estimate = header_pp._estimate_cycle_time(gcode)
+    for i, line in enumerate(gcode):
+        if line.startswith("(Operations:"):
+            time_lines = [
+                "",
+                f"(Estimated cycle time: {header_pp._format_time(time_estimate['total'])})",
+                f"(  Cutting: {header_pp._format_time(time_estimate['cutting'])}, Rapids: {header_pp._format_time(time_estimate['rapid'])}, Spindle: {header_pp._format_time(time_estimate['dwell'])})",
+                "(  Note: Estimate does not include acceleration/deceleration)"
+            ]
+            for j, time_line in enumerate(time_lines):
+                gcode.insert(i + 1 + j, time_line)
+            break
+
+    base_name = suggested_filename if suggested_filename else "job"
+    timestamp_for_file = timestamp.replace('-', '').replace(' ', '_').replace(':', '')
+    filename = f"{base_name}_{timestamp_for_file}.nc"
+
+    return PostProcessorResult(
+        success=True,
+        gcode='\n'.join(gcode),
+        filename=filename,
+        stats={
+            'num_parts': len(part_jobs),
+            'total_lines': len(gcode),
+            'cycle_time_seconds': time_estimate['total'],
+            'cycle_time_display': header_pp._format_time(time_estimate['total']),
+            'cutting_time': header_pp._format_time(time_estimate['cutting']),
+            'rapid_time': header_pp._format_time(time_estimate['rapid']),
+            'dwell_time': header_pp._format_time(time_estimate['dwell'])
+        }
+    )
 
 
 def add_timestamp_to_filename(filename: str) -> str:
