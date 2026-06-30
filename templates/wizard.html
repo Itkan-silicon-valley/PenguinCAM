@@ -162,6 +162,15 @@
         </footer>
     </div>
 
+    <div id="connect-overlay" hidden>
+        <div class="connect-card">
+            <h2>Connect to Onshape</h2>
+            <p>PenguinCAM needs access to your Onshape document to read parts.</p>
+            <button type="button" id="btn-connect" class="btn primary">Connect to Onshape</button>
+            <p class="hint" id="connect-status"></p>
+        </div>
+    </div>
+
     <div id="debug-overlay" hidden>
         <strong>debug</strong>
         <pre id="debug-content"></pre>
@@ -170,6 +179,8 @@
     <script>
       window.PenguinCAM = {
         source: {{ source|tojson }},
+        authenticated: {{ (authenticated if authenticated is defined else True)|tojson }},
+        onshape: {{ (onshape_ctx if onshape_ctx is defined else {})|tojson }},
         bed: { width: {{ machine_x_max|tojson }}, height: {{ machine_y_max|tojson }} },
         defaultTool: {{ default_tool_diameter|tojson }},
       };

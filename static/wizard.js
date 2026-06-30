@@ -308,12 +308,22 @@
     if (state.source === 'onshape') {
       $('#upload-source').hidden = true;
       $('#onshape-source').hidden = false;
+      var sel = $('#btn-select-face');
       // The Onshape adapter calls this when a face has been exported to a DXF blob.
       window.PenguinCAM.onPart = function (data, fileOrBlob) {
         var file = fileOrBlob instanceof File ? fileOrBlob : new File([fileOrBlob], (data.name || 'part') + '.dxf');
         addPartFromOutline(data, file);
       };
-      var sel = $('#btn-select-face');
+      window.PenguinCAM.onSelectionBusy = function (busy) {
+        if (!sel) return;
+        sel.disabled = busy;
+        sel.textContent = busy ? 'Exporting selected face…' : 'Select a face in Onshape';
+      };
+      window.PenguinCAM.onSelectionError = function (msg) {
+        dbg('onshape:error', msg);
+        if (sel) { sel.disabled = false; sel.textContent = 'Select a face in Onshape'; }
+        alert('Onshape selection failed: ' + msg);
+      };
       if (sel) sel.addEventListener('click', function () {
         if (window.PenguinCAM.requestOnshapeSelection) window.PenguinCAM.requestOnshapeSelection();
         else dbg('onshape', 'adapter not loaded');
@@ -598,15 +608,32 @@
     });
   }
 
+  function bindConnect() {
+    var btn = $('#btn-connect');
+    if (btn) btn.addEventListener('click', function () {
+      $('#connect-status').textContent = 'Opening Onshape sign-in…';
+      window.open('/onshape/auth?popup=1', 'penguincam_oauth', 'width=520,height=720');
+    });
+    // The OAuth popup posts this when the connect completes.
+    window.addEventListener('message', function (e) {
+      if (e.data === 'penguincam-auth-done') { dbg('auth', 'done'); location.reload(); }
+    });
+  }
+
   function init() {
     if (DEBUG) { $('#debug-overlay').hidden = false; }
+    window.PenguinCAM.debug = dbg; // let the Onshape adapter log into the debug overlay
     bindSetup();
     bindParts();
     bindLayout();
     bindPreview();
     bindNav();
+    bindConnect();
     gotoStep('setup');
-    dbg('init', { source: state.source });
+    dbg('init', { source: state.source, authed: CFG.authenticated });
+    if (state.source === 'onshape' && !CFG.authenticated) {
+      $('#connect-overlay').hidden = false;
+    }
   }
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);

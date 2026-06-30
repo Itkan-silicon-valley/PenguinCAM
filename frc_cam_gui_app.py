@@ -16,6 +16,7 @@ import shutil
 import traceback
 from pathlib import Path
 import json
+import base64
 import secrets
 import re
 import atexit
@@ -227,6 +228,16 @@ if secret_key:
 elif not app.secret_key:
     app.secret_key = secrets.token_hex(32)
     log("⚠️  WARNING: Using random secret key. Sessions will not persist across restarts.")
+
+# Embedded Onshape panel runs in an iframe, a third-party context. For the session
+# cookie (and thus OAuth/login) to be sent there, it must be SameSite=None; Secure,
+# which requires HTTPS. Enable in production (FLASK_SECRET_KEY set => HTTPS deploy)
+# or when EMBED_COOKIES=1. Left as Flask's default (Lax) for local HTTP dev.
+_embed_cookies = os.environ.get('EMBED_COOKIES', '').lower() in ('1', 'true', 'yes') or bool(secret_key)
+if _embed_cookies:
+    app.config['SESSION_COOKIE_SAMESITE'] = 'None'
+    app.config['SESSION_COOKIE_SECURE'] = True
+    log("🔒 Session cookie: SameSite=None; Secure (embeddable in Onshape iframe)")
     log("   Set FLASK_SECRET_KEY environment variable for persistent sessions.")
 
 # Initialize authentication if available
@@ -449,6 +460,36 @@ def _require_onshape_auth():
     return None
 
 
+def _compute_dxf_outline(path):
+    """Load a DXF and return its perimeter outline + dims + holes for the wizard layout
+    canvas/thumbnail. Coordinates normalized so the bounding-box minimum is (0,0).
+    Returns a dict (width, height, outline, holes) or None if there is no geometry."""
+    team_config = TeamConfig.from_dict(session.get('team_config_data', {}))
+    pp = FRCPostProcessor(material_thickness=0.25, tool_diameter=0.125,
+                          units='inch', config=team_config)
+    pp.load_dxf(path)
+    pp.transform_coordinates('bottom-left', 0, enforce_bounds=False)
+    pp.identify_perimeter_and_pockets()
+    pp.classify_holes()
+    bbox = pp.bounding_box()
+    if not bbox:
+        return None
+    minx, miny, maxx, maxy = bbox
+    width, height = maxx - minx, maxy - miny
+    outline = []
+    if pp.perimeter:
+        outline = [[round(x - minx, 4), round(y - miny, 4)] for (x, y) in pp.perimeter]
+    if len(outline) < 3:
+        outline = [[0, 0], [round(width, 4), 0],
+                   [round(width, 4), round(height, 4)], [0, round(height, 4)]]
+    holes = [{'cx': round(h['center'][0] - minx, 4),
+              'cy': round(h['center'][1] - miny, 4),
+              'r': round(h['diameter'] / 2.0, 4)}
+             for h in (pp.holes or [])]
+    return {'width': round(width, 4), 'height': round(height, 4),
+            'outline': outline, 'holes': holes}
+
+
 @app.route('/')
 def index():
     """Render the main GUI page"""
@@ -480,18 +521,30 @@ def wizard_app():
     gate = _require_onshape_auth()
     if gate:
         return gate
-    return render_template('wizard.html', source='upload', **_app_template_context())
+    return render_template('wizard.html', source='upload', authenticated=True,
+                           onshape_ctx={}, **_app_template_context())
 
 
 @app.route('/onshape-panel')
 def onshape_panel():
     """Multi-part wizard, embedded in the Onshape right-side panel (iframe). Same
     template/JS as /app, with the Onshape selection source. Sets framing + cookie
-    headers so the iframe and its OAuth/session work inside Onshape."""
-    gate = _require_onshape_auth()
-    if gate:
-        return gate
-    resp = make_response(render_template('wizard.html', source='onshape', **_app_template_context()))
+    headers so the iframe and its OAuth/session work inside Onshape.
+
+    Does NOT hard-redirect to OAuth when unauthenticated (the iframe cannot frame
+    Onshape's login). Instead it passes an `authenticated` flag and the wizard shows
+    a Connect button that runs OAuth in a popup."""
+    onshape_ctx = {
+        'documentId': request.args.get('documentId', ''),
+        'workspaceId': request.args.get('workspaceId', ''),
+        'elementId': request.args.get('elementId', ''),
+        'server': request.args.get('server', 'https://cad.onshape.com'),
+    }
+    authenticated = bool(ONSHAPE_AVAILABLE and session_manager.get_client(get_current_user_id()))
+    log(f"[PANEL] render did={onshape_ctx['documentId'][:8]} authed={authenticated}")
+    resp = make_response(render_template('wizard.html', source='onshape',
+                                         authenticated=authenticated, onshape_ctx=onshape_ctx,
+                                         **_app_template_context()))
     # Allow embedding only within Onshape; allow the session cookie to ride in the iframe.
     resp.headers['Content-Security-Policy'] = "frame-ancestors https://*.onshape.com"
     resp.headers.pop('X-Frame-Options', None)
@@ -968,41 +1021,12 @@ def part_outline():
         tmp.close()
         f.save(path)
 
-        team_config = TeamConfig.from_dict(session.get('team_config_data', {}))
-        pp = FRCPostProcessor(material_thickness=0.25, tool_diameter=0.125,
-                              units='inch', config=team_config)
-        pp.load_dxf(path)
-        pp.transform_coordinates('bottom-left', 0, enforce_bounds=False)
-        pp.identify_perimeter_and_pockets()
-        pp.classify_holes()
-
-        bbox = pp.bounding_box()
-        if not bbox:
+        geo = _compute_dxf_outline(path)
+        if not geo:
             return jsonify({'error': 'No geometry found in DXF'}), 400
-        minx, miny, maxx, maxy = bbox
-        width, height = maxx - minx, maxy - miny
-
-        outline = []
-        if pp.perimeter:
-            outline = [[round(x - minx, 4), round(y - miny, 4)] for (x, y) in pp.perimeter]
-        if len(outline) < 3:
-            # No closed perimeter (e.g. holes only) - fall back to the bounding rectangle.
-            outline = [[0, 0], [round(width, 4), 0],
-                       [round(width, 4), round(height, 4)], [0, round(height, 4)]]
-
-        holes = [{'cx': round(h['center'][0] - minx, 4),
-                  'cy': round(h['center'][1] - miny, 4),
-                  'r': round(h['diameter'] / 2.0, 4)}
-                 for h in (pp.holes or [])]
-
-        return jsonify({
-            'success': True,
-            'name': Path(f.filename).stem,
-            'width': round(width, 4),
-            'height': round(height, 4),
-            'outline': outline,
-            'holes': holes,
-        })
+        geo['success'] = True
+        geo['name'] = Path(f.filename).stem
+        return jsonify(geo)
     except Exception as e:
         log(traceback.format_exc())
         return jsonify({'error': str(e)}), 500
@@ -1288,6 +1312,13 @@ def onshape_auth():
         # Store state in session for verification
         session['onshape_oauth_state'] = state
 
+        # Popup mode (from the embedded panel): remember so the callback closes the
+        # popup and notifies the opener instead of navigating the whole window.
+        if request.args.get('popup'):
+            session['onshape_oauth_popup'] = True
+        else:
+            session.pop('onshape_oauth_popup', None)
+
         # Get authorization URL
         auth_url = client.get_authorization_url(state=state)
 
@@ -1381,6 +1412,11 @@ def onshape_oauth_callback():
         # Clean up OAuth state
         session.pop('onshape_oauth_state', None)
 
+        # Popup mode (embedded panel connect): close the popup and tell the opener.
+        if session.pop('onshape_oauth_popup', None):
+            session.pop('pending_onshape_import', None)
+            return redirect('/onshape/auth-complete')
+
         # Get pending import (if any)
         pending_import = session.pop('pending_onshape_import', None)
 
@@ -1394,6 +1430,86 @@ def onshape_oauth_callback():
         
     except Exception as e:
         return f"OAuth callback error: {str(e)}", 500
+
+
+@app.route('/onshape/auth-complete')
+def onshape_auth_complete():
+    """Tiny page shown in the OAuth popup after a successful connect: notify the
+    opener (the embedded panel) and close."""
+    return """<!doctype html><html><head><meta charset="utf-8"><title>Connected</title></head>
+<body style="font-family:-apple-system,sans-serif;background:#0f1419;color:#e6edf3;text-align:center;padding:2rem">
+<p>Connected to Onshape. You can close this window.</p>
+<script>
+  try { if (window.opener) window.opener.postMessage('penguincam-auth-done', '*'); } catch (e) {}
+  setTimeout(function () { window.close(); }, 400);
+</script></body></html>"""
+
+
+@app.route('/onshape/export-face', methods=['POST'])
+@limiter.limit("30 per minute")
+def onshape_export_face():
+    """Export a single selected Onshape face to a flat DXF and return its bytes
+    (base64) plus the outline/dims for the layout canvas. The browser holds the DXF
+    bytes and re-submits them at /process-job time (serverless-safe; no server cache)."""
+    client, err_resp, err_code = get_onshape_client_or_401()
+    if err_resp:
+        return err_resp, err_code
+
+    data = request.get_json(force=True, silent=True) or {}
+    did = data.get('documentId')
+    wid = data.get('workspaceId')
+    eid = data.get('elementId')
+    fid = data.get('faceId')
+    bid = data.get('partId') or data.get('bodyId')
+    if not all([did, wid, eid, fid]):
+        return jsonify({'error': 'Missing selection IDs (need document/workspace/element/face).'}), 400
+
+    log(f"[EXPORT] face did={str(did)[:8]} eid={str(eid)[:8]} fid={fid} bid={bid}")
+    path = None
+    try:
+        # Resolve the selected face's normal (for correct flatten orientation) and the
+        # part name (for the parts list) in one bodydetails call.
+        face_normal = None
+        name = data.get('name')
+        try:
+            faces = client.list_faces(did, wid, eid)
+            for body in (faces or {}).get('bodies', []):
+                for fc in body.get('faces', []):
+                    if fc.get('id') == fid:
+                        face_normal = (fc.get('surface') or {}).get('normal')
+                        if not name:
+                            name = (body.get('properties') or {}).get('name')
+                        break
+        except Exception:
+            pass
+
+        dxf_bytes = client.export_face_to_dxf(did, wid, eid, fid, body_id=bid, face_normal=face_normal)
+        session_manager.update_session_tokens(client)
+        if not dxf_bytes:
+            return jsonify({'error': 'Onshape returned no DXF for that face.'}), 502
+
+        tmp = tempfile.NamedTemporaryFile(suffix='.dxf', delete=False, dir=UPLOAD_FOLDER)
+        path = tmp.name
+        tmp.close()
+        with open(path, 'wb') as fh:
+            fh.write(dxf_bytes)
+
+        geo = _compute_dxf_outline(path)
+        if not geo:
+            return jsonify({'error': 'Exported DXF had no usable geometry.'}), 500
+
+        geo['name'] = name or 'Onshape part'
+        geo['success'] = True
+        geo['dxf'] = base64.b64encode(dxf_bytes).decode('ascii')
+        log(f"[EXPORT] ok name='{geo['name']}' {geo['width']}x{geo['height']}")
+        return jsonify(geo)
+    except Exception as e:
+        log(traceback.format_exc())
+        return jsonify({'error': f'Face export failed: {str(e)}'}), 500
+    finally:
+        if path and os.path.exists(path):
+            os.remove(path)
+
 
 @app.route('/onshape/status')
 @limiter.limit("30 per minute")
