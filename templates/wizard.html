@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PenguinCAM</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='wizard.css') }}">
+</head>
+<body data-source="{{ source }}">
+    <div id="wizard">
+        <header id="wiz-header">
+            <div class="brand">PenguinCAM</div>
+            <ol id="stepbar" aria-label="Steps">
+                <li data-step="setup" class="active">Setup</li>
+                <li data-step="parts">Parts</li>
+                <li data-step="layout">Layout</li>
+                <li data-step="preview">Preview</li>
+            </ol>
+        </header>
+
+        <main id="wiz-body">
+            <!-- ===== SETUP ===== -->
+            <section class="step" data-step="setup">
+                <h2>Setup</h2>
+
+                {% if machines and machines|length > 1 %}
+                <label class="field">
+                    <span>Machine</span>
+                    <select id="f-machine">
+                        {% for mid, m in machines.items() %}
+                        <option value="{{ mid }}" {% if mid == current_machine_id %}selected{% endif %}>{{ m.name }}</option>
+                        {% endfor %}
+                    </select>
+                </label>
+                {% endif %}
+
+                <fieldset class="field">
+                    <legend>Mode</legend>
+                    <label class="radio"><input type="radio" name="mode" value="2d" checked> 2D — flat plate (multi-part)</label>
+                    <label class="radio"><input type="radio" name="mode" value="2.5d"> 2.5D — derive thickness from CAD (single part)</label>
+                </fieldset>
+
+                <label class="field">
+                    <span>Tool diameter (in)</span>
+                    <input type="number" id="f-tool" step="0.001" min="0.01" value="{{ default_tool_diameter }}">
+                </label>
+
+                <label class="field">
+                    <span>Material</span>
+                    <select id="f-material">
+                        {% for mid, m in materials.items() if mid != 'aluminum_tube' %}
+                        <option value="{{ mid }}" {% if mid == 'plywood' %}selected{% endif %}>{{ m.name }}</option>
+                        {% endfor %}
+                    </select>
+                </label>
+
+                <label class="field" id="thickness-field">
+                    <span>Material thickness (in)</span>
+                    <input type="number" id="f-thickness" step="0.001" min="0.01" value="0.25">
+                </label>
+                <p class="hint" id="thickness-derived" style="display:none">
+                    Thickness is derived from the CAD part in 2.5D mode.
+                </p>
+            </section>
+
+            <!-- ===== PARTS ===== -->
+            <section class="step" data-step="parts" hidden>
+                <h2>Parts</h2>
+                <div id="upload-source">
+                    <div id="dropzone" tabindex="0">
+                        <p>Drop a DXF here or click to browse</p>
+                        <input type="file" id="f-dxf" accept=".dxf" hidden>
+                    </div>
+                </div>
+                <div id="onshape-source" hidden>
+                    <button type="button" id="btn-select-face" class="btn">Select a face in Onshape</button>
+                    <p class="hint">Pick a planar face in the model, then add it to the job.</p>
+                </div>
+                <p class="hint" id="parts-mode-note"></p>
+                <ul id="parts-list" aria-live="polite"></ul>
+            </section>
+
+            <!-- ===== LAYOUT ===== -->
+            <section class="step" data-step="layout" hidden>
+                <h2>Layout</h2>
+                <p class="hint">↔ Widen the panel for easier layout. Drag parts to position; rotate with the controls.</p>
+                <div class="sheet-fields">
+                    <label class="field inline"><span>Sheet W</span><input type="number" id="f-sheet-w" step="0.1" min="1"></label>
+                    <label class="field inline"><span>Sheet H</span><input type="number" id="f-sheet-h" step="0.1" min="1"></label>
+                </div>
+                <div id="layout-controls">
+                    <label class="field inline"><span>Selected rotation</span>
+                        <input type="range" id="f-rotation" min="0" max="359" step="1" value="0" disabled>
+                        <span id="rotation-val">0&deg;</span>
+                    </label>
+                    <button type="button" class="btn small" id="btn-rot-left" disabled>&#8634; -15&deg;</button>
+                    <button type="button" class="btn small" id="btn-rot-right" disabled>+15&deg; &#8635;</button>
+                </div>
+                <canvas id="layout-canvas" width="600" height="400"></canvas>
+                <div id="layout-errors" class="errors" aria-live="polite"></div>
+            </section>
+
+            <!-- ===== PREVIEW ===== -->
+            <section class="step" data-step="preview" hidden>
+                <h2>Preview &amp; Save</h2>
+                <button type="button" id="btn-generate" class="btn primary">Generate G-code</button>
+                <div id="gen-status" class="hint"></div>
+                <div id="preview-result" hidden>
+                    <canvas id="preview-canvas" width="600" height="400"></canvas>
+                    <div id="preview-stats"></div>
+                    <a id="download-link" class="btn primary" href="#" download>Download .nc</a>
+                </div>
+                <div id="preview-errors" class="errors" aria-live="polite"></div>
+            </section>
+        </main>
+
+        <footer id="wiz-nav">
+            <button type="button" id="btn-back" class="btn" disabled>Back</button>
+            <button type="button" id="btn-next" class="btn primary">Next</button>
+        </footer>
+    </div>
+
+    <div id="debug-overlay" hidden>
+        <strong>debug</strong>
+        <pre id="debug-content"></pre>
+    </div>
+
+    <script>
+      window.PenguinCAM = {
+        source: {{ source|tojson }},
+        bed: { width: {{ machine_x_max|tojson }}, height: {{ machine_y_max|tojson }} },
+        defaultTool: {{ default_tool_diameter|tojson }},
+      };
+    </script>
+    {% if source == 'onshape' %}
+    <script src="{{ url_for('static', filename='source_onshape.js') }}"></script>
+    {% endif %}
+    <script src="{{ url_for('static', filename='wizard.js') }}"></script>
+</body>
+</html>
