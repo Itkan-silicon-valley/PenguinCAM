@@ -2198,6 +2198,30 @@ class TestMultiPartEngine(unittest.TestCase):
         self.assertEqual(validate_job_layout(parts, 24, 24, 24, 24, min_gap=0.0), [])
         self.assertTrue(validate_job_layout(parts, 24, 24, 24, 24, min_gap=0.25))
 
+    def test_validate_concave_nesting_not_flagged(self):
+        """A small part nested in an L-shaped part's notch: bounding boxes overlap, but
+        the real perimeters are clear -> must NOT be flagged."""
+        from shapely.geometry import Polygon
+        L = Polygon([(0, 0), (6, 0), (6, 2), (2, 2), (2, 6), (0, 6)])  # bbox 0,0,6,6
+        small = Polygon([(2.5, 2.5), (5.5, 2.5), (5.5, 5.5), (2.5, 5.5)])  # nests in the notch
+        parts = [
+            {'name': 'L', 'bbox': (0, 0, 6, 6), 'polygon': L},
+            {'name': 'small', 'bbox': (2.5, 2.5, 5.5, 5.5), 'polygon': small},
+        ]
+        self.assertEqual(validate_job_layout(parts, 24, 24, 24, 24, min_gap=0.157), [])
+
+    def test_validate_real_overlap_still_flagged(self):
+        """Same L-shape but the small part intrudes into the solid arm -> flagged."""
+        from shapely.geometry import Polygon
+        L = Polygon([(0, 0), (6, 0), (6, 2), (2, 2), (2, 6), (0, 6)])
+        overlapping = Polygon([(1, 1), (4, 1), (4, 4), (1, 4)])  # crosses into L's arms
+        parts = [
+            {'name': 'L', 'bbox': (0, 0, 6, 6), 'polygon': L},
+            {'name': 'X', 'bbox': (1, 1, 4, 4), 'polygon': overlapping},
+        ]
+        errors = validate_job_layout(parts, 24, 24, 24, 24, min_gap=0.157)
+        self.assertTrue(any('overlap' in e['error'].lower() for e in errors))
+
 
 if __name__ == '__main__':
     unittest.main()

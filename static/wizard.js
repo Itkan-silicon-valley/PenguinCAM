@@ -91,28 +91,78 @@
     return { minX: part.place_x, minY: part.place_y, maxX: part.place_x + s.w, maxY: part.place_y + s.h, shape: s };
   }
 
-  // Mirror of validate_job_layout (sheet fit + overlap with kerf). Returns set of
-  // invalid part ids and a list of messages.
+  // The placed perimeter polygon in sheet coordinates (mirror of placed_polygon()).
+  function placedPolygon(part) {
+    var s = placedShape(part);
+    return s.pts.map(function (pt) { return [part.place_x + pt[0], part.place_y + pt[1]]; });
+  }
+
+  function segPointDist(px, py, ax, ay, bx, by) {
+    var dx = bx - ax, dy = by - ay, len2 = dx * dx + dy * dy;
+    if (len2 === 0) return Math.hypot(px - ax, py - ay);
+    var t = ((px - ax) * dx + (py - ay) * dy) / len2;
+    t = Math.max(0, Math.min(1, t));
+    return Math.hypot(px - (ax + t * dx), py - (ay + t * dy));
+  }
+  function segsIntersect(a, b, c, d) {
+    function ccw(p, q, r) { return (r[1] - p[1]) * (q[0] - p[0]) > (q[1] - p[1]) * (r[0] - p[0]); }
+    return ccw(a, c, d) !== ccw(b, c, d) && ccw(a, b, c) !== ccw(a, b, d);
+  }
+  function pointInPoly(pt, poly) {
+    var x = pt[0], y = pt[1], inside = false;
+    for (var i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+      var xi = poly[i][0], yi = poly[i][1], xj = poly[j][0], yj = poly[j][1];
+      if (((yi > y) !== (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi) + xi)) inside = !inside;
+    }
+    return inside;
+  }
+  // Minimum distance between two polygon outlines (0 if they intersect or one
+  // contains the other). Used for the kerf-gap proximity test.
+  function polyMinDist(A, B) {
+    if (pointInPoly(A[0], B) || pointInPoly(B[0], A)) return 0;
+    var min = Infinity;
+    for (var i = 0; i < A.length; i++) {
+      var a1 = A[i], a2 = A[(i + 1) % A.length];
+      for (var j = 0; j < B.length; j++) {
+        var b1 = B[j], b2 = B[(j + 1) % B.length];
+        if (segsIntersect(a1, a2, b1, b2)) return 0;
+        var d = Math.min(
+          segPointDist(a1[0], a1[1], b1[0], b1[1], b2[0], b2[1]),
+          segPointDist(a2[0], a2[1], b1[0], b1[1], b2[0], b2[1]),
+          segPointDist(b1[0], b1[1], a1[0], a1[1], a2[0], a2[1]),
+          segPointDist(b2[0], b2[1], a1[0], a1[1], a2[0], a2[1])
+        );
+        if (d < min) min = d;
+      }
+    }
+    return min;
+  }
+
+  // Mirror of validate_job_layout: sheet fit via bbox, plus a real-geometry overlap
+  // test (so a part nesting into another's concave region isn't a false positive).
   function validateLayout() {
     var msgs = [];
     var bad = {};
     var gap = state.tool_diameter;
     var W = state.sheet.width, H = state.sheet.height;
-    var boxes = state.parts.map(function (p) { return { id: p.id, name: p.name, box: footprint(p) }; });
-    boxes.forEach(function (b) {
+    var items = state.parts.map(function (p) { return { id: p.id, name: p.name, box: footprint(p), poly: placedPolygon(p) }; });
+    items.forEach(function (b) {
       if (b.box.minX < -1e-6 || b.box.minY < -1e-6 || b.box.maxX > W + 1e-6 || b.box.maxY > H + 1e-6) {
         bad[b.id] = true;
         msgs.push(b.name + ' extends outside the sheet.');
       }
     });
-    for (var i = 0; i < boxes.length; i++) {
-      for (var j = i + 1; j < boxes.length; j++) {
-        var a = boxes[i].box, c = boxes[j].box;
+    for (var i = 0; i < items.length; i++) {
+      for (var j = i + 1; j < items.length; j++) {
+        var a = items[i].box, c = items[j].box;
+        // Cheap bbox prune: clearly-separated boxes mean clear parts.
         var clearX = (a.maxX + gap <= c.minX + 1e-6) || (c.maxX + gap <= a.minX + 1e-6);
         var clearY = (a.maxY + gap <= c.minY + 1e-6) || (c.maxY + gap <= a.minY + 1e-6);
-        if (!(clearX || clearY)) {
-          bad[boxes[i].id] = true; bad[boxes[j].id] = true;
-          msgs.push(boxes[i].name + ' and ' + boxes[j].name + ' overlap or are too close.');
+        if (clearX || clearY) continue;
+        // Boxes are close - test the actual perimeters.
+        if (polyMinDist(items[i].poly, items[j].poly) < gap - 1e-6) {
+          bad[items[i].id] = true; bad[items[j].id] = true;
+          msgs.push(items[i].name + ' and ' + items[j].name + ' overlap or are too close.');
         }
       }
     }

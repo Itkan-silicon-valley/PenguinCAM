@@ -1099,6 +1099,24 @@ class FRCPostProcessor:
             return None
         return (min(all_x), min(all_y), max(all_x), max(all_y))
 
+    def placed_polygon(self):
+        """Return a Shapely Polygon of this part's outer perimeter in current
+        (already-transformed) coordinates, for multi-part overlap tests. Uses the
+        identified perimeter when available; otherwise falls back to the bounding
+        rectangle so disjoint parts still get a real-geometry distance check."""
+        if self.perimeter and len(self.perimeter) >= 3:
+            try:
+                poly = Polygon(self.perimeter)
+                if poly.is_valid and not poly.is_empty:
+                    return poly
+            except Exception:
+                pass
+        bbox = self.bounding_box()
+        if not bbox:
+            return None
+        minx, miny, maxx, maxy = bbox
+        return Polygon([(minx, miny), (maxx, miny), (maxx, maxy), (minx, maxy)])
+
     def classify_holes(self):
         """Classify holes by diameter"""
         # Classify all circles as holes (apply size check)
@@ -5094,7 +5112,10 @@ def validate_job_layout(parts, stock_width, stock_height, machine_x_max, machine
                           f"sheet {stock_width:.2f}\" x {stock_height:.2f}\").")
             })
 
-    # Parts must not overlap (or sit closer than min_gap).
+    # Parts must not overlap (or sit closer than min_gap). When a placed perimeter
+    # polygon is supplied, test the real geometry (so a part can nest into another's
+    # concave region even though their bounding boxes intersect). Otherwise fall back
+    # to a bounding-box gap test.
     for i in range(len(parts)):
         bi = parts[i].get('bbox')
         if bi is None:
@@ -5103,9 +5124,23 @@ def validate_job_layout(parts, stock_width, stock_height, machine_x_max, machine
             bj = parts[j].get('bbox')
             if bj is None:
                 continue
+
+            # Cheap bbox prune: if the boxes themselves clear the gap, parts are clear.
             clear_x = (bi[2] + min_gap <= bj[0] + tol) or (bj[2] + min_gap <= bi[0] + tol)
             clear_y = (bi[3] + min_gap <= bj[1] + tol) or (bj[3] + min_gap <= bi[1] + tol)
-            if not (clear_x or clear_y):
+            if clear_x or clear_y:
+                continue
+
+            pi = parts[i].get('polygon')
+            pj = parts[j].get('polygon')
+            too_close = True
+            if pi is not None and pj is not None:
+                try:
+                    too_close = pi.distance(pj) < (min_gap - tol)
+                except Exception:
+                    too_close = True  # geometry error -> be conservative
+
+            if too_close:
                 ni = parts[i].get('name', f'part {i + 1}')
                 nj = parts[j].get('name', f'part {j + 1}')
                 gap_note = f" (need {min_gap:.3f}\" clearance)" if min_gap else ""

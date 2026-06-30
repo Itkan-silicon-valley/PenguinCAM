@@ -871,7 +871,7 @@ def process_job():
             pp.identify_perimeter_and_pockets()
             pp.classify_holes()
             bbox = pp.bounding_box()
-            placed.append({'name': name, 'bbox': bbox})
+            placed.append({'name': name, 'bbox': bbox, 'polygon': pp.placed_polygon()})
             prepared.append({'pp': pp, 'bbox': bbox, 'name': name,
                              'place_x': place_x, 'place_y': place_y, 'rotation': rotation})
 
