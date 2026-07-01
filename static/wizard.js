@@ -610,13 +610,30 @@
 
   function bindConnect() {
     var btn = $('#btn-connect');
+    var poll = null;
+    function stopPoll() { if (poll) { clearInterval(poll); poll = null; } }
+    function checkAuthed() {
+      fetch('/onshape/authed', { credentials: 'same-origin' })
+        .then(function (r) { return r.json(); })
+        .then(function (j) {
+          dbg('authed-poll', j);
+          if (j && j.authenticated) { stopPoll(); location.reload(); }
+        })
+        .catch(function (e) { dbg('authed-poll:err', String(e)); });
+    }
     if (btn) btn.addEventListener('click', function () {
-      $('#connect-status').textContent = 'Opening Onshape sign-in…';
+      $('#connect-status').textContent = 'Opening Onshape sign-in… complete it in the popup.';
       window.open('/onshape/auth?popup=1', 'penguincam_oauth', 'width=520,height=720');
+      // Poll for auth completion. Cross-origin OAuth navigation usually severs
+      // window.opener, so we don't rely on a postMessage from the popup; the iframe
+      // asks the server (via its own cookie) whether tokens have landed yet.
+      stopPoll();
+      poll = setInterval(checkAuthed, 1500);
+      setTimeout(stopPoll, 120000); // give up after 2 min
     });
-    // The OAuth popup posts this when the connect completes.
+    // Fast path if the opener relationship happens to survive.
     window.addEventListener('message', function (e) {
-      if (e.data === 'penguincam-auth-done') { dbg('auth', 'done'); location.reload(); }
+      if (e.data === 'penguincam-auth-done') { dbg('auth', 'done-msg'); stopPoll(); location.reload(); }
     });
   }
 

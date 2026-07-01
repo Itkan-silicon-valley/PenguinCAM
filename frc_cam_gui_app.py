@@ -1473,6 +1473,16 @@ def onshape_auth_complete():
 </script></body></html>"""
 
 
+@app.route('/onshape/authed')
+def onshape_authed():
+    """Cheap session-only auth check (no Onshape API call) for the panel's connect
+    poll. The embedded iframe polls this after opening the OAuth popup and reloads
+    once tokens land in the session — avoids relying on window.opener/postMessage,
+    which cross-origin OAuth navigation often severs."""
+    authed = bool(ONSHAPE_AVAILABLE and session_manager.get_client(get_current_user_id()))
+    return jsonify({'authenticated': authed})
+
+
 @app.route('/onshape/export-face', methods=['POST'])
 @limiter.limit("30 per minute")
 def onshape_export_face():
