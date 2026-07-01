@@ -120,7 +120,6 @@ fieldset.field { border: 1px solid var(--line); border-radius: 6px; padding: 8px
 .part-item .remove { color: var(--danger); background: none; border: none; cursor: pointer; font-size: 18px; }
 
 .sheet-fields { display: flex; gap: 12px; }
-#layout-controls { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 8px 0; }
 #layout-canvas, #preview-canvas {
   width: 100%;
   height: auto;

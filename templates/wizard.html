@@ -99,18 +99,10 @@
             <!-- ===== LAYOUT ===== -->
             <section class="step" data-step="layout" hidden>
                 <h2>Layout</h2>
-                <p class="hint">↔ Widen the panel for easier layout. Drag parts to position; rotate with the controls.</p>
+                <p class="hint">↔ Widen the panel for easier layout. Click a part to select it, drag to position, and drag the round handle above it to rotate (snaps to 45°).</p>
                 <div class="sheet-fields">
                     <label class="field inline"><span>Sheet W</span><input type="number" id="f-sheet-w" step="0.1" min="1"></label>
                     <label class="field inline"><span>Sheet H</span><input type="number" id="f-sheet-h" step="0.1" min="1"></label>
-                </div>
-                <div id="layout-controls">
-                    <label class="field inline"><span>Selected rotation</span>
-                        <input type="range" id="f-rotation" min="0" max="359" step="1" value="0" disabled>
-                        <span id="rotation-val">0&deg;</span>
-                    </label>
-                    <button type="button" class="btn small" id="btn-rot-left" disabled>&#8634; -15&deg;</button>
-                    <button type="button" class="btn small" id="btn-rot-right" disabled>+15&deg; &#8635;</button>
                 </div>
                 <canvas id="layout-canvas" width="600" height="400"></canvas>
                 <div id="layout-errors" class="errors" aria-live="polite"></div>

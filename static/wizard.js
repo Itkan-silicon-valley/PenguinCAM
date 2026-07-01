@@ -21,7 +21,7 @@
     thickness: 0.25,
     tab_spacing: 6.0,
     sheet: { width: CFG.bed.width || 24, height: CFG.bed.height || 24 },
-    parts: [],            // {id,name,width,height,outline,holes,file,place_x,place_y,rotation}
+    parts: [],            // {id,name,width,height,outline,holes,file,cx,cy,rotation}
     selectedId: null,
     lastResponse: null,
   };
@@ -47,7 +47,7 @@
       source: state.source, step: state.step, mode: state.mode,
       tool: state.tool_diameter, sheet: state.sheet,
       parts: state.parts.map(function (p) {
-        return { name: p.name, w: p.width, h: p.height, x: p.place_x, y: p.place_y, rot: p.rotation };
+        return { name: p.name, w: p.width, h: p.height, cx: p.cx, cy: p.cy, rot: p.rotation };
       }),
     };
     el.textContent = JSON.stringify(snapshot, null, 1) + '\n--- events ---\n' +
@@ -86,15 +86,23 @@
     return { pts: norm, holes: holes, w: maxX - minX, h: maxY - minY };
   }
 
-  function footprint(part) {
+  // Parts are stored by their center (cx, cy) so rotation happens in place. The
+  // placement is the derived axis-aligned footprint whose bbox-min the server pins to
+  // place_x/place_y.
+  function placement(part) {
     var s = placedShape(part);
-    return { minX: part.place_x, minY: part.place_y, maxX: part.place_x + s.w, maxY: part.place_y + s.h, shape: s };
+    return { x: part.cx - s.w / 2, y: part.cy - s.h / 2, w: s.w, h: s.h, shape: s };
+  }
+
+  function footprint(part) {
+    var p = placement(part);
+    return { minX: p.x, minY: p.y, maxX: p.x + p.w, maxY: p.y + p.h, shape: p.shape };
   }
 
   // The placed perimeter polygon in sheet coordinates (mirror of placed_polygon()).
   function placedPolygon(part) {
-    var s = placedShape(part);
-    return s.pts.map(function (pt) { return [part.place_x + pt[0], part.place_y + pt[1]]; });
+    var p = placement(part);
+    return p.shape.pts.map(function (pt) { return [p.x + pt[0], p.y + pt[1]]; });
   }
 
   function segPointDist(px, py, ax, ay, bx, by) {
@@ -270,12 +278,14 @@
       width: data.width, height: data.height,
       outline: data.outline, holes: data.holes || [],
       file: file,
-      place_x: 0, place_y: 0, rotation: 0,
+      cx: 0, cy: 0, rotation: 0,
     };
-    // Naive initial placement: stack to the right of existing parts.
-    var x = 0;
-    state.parts.forEach(function (q) { x = Math.max(x, q.place_x + footprint(q).maxX - q.place_x + state.tool_diameter); });
-    p.place_x = state.parts.length ? x : 0;
+    // Initial placement: bottom edge on Y=0, stacked to the right of existing parts.
+    var s = placedShape(p);
+    var startX = 0;
+    state.parts.forEach(function (q) { startX = Math.max(startX, footprint(q).maxX + state.tool_diameter); });
+    p.cx = startX + s.w / 2;
+    p.cy = s.h / 2;
     state.parts.push(p);
     if (state.selectedId == null) state.selectedId = p.id;
     renderParts();
@@ -341,7 +351,7 @@
   }
 
   /* -------------------------------------------------------------- layout */
-  var canvasState = { scale: 1, ox: 0, oy: 0, dragging: null, grab: null };
+  var canvasState = { scale: 1, ox: 0, oy: 0, action: null };
 
   function fitTransform(canvas) {
     var W = state.sheet.width, H = state.sheet.height;
@@ -354,6 +364,25 @@
   function worldToCanvas(x, y) { return [canvasState.ox + x * canvasState.scale, canvasState.oy - y * canvasState.scale]; }
   function canvasToWorld(cx, cy) { return [(cx - canvasState.ox) / canvasState.scale, (canvasState.oy - cy) / canvasState.scale]; }
 
+  function selectedPart() { return state.parts.filter(function (p) { return p.id === state.selectedId; })[0]; }
+
+  // Canvas geometry of a part's rotation handle: outside the footprint, along the
+  // part's "up" direction after rotation (so it points toward the pointer while
+  // rotating and shows orientation at rest).
+  function handleGeom(part) {
+    var pl = placement(part);
+    var ctr = worldToCanvas(part.cx, part.cy);
+    var up = rotatePoint(0, 1, part.rotation);
+    var upc = worldToCanvas(part.cx + up[0], part.cy + up[1]);
+    var dx = upc[0] - ctr[0], dy = upc[1] - ctr[1], len = Math.hypot(dx, dy) || 1;
+    dx /= len; dy /= len;
+    var edge = 0.5 * Math.hypot(pl.w * canvasState.scale, pl.h * canvasState.scale);
+    return {
+      ex: ctr[0] + dx * edge, ey: ctr[1] + dy * edge,           // stem start (box corner radius)
+      hx: ctr[0] + dx * (edge + 26), hy: ctr[1] + dy * (edge + 26) // handle center
+    };
+  }
+
   function drawLayout() {
     var canvas = $('#layout-canvas');
     if (!canvas) return;
@@ -361,25 +390,24 @@
     fitTransform(canvas);
     ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-    // Sheet
+    // Sheet + machine-origin marker.
     var o = worldToCanvas(0, 0), tr = worldToCanvas(state.sheet.width, state.sheet.height);
     ctx.fillStyle = '#11161d';
-    ctx.fillRect(tr[0] < o[0] ? tr[0] : o[0], tr[1], Math.abs(tr[0] - o[0]), Math.abs(o[1] - tr[1]));
+    ctx.fillRect(Math.min(o[0], tr[0]), tr[1], Math.abs(tr[0] - o[0]), Math.abs(o[1] - tr[1]));
     ctx.strokeStyle = '#3b4654'; ctx.lineWidth = 1;
     ctx.strokeRect(o[0], tr[1], (tr[0] - o[0]), (o[1] - tr[1]));
-    // origin marker
     ctx.fillStyle = '#3fb950'; ctx.beginPath(); ctx.arc(o[0], o[1], 4, 0, 7); ctx.fill();
 
     var v = validateLayout();
     $('#layout-errors').textContent = v.msgs.join('\n');
 
     state.parts.forEach(function (p) {
-      var s = placedShape(p);
+      var pl = placement(p), s = pl.shape;
       var invalid = !!v.bad[p.id];
       var selected = p.id === state.selectedId;
       ctx.beginPath();
       s.pts.forEach(function (pt, i) {
-        var c = worldToCanvas(p.place_x + pt[0], p.place_y + pt[1]);
+        var c = worldToCanvas(pl.x + pt[0], pl.y + pt[1]);
         if (i) ctx.lineTo(c[0], c[1]); else ctx.moveTo(c[0], c[1]);
       });
       ctx.closePath();
@@ -389,14 +417,31 @@
       ctx.lineWidth = selected ? 2 : 1;
       ctx.stroke();
       s.holes.forEach(function (h) {
-        var c = worldToCanvas(p.place_x + h.cx, p.place_y + h.cy);
+        var c = worldToCanvas(pl.x + h.cx, pl.y + h.cy);
         ctx.beginPath(); ctx.arc(c[0], c[1], Math.max(1, h.r * canvasState.scale), 0, 7); ctx.strokeStyle = '#9aa7b4'; ctx.stroke();
       });
-      // label
-      var lc = worldToCanvas(p.place_x, p.place_y + s.h);
+      var lc = worldToCanvas(pl.x, pl.y + pl.h);
       ctx.fillStyle = '#e6edf3'; ctx.font = '11px sans-serif';
       ctx.fillText(p.name, lc[0] + 3, lc[1] + 12);
     });
+
+    // Selection footprint box + rotation handle.
+    var sel = selectedPart();
+    if (sel) {
+      var pl = placement(sel);
+      var a = worldToCanvas(pl.x, pl.y), b = worldToCanvas(pl.x + pl.w, pl.y + pl.h);
+      ctx.save();
+      ctx.strokeStyle = '#2f81f7'; ctx.lineWidth = 1; ctx.setLineDash([4, 3]);
+      ctx.strokeRect(Math.min(a[0], b[0]), Math.min(a[1], b[1]), Math.abs(b[0] - a[0]), Math.abs(b[1] - a[1]));
+      ctx.setLineDash([]);
+      var hg = handleGeom(sel);
+      ctx.beginPath(); ctx.moveTo(hg.ex, hg.ey); ctx.lineTo(hg.hx, hg.hy);
+      ctx.strokeStyle = '#2f81f7'; ctx.lineWidth = 1.5; ctx.stroke();
+      ctx.beginPath(); ctx.arc(hg.hx, hg.hy, 6, 0, 7); ctx.fillStyle = '#2f81f7'; ctx.fill();
+      ctx.fillStyle = '#e6edf3'; ctx.font = '11px sans-serif';
+      ctx.fillText(Math.round(((sel.rotation % 360) + 360) % 360) + '°', hg.hx + 9, hg.hy + 4);
+      ctx.restore();
+    }
   }
 
   function hitTest(wx, wy) {
@@ -408,6 +453,16 @@
     return null;
   }
 
+  // Rotate a part to face the pointer, pivoting on its center (so it stays put).
+  // Snaps within 5 degrees of a 45-degree multiple.
+  function rotateToPointer(part, wx, wy) {
+    var deg = 90 - Math.atan2(wy - part.cy, wx - part.cx) * 180 / Math.PI;
+    deg = ((deg % 360) + 360) % 360;
+    var snapped = Math.round(deg / 45) * 45;
+    if (Math.abs(snapped - deg) <= 5) deg = snapped % 360;
+    part.rotation = deg;
+  }
+
   function bindLayout() {
     $('#f-sheet-w').value = state.sheet.width;
     $('#f-sheet-h').value = state.sheet.height;
@@ -415,70 +470,59 @@
     $('#f-sheet-h').addEventListener('input', function () { state.sheet.height = parseFloat(this.value) || state.sheet.height; drawLayout(); });
 
     var canvas = $('#layout-canvas');
-    function evtWorld(e) {
+    function evtCanvas(e) {
       var rect = canvas.getBoundingClientRect();
       var t = e.touches ? e.touches[0] : e;
-      var cx = (t.clientX - rect.left) * (canvas.width / rect.width);
-      var cy = (t.clientY - rect.top) * (canvas.height / rect.height);
-      return canvasToWorld(cx, cy);
+      return [(t.clientX - rect.left) * (canvas.width / rect.width),
+              (t.clientY - rect.top) * (canvas.height / rect.height)];
     }
     function down(e) {
-      var w = evtWorld(e);
+      var c = evtCanvas(e), w = canvasToWorld(c[0], c[1]);
+      var sel = selectedPart();
+      if (sel) {
+        var hg = handleGeom(sel);
+        if (Math.hypot(c[0] - hg.hx, c[1] - hg.hy) <= 12) {
+          canvasState.action = { type: 'rotate', part: sel };
+          e.preventDefault();
+          return;
+        }
+      }
       var hit = hitTest(w[0], w[1]);
       if (hit) {
         state.selectedId = hit.id;
-        canvasState.dragging = hit;
-        canvasState.grab = [w[0] - hit.place_x, w[1] - hit.place_y];
-        syncRotationControls();
+        canvasState.action = { type: 'drag', part: hit, grab: [w[0] - hit.cx, w[1] - hit.cy] };
         drawLayout();
         e.preventDefault();
+      } else if (sel) {
+        state.selectedId = null;  // click empty space to deselect
+        drawLayout();
       }
     }
     function move(e) {
-      if (!canvasState.dragging) return;
-      var w = evtWorld(e);
-      var p = canvasState.dragging;
-      p.place_x = Math.max(0, w[0] - canvasState.grab[0]);
-      p.place_y = Math.max(0, w[1] - canvasState.grab[1]);
+      var act = canvasState.action;
+      if (!act) return;
+      var c = evtCanvas(e), w = canvasToWorld(c[0], c[1]);
+      if (act.type === 'drag') {
+        act.part.cx = w[0] - act.grab[0];
+        act.part.cy = w[1] - act.grab[1];
+        // Keep the footprint on the sheet side of the machine origin (no negative coords).
+        var pl = placement(act.part);
+        if (pl.x < 0) act.part.cx -= pl.x;
+        if (pl.y < 0) act.part.cy -= pl.y;
+      } else if (act.type === 'rotate') {
+        rotateToPointer(act.part, w[0], w[1]);
+      }
       drawLayout();
       e.preventDefault();
     }
-    function up() { canvasState.dragging = null; }
+    function up() { canvasState.action = null; }
     canvas.addEventListener('mousedown', down);
     window.addEventListener('mousemove', move);
     window.addEventListener('mouseup', up);
     canvas.addEventListener('touchstart', down, { passive: false });
     canvas.addEventListener('touchmove', move, { passive: false });
     canvas.addEventListener('touchend', up);
-
-    var rot = $('#f-rotation');
-    rot.addEventListener('input', function () { setRotation(parseFloat(this.value)); });
-    $('#btn-rot-left').addEventListener('click', function () { nudgeRotation(-15); });
-    $('#btn-rot-right').addEventListener('click', function () { nudgeRotation(15); });
   }
-
-  function selectedPart() { return state.parts.filter(function (p) { return p.id === state.selectedId; })[0]; }
-
-  function syncRotationControls() {
-    var p = selectedPart();
-    var has = !!p;
-    $('#f-rotation').disabled = !has;
-    $('#btn-rot-left').disabled = !has;
-    $('#btn-rot-right').disabled = !has;
-    if (has) { $('#f-rotation').value = p.rotation; $('#rotation-val').innerHTML = p.rotation.toFixed(0) + '&deg;'; }
-  }
-
-  function setRotation(deg) {
-    var p = selectedPart(); if (!p) return;
-    deg = ((deg % 360) + 360) % 360;
-    // Snap within 5 degrees of a 45-degree multiple.
-    var snapped = Math.round(deg / 45) * 45;
-    if (Math.abs(snapped - deg) <= 5) deg = snapped % 360;
-    p.rotation = deg;
-    $('#rotation-val').innerHTML = deg.toFixed(0) + '&deg;';
-    drawLayout();
-  }
-  function nudgeRotation(delta) { var p = selectedPart(); if (!p) return; setRotation(p.rotation + delta); $('#f-rotation').value = p.rotation; }
 
   /* ------------------------------------------------------------- preview */
   function resetPreview() {
@@ -508,7 +552,8 @@
       name: 'job', parts: [],
     };
     state.parts.forEach(function (p, i) {
-      job.parts.push({ file_index: i, name: p.name, place_x: p.place_x, place_y: p.place_y, rotation: p.rotation });
+      var pl = placement(p);
+      job.parts.push({ file_index: i, name: p.name, place_x: pl.x, place_y: pl.y, rotation: p.rotation });
       fd.append('file_' + i, p.file, p.name + '.dxf');
     });
     fd.append('job', JSON.stringify(job));
@@ -598,7 +643,6 @@
     $('#btn-next').addEventListener('click', function () {
       var idx = STEPS.indexOf(state.step);
       if (idx < STEPS.length - 1 && canLeave(state.step)) {
-        if (STEPS[idx + 1] === 'layout') syncRotationControls();
         gotoStep(STEPS[idx + 1]);
       }
     });

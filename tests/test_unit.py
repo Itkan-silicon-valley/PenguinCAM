@@ -1849,6 +1849,28 @@ class TestMultiTier25D(unittest.TestCase):
                 hatch.paths.add_polyline_path(pts + [pts[0]], is_closed=True)
         doc.saveas(filename)
 
+    def test_thickness_derived_from_cad_layers(self):
+        """A multilayer DXF's thickness comes from its deepest layer, overriding whatever
+        thickness the caller passed (the wizard sends a placeholder in 2.5D mode)."""
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix='.dxf', delete=False) as f:
+            dxf_path = f.name
+        try:
+            self._create_dxf(dxf_path, {
+                'Z_0p500': [(0, 0, 6, 6)],       # top face at 0.5" => stock is 0.5" thick
+                'Z_0p250': [(2, 2, 2, 2)],
+                'Z_0p000': [(0, 0, 6, 6)],
+            })
+            pp = FRCPostProcessor(material_thickness=0.125, tool_diameter=0.125)  # deliberately wrong
+            pp.apply_material_preset('plywood')
+            pp.load_dxf(dxf_path)
+            self.assertAlmostEqual(pp.material_thickness, 0.5, places=3)
+            self.assertAlmostEqual(pp.material_top, 0.5, places=3)
+            self.assertAlmostEqual(pp.retract_height, 0.5 + pp.clearance_height, places=3)
+        finally:
+            if os.path.exists(dxf_path):
+                os.remove(dxf_path)
+
     def test_three_tier_nested_pockets(self):
         import tempfile
         import re

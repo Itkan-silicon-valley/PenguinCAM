@@ -520,6 +520,18 @@ class FRCPostProcessor:
             self.circles = [circle.copy() for circle in self.layer_data[top_layer]['circles']]
             self.polylines = [polyline[:] for polyline in self.layer_data[top_layer]['polylines']]
 
+            # Derive stock thickness from the CAD layers themselves. In the Z convention
+            # (Z=0 sacrifice board, top face at Z=thickness), the deepest layer depth IS
+            # the material thickness. This makes 2.5D authoritative from geometry, so the
+            # wizard doesn't ask the user for thickness in 2.5D mode. Also refresh the
+            # thickness-derived heights that __init__ computed from the (placeholder) arg.
+            max_depth = max((info['depth'] for info in self.layer_data.values()), default=0.0)
+            if max_depth > 0:
+                self.material_thickness = max_depth
+                self.material_top = max_depth
+                self.retract_height = max_depth + self.clearance_height
+                print(f"  Derived stock thickness from CAD layers: {max_depth:.4f}\"")
+
     def _chain_entities_to_paths(self, lines, arcs, splines, unclosed_polylines=None):
         """
         Chain individual LINE, ARC, SPLINE, and unclosed LWPOLYLINE entities into closed paths.
