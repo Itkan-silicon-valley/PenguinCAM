@@ -230,14 +230,25 @@ elif not app.secret_key:
     log("⚠️  WARNING: Using random secret key. Sessions will not persist across restarts.")
 
 # Embedded Onshape panel runs in an iframe, a third-party context. For the session
-# cookie (and thus OAuth/login) to be sent there, it must be SameSite=None; Secure,
-# which requires HTTPS. Enable in production (FLASK_SECRET_KEY set => HTTPS deploy)
-# or when EMBED_COOKIES=1. Left as Flask's default (Lax) for local HTTP dev.
-_embed_cookies = os.environ.get('EMBED_COOKIES', '').lower() in ('1', 'true', 'yes') or bool(secret_key)
+# cookie (and thus OAuth/login) to be sent there, it MUST be SameSite=None; Secure
+# (requires HTTPS). Without this, the OAuth popup sets the cookie first-party but the
+# iframe's reload can't send it back, so the panel stays "not authenticated".
+#
+# EMBED_COOKIES explicitly forces on/off; otherwise auto-enable on deployed HTTPS
+# platforms (Railway/Vercel set PORT / platform vars, or FLASK_SECRET_KEY is set).
+# Left as Flask's default (Lax) only for local HTTP dev.
+_embed_env = os.environ.get('EMBED_COOKIES')
+if _embed_env is not None:
+    _embed_cookies = _embed_env.strip().lower() in ('1', 'true', 'yes')
+else:
+    _embed_cookies = bool(secret_key or os.environ.get('PORT')
+                          or os.environ.get('RAILWAY_ENVIRONMENT') or os.environ.get('VERCEL'))
 if _embed_cookies:
     app.config['SESSION_COOKIE_SAMESITE'] = 'None'
     app.config['SESSION_COOKIE_SECURE'] = True
     log("🔒 Session cookie: SameSite=None; Secure (embeddable in Onshape iframe)")
+else:
+    log("🍪 Session cookie: default SameSite=Lax — set EMBED_COOKIES=1 for Onshape iframe embedding")
     log("   Set FLASK_SECRET_KEY environment variable for persistent sessions.")
 
 # Initialize authentication if available
