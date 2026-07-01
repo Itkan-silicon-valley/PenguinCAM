@@ -610,43 +610,36 @@
 
   function bindConnect() {
     var btn = $('#btn-connect');
-    var poll = null;
-    var reloading = false;
-    function stopPoll() { if (poll) { clearInterval(poll); poll = null; } }
-    // Fire exactly one reload. Several poll fetches (and the postMessage fast-path)
-    // can resolve at once when auth flips true; without this guard each reload cancels
-    // the previous navigation and the frame never commits the authenticated page.
-    function reloadOnce(reason) {
-      if (reloading) return;
-      reloading = true;
-      stopPoll();
-      dbg('reload', reason);
-      location.reload();
-    }
-    function checkAuthed() {
+    if (!btn) return;
+    var watching = false;
+    function setStatus(msg) { $('#connect-status').textContent = msg; }
+
+    // Confirm the iframe's own session is authenticated, then reload once to re-render
+    // with the now-authenticated server context (config banner, material/tool options).
+    function verifyAndEnter() {
       fetch('/onshape/authed', { credentials: 'same-origin' })
         .then(function (r) { return r.json(); })
         .then(function (j) {
-          dbg('authed-poll', j);
-          if (j && j.authenticated) reloadOnce('poll');
+          dbg('authed-check', j);
+          if (j && j.authenticated) location.reload();
+          else { watching = false; setStatus('Sign-in didn’t complete. Click Connect to try again.'); }
         })
-        .catch(function (e) { dbg('authed-poll:err', String(e)); });
+        .catch(function (e) { watching = false; dbg('authed-check:err', String(e)); setStatus('Could not verify sign-in — try again.'); });
     }
-    if (btn) btn.addEventListener('click', function () {
-      $('#connect-status').textContent = 'Opening Onshape sign-in… complete it in the popup.';
-      window.open('/onshape/auth?popup=1', 'penguincam_oauth', 'width=520,height=720');
-      // Poll for auth completion. Cross-origin OAuth navigation usually severs
-      // window.opener, so we don't rely on a postMessage from the popup; the iframe
-      // asks the server (via its own cookie) whether tokens have landed yet.
-      stopPoll();
-      poll = setInterval(checkAuthed, 2000);
-      setTimeout(stopPoll, 120000); // give up after 2 min
-    });
-    // Note: we deliberately do NOT reload on the popup's postMessage, because that
-    // fires when OAuth *completes* regardless of whether the iframe's cookie carries
-    // the tokens. Only the poll (which reflects the iframe's actual session) reloads.
-    window.addEventListener('message', function (e) {
-      if (e.data === 'penguincam-auth-done') dbg('auth', 'popup-msg (not reloading; waiting for poll)');
+
+    btn.addEventListener('click', function () {
+      if (watching) return;
+      var popup = window.open('/onshape/auth?popup=1', 'penguincam_oauth', 'width=520,height=720');
+      if (!popup) { setStatus('Popup blocked — allow popups for this site, then click Connect.'); return; }
+      watching = true;
+      setStatus('Complete sign-in in the popup window…');
+      // Watch the popup close locally (no server polling); cross-origin OAuth navigation
+      // severs window.opener, so a postMessage from the popup isn't reliable. When it
+      // closes, verify auth once. A safety cap stops the watcher if the popup lingers.
+      var iv = setInterval(function () {
+        if (popup.closed) { clearInterval(iv); setStatus('Finishing sign-in…'); verifyAndEnter(); }
+      }, 500);
+      setTimeout(function () { clearInterval(iv); }, 180000);
     });
   }
 

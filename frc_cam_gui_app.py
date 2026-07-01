@@ -552,9 +552,7 @@ def _serve_onshape_panel():
         'server': request.args.get('server', 'https://cad.onshape.com'),
     }
     authenticated = bool(ONSHAPE_AVAILABLE and session_manager.get_client(get_current_user_id()))
-    log(f"[PANEL] render did={onshape_ctx['documentId'][:8]} authed={authenticated} "
-        f"has_tokens={bool(session.get('onshape_tokens'))} user={session.get('user_email')} "
-        f"sess_keys={sorted(session.keys())}")
+    log(f"[PANEL] render did={onshape_ctx['documentId'][:8]} authed={authenticated}")
     resp = make_response(render_template('wizard.html', source='onshape',
                                          authenticated=authenticated, onshape_ctx=onshape_ctx,
                                          **_app_template_context()))
@@ -1431,16 +1429,17 @@ def onshape_oauth_callback():
         # Clean up OAuth state
         session.pop('onshape_oauth_state', None)
 
-        # Log session size to catch cookie overflow (>~4KB browsers drop the cookie,
-        # so the tokens we just wrote would never persist).
+        # Safeguard: browsers drop cookies over ~4KB, which would silently lose the
+        # tokens we just wrote. Warn if the session is getting close.
         try:
-            _sizes = {k: len(json.dumps(v, default=str)) for k, v in session.items()}
-            log(f"[ONSHAPE-AUTH] session set: has_tokens={bool(session.get('onshape_tokens'))} "
-                f"sizes={_sizes} total~{sum(_sizes.values())}B")
+            _total = sum(len(json.dumps(v, default=str)) for v in session.values())
+            if _total > 3500:
+                log(f"[ONSHAPE-AUTH] WARNING: session ~{_total}B nearing the 4KB cookie limit")
         except Exception:
             pass
 
-        # Popup mode (embedded panel connect): close the popup and tell the opener.
+        # Popup mode (embedded panel connect): close the popup; the panel detects the
+        # close and verifies auth.
         if session.pop('onshape_oauth_popup', None):
             session.pop('pending_onshape_import', None)
             return redirect('/onshape/auth-complete')
@@ -1462,15 +1461,12 @@ def onshape_oauth_callback():
 
 @app.route('/onshape/auth-complete')
 def onshape_auth_complete():
-    """Tiny page shown in the OAuth popup after a successful connect: notify the
-    opener (the embedded panel) and close."""
+    """Tiny page shown in the OAuth popup after a successful connect: close the popup.
+    The embedded panel detects the close (popup.closed) and verifies auth."""
     return """<!doctype html><html><head><meta charset="utf-8"><title>Connected</title></head>
 <body style="font-family:-apple-system,sans-serif;background:#0f1419;color:#e6edf3;text-align:center;padding:2rem">
 <p>Connected to Onshape. You can close this window.</p>
-<script>
-  try { if (window.opener) window.opener.postMessage('penguincam-auth-done', '*'); } catch (e) {}
-  setTimeout(function () { window.close(); }, 400);
-</script></body></html>"""
+<script>setTimeout(function () { window.close(); }, 300);</script></body></html>"""
 
 
 @app.route('/onshape/authed')
