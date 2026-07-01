@@ -428,9 +428,11 @@ def _app_template_context():
 
     team_config_dict = team_config.to_dict(current_machine_id)
     drive_enabled = team_config_dict.get('google_drive_enabled', False)
-    default_tool_diameter = team_config_dict.get('default_tool_diameter', 0.157)
-    machine_x_max = team_config_dict.get('machine_x_max', 48.0)
-    machine_y_max = team_config_dict.get('machine_y_max', 96.0)
+    # Use `or` (not .get default) so an explicit None in the config doesn't render as
+    # the string "None" into a numeric <input value="...">.
+    default_tool_diameter = team_config_dict.get('default_tool_diameter') or 0.157
+    machine_x_max = team_config_dict.get('machine_x_max') or 48.0
+    machine_y_max = team_config_dict.get('machine_y_max') or 96.0
 
     available_materials = team_config.get_available_materials(current_machine_id)
     available_materials['aluminum_tube'] = {
@@ -550,7 +552,9 @@ def _serve_onshape_panel():
         'server': request.args.get('server', 'https://cad.onshape.com'),
     }
     authenticated = bool(ONSHAPE_AVAILABLE and session_manager.get_client(get_current_user_id()))
-    log(f"[PANEL] render did={onshape_ctx['documentId'][:8]} authed={authenticated}")
+    log(f"[PANEL] render did={onshape_ctx['documentId'][:8]} authed={authenticated} "
+        f"has_tokens={bool(session.get('onshape_tokens'))} user={session.get('user_email')} "
+        f"sess_keys={sorted(session.keys())}")
     resp = make_response(render_template('wizard.html', source='onshape',
                                          authenticated=authenticated, onshape_ctx=onshape_ctx,
                                          **_app_template_context()))
@@ -1426,6 +1430,15 @@ def onshape_oauth_callback():
 
         # Clean up OAuth state
         session.pop('onshape_oauth_state', None)
+
+        # Log session size to catch cookie overflow (>~4KB browsers drop the cookie,
+        # so the tokens we just wrote would never persist).
+        try:
+            _sizes = {k: len(json.dumps(v, default=str)) for k, v in session.items()}
+            log(f"[ONSHAPE-AUTH] session set: has_tokens={bool(session.get('onshape_tokens'))} "
+                f"sizes={_sizes} total~{sum(_sizes.values())}B")
+        except Exception:
+            pass
 
         # Popup mode (embedded panel connect): close the popup and tell the opener.
         if session.pop('onshape_oauth_popup', None):
