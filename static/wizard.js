@@ -611,13 +611,24 @@
   function bindConnect() {
     var btn = $('#btn-connect');
     var poll = null;
+    var reloading = false;
     function stopPoll() { if (poll) { clearInterval(poll); poll = null; } }
+    // Fire exactly one reload. Several poll fetches (and the postMessage fast-path)
+    // can resolve at once when auth flips true; without this guard each reload cancels
+    // the previous navigation and the frame never commits the authenticated page.
+    function reloadOnce(reason) {
+      if (reloading) return;
+      reloading = true;
+      stopPoll();
+      dbg('reload', reason);
+      location.reload();
+    }
     function checkAuthed() {
       fetch('/onshape/authed', { credentials: 'same-origin' })
         .then(function (r) { return r.json(); })
         .then(function (j) {
           dbg('authed-poll', j);
-          if (j && j.authenticated) { stopPoll(); location.reload(); }
+          if (j && j.authenticated) reloadOnce('poll');
         })
         .catch(function (e) { dbg('authed-poll:err', String(e)); });
     }
@@ -628,12 +639,12 @@
       // window.opener, so we don't rely on a postMessage from the popup; the iframe
       // asks the server (via its own cookie) whether tokens have landed yet.
       stopPoll();
-      poll = setInterval(checkAuthed, 1500);
+      poll = setInterval(checkAuthed, 2000);
       setTimeout(stopPoll, 120000); // give up after 2 min
     });
     // Fast path if the opener relationship happens to survive.
     window.addEventListener('message', function (e) {
-      if (e.data === 'penguincam-auth-done') { dbg('auth', 'done-msg'); stopPoll(); location.reload(); }
+      if (e.data === 'penguincam-auth-done') reloadOnce('msg');
     });
   }
 
