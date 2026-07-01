@@ -192,6 +192,9 @@ fieldset.field { border: 1px solid var(--line); border-radius: 6px; padding: 8px
   z-index: 5000;
   padding: 20px;
 }
+/* The `display: flex` above overrides the HTML `hidden` attribute, so restore
+   hidden behavior explicitly (higher specificity than the id rule). */
+#connect-overlay[hidden] { display: none; }
 .connect-card {
   max-width: 320px;
   text-align: center;

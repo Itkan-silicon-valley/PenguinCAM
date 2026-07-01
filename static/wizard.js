@@ -642,9 +642,11 @@
       poll = setInterval(checkAuthed, 2000);
       setTimeout(stopPoll, 120000); // give up after 2 min
     });
-    // Fast path if the opener relationship happens to survive.
+    // Note: we deliberately do NOT reload on the popup's postMessage, because that
+    // fires when OAuth *completes* regardless of whether the iframe's cookie carries
+    // the tokens. Only the poll (which reflects the iframe's actual session) reloads.
     window.addEventListener('message', function (e) {
-      if (e.data === 'penguincam-auth-done') reloadOnce('msg');
+      if (e.data === 'penguincam-auth-done') dbg('auth', 'popup-msg (not reloading; waiting for poll)');
     });
   }
 
