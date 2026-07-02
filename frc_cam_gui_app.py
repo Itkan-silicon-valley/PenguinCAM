@@ -535,7 +535,7 @@ def wizard_app():
     if gate:
         return gate
     return render_template('wizard.html', source='upload', authenticated=True,
-                           onshape_ctx={}, **_app_template_context())
+                           onshape_ctx={}, theme='dark', **_app_template_context())
 
 
 def _serve_onshape_panel():
@@ -551,11 +551,14 @@ def _serve_onshape_panel():
         'elementId': request.args.get('elementId', ''),
         'server': request.args.get('server', 'https://cad.onshape.com'),
     }
+    # Onshape passes the user's current theme (e.g. ?theme=light|dark) when it loads the
+    # panel iframe; mirror it so the panel matches Onshape's light/dark preference.
+    theme = 'dark' if request.args.get('theme', 'light').lower() == 'dark' else 'light'
     authenticated = bool(ONSHAPE_AVAILABLE and session_manager.get_client(get_current_user_id()))
-    log(f"[PANEL] render did={onshape_ctx['documentId'][:8]} authed={authenticated}")
+    log(f"[PANEL] render did={onshape_ctx['documentId'][:8]} authed={authenticated} theme={theme}")
     resp = make_response(render_template('wizard.html', source='onshape',
                                          authenticated=authenticated, onshape_ctx=onshape_ctx,
-                                         **_app_template_context()))
+                                         theme=theme, **_app_template_context()))
     # Allow embedding only within Onshape; allow the session cookie to ride in the iframe.
     resp.headers['Content-Security-Policy'] = "frame-ancestors https://*.onshape.com"
     resp.headers.pop('X-Frame-Options', None)

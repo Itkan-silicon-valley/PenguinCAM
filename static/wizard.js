@@ -35,6 +35,17 @@
   /* ----------------------------------------------------------------- utils */
   function $(sel, root) { return (root || document).querySelector(sel); }
   function $all(sel, root) { return Array.prototype.slice.call((root || document).querySelectorAll(sel)); }
+  function cssVar(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
+
+  // Apply light/dark theme (tied to Onshape's theme). The server sets it on <html> at
+  // render; this handles live changes if Onshape posts a theme update while open.
+  function applyTheme(theme) {
+    if (theme !== 'light' && theme !== 'dark') return;
+    document.documentElement.setAttribute('data-theme', theme);
+    if (viewer && viewer.setTheme) viewer.setTheme(theme);
+    if (state.step === 'layout') drawLayout();
+    dbg('theme', theme);
+  }
 
   function dbg(label, data) {
     debugEvents.unshift({ t: new Date().toISOString().slice(11, 19), label: label, data: data });
@@ -445,6 +456,15 @@
     $('#layout-errors').textContent = v.msgs.join('\n');
     var flipBtn = $('#btn-flip'); if (flipBtn) flipBtn.disabled = state.selectedIds.length === 0;
 
+    // Theme-aware colors (read the CSS variables so the canvas matches light/dark).
+    var col = {
+      ink: cssVar('--ink') || '#e6edf3',
+      muted: cssVar('--muted') || '#9aa7b4',
+      danger: cssVar('--danger') || '#f85149',
+      accent: cssVar('--accent') || '#2f81f7',
+      ok: cssVar('--ok') || '#3fb950',
+    };
+
     // Stock = combined bounding box (dotted). Red if it exceeds the machine. The G54
     // origin marker sits at its lower-left.
     var bb = v.bbox;
@@ -452,10 +472,10 @@
       var a = worldToCanvas(bb.minX, bb.minY), c = worldToCanvas(bb.maxX, bb.maxY);
       ctx.save();
       ctx.setLineDash([5, 4]);
-      ctx.strokeStyle = v.tooBig ? '#f85149' : '#5b6876'; ctx.lineWidth = 1;
+      ctx.strokeStyle = v.tooBig ? col.danger : col.muted; ctx.lineWidth = 1;
       ctx.strokeRect(Math.min(a[0], c[0]), Math.min(a[1], c[1]), Math.abs(c[0] - a[0]), Math.abs(c[1] - a[1]));
       ctx.setLineDash([]);
-      ctx.fillStyle = '#3fb950'; ctx.beginPath(); ctx.arc(a[0], a[1], 4, 0, 7); ctx.fill();
+      ctx.fillStyle = col.ok; ctx.beginPath(); ctx.arc(a[0], a[1], 4, 0, 7); ctx.fill();
       ctx.restore();
     }
 
@@ -472,15 +492,15 @@
       ctx.closePath();
       ctx.fillStyle = invalid ? 'rgba(248,81,73,0.18)' : (selected ? 'rgba(47,129,247,0.22)' : 'rgba(154,167,180,0.12)');
       ctx.fill();
-      ctx.strokeStyle = invalid ? '#f85149' : (selected ? '#2f81f7' : '#9aa7b4');
+      ctx.strokeStyle = invalid ? col.danger : (selected ? col.accent : col.muted);
       ctx.lineWidth = selected ? 2 : 1;
       ctx.stroke();
       s.holes.forEach(function (h) {
         var hc = worldToCanvas(pl.x + h.cx, pl.y + h.cy);
-        ctx.beginPath(); ctx.arc(hc[0], hc[1], Math.max(1, h.r * canvasState.scale), 0, 7); ctx.strokeStyle = '#9aa7b4'; ctx.stroke();
+        ctx.beginPath(); ctx.arc(hc[0], hc[1], Math.max(1, h.r * canvasState.scale), 0, 7); ctx.strokeStyle = col.muted; ctx.stroke();
       });
       var lc = worldToCanvas(pl.x, pl.y + pl.h);
-      ctx.fillStyle = '#e6edf3'; ctx.font = '11px sans-serif';
+      ctx.fillStyle = col.ink; ctx.font = '11px sans-serif';
       ctx.fillText(p.name + (p.flipped ? ' (flipped)' : ''), lc[0] + 3, lc[1] + 12);
     });
 
@@ -494,15 +514,15 @@
       ctx.setLineDash([]);
       var hg = selectionHandle(selBox);
       ctx.beginPath(); ctx.moveTo(hg.ex, hg.ey); ctx.lineTo(hg.hx, hg.hy);
-      ctx.strokeStyle = '#2f81f7'; ctx.lineWidth = 1.5; ctx.stroke();
-      ctx.beginPath(); ctx.arc(hg.hx, hg.hy, 6, 0, 7); ctx.fillStyle = '#2f81f7'; ctx.fill();
+      ctx.strokeStyle = col.accent; ctx.lineWidth = 1.5; ctx.stroke();
+      ctx.beginPath(); ctx.arc(hg.hx, hg.hy, 6, 0, 7); ctx.fillStyle = col.accent; ctx.fill();
       ctx.restore();
     }
 
     // Combined size readout, upper-right.
     ctx.save();
     ctx.textAlign = 'right'; ctx.font = '12px sans-serif';
-    ctx.fillStyle = v.tooBig ? '#f85149' : '#9aa7b4';
+    ctx.fillStyle = v.tooBig ? col.danger : col.muted;
     ctx.fillText(bb ? (bb.w.toFixed(2) + '" x ' + bb.h.toFixed(2) + '"') : 'no parts', canvas.width - 8, 16);
     ctx.restore();
   }
@@ -800,8 +820,14 @@
     bindPreview();
     bindNav();
     bindConnect();
+    // Best-effort live theme sync: apply if Onshape posts a theme update while open.
+    // (The load-time theme is already set server-side from the ?theme= URL param.)
+    window.addEventListener('message', function (e) {
+      var d = e.data;
+      if (d && typeof d === 'object' && (d.theme === 'light' || d.theme === 'dark')) applyTheme(d.theme);
+    });
     gotoStep('setup');
-    dbg('init', { source: state.source, authed: CFG.authenticated });
+    dbg('init', { source: state.source, authed: CFG.authenticated, theme: CFG.theme });
     if (state.source === 'onshape' && !CFG.authenticated) {
       $('#connect-overlay').hidden = false;
     }

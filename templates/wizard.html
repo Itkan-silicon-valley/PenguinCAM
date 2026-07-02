@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="{{ theme|default('dark') }}">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -178,6 +178,7 @@
     <script>
       window.PenguinCAM = {
         source: {{ source|tojson }},
+        theme: {{ (theme if theme is defined else 'dark')|tojson }},
         authenticated: {{ (authenticated if authenticated is defined else True)|tojson }},
         onshape: {{ (onshape_ctx if onshape_ctx is defined else {})|tojson }},
         bed: { width: {{ machine_x_max|tojson }}, height: {{ machine_y_max|tojson }} },

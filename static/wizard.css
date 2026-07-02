@@ -9,6 +9,25 @@
   --danger: #f85149;
   --ok: #3fb950;
   --line: #30363d;
+  --canvas-bg: #11161d;      /* 2D layout / 3D viewer background */
+  --canvas-grid: #30363d;
+}
+
+/* Light theme — tied to Onshape's theme (?theme=light|dark) or standalone default. */
+:root[data-theme="light"] {
+  --bg: #f6f8fa;
+  --panel: #ffffff;
+  --panel-2: #eef1f4;
+  --ink: #1f2328;
+  --muted: #5a6570;
+  --accent: #2f81f7;
+  --accent-ink: #ffffff;
+  --danger: #d1242f;
+  --ok: #1a7f37;
+  --line: #d0d7de;
+  --canvas-bg: #f2f4f7;
+  --canvas-grid: #c7cfd8;
+  color-scheme: light;
 }
 
 * { box-sizing: border-box; }
@@ -177,7 +196,7 @@ fieldset.field { border: 1px solid var(--line); border-radius: 6px; padding: 8px
   position: relative;
   width: 100%;
   height: 320px;
-  background: #0a0e14;
+  background: var(--canvas-bg);
   border: 1px solid var(--line);
   border-radius: 6px;
   overflow: hidden;

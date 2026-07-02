@@ -39,7 +39,7 @@
     var h = container.clientHeight || 400;
 
     this.scene = new THREE.Scene();
-    this.scene.background = new THREE.Color(0x0a0e14);
+    this.scene.background = new THREE.Color(this._themeColors().bg);
 
     this.camera = new THREE.PerspectiveCamera(45, w / h, 0.1, 1000);
     this.camera.position.set(10, 10, 10);
@@ -84,6 +84,17 @@
     this.camera.aspect = w / h;
     this.camera.updateProjectionMatrix();
     this.renderer.setSize(w, h);
+  };
+
+  // Background/grid colors that follow the page theme (light/dark).
+  GcodeViewer.prototype._themeColors = function () {
+    var light = document.documentElement.getAttribute('data-theme') === 'light';
+    return light ? { bg: 0xf2f4f7, grid1: 0xc7cfd8, grid2: 0xdde3ea }
+                 : { bg: 0x0a0e14, grid1: 0x30363d, grid2: 0x1e2632 };
+  };
+
+  GcodeViewer.prototype.setTheme = function () {
+    if (this.scene) this.scene.background = new THREE.Color(this._themeColors().bg);
   };
 
   GcodeViewer.prototype._bindControls = function () {
@@ -171,9 +182,11 @@
     keep.forEach(this.scene.add, this.scene);
     this.completedLine = this.upcomingLine = this.toolMesh = null;
 
+    var tc = this._themeColors();
+    this.scene.background = new THREE.Color(tc.bg);
     var maxDim = Math.max(maxX, maxY, maxZ);
     var gridSize = Math.max(maxX * 1.3, maxY * 1.3, 15);
-    var grid = new THREE.GridHelper(gridSize, Math.ceil(gridSize), 0x30363d, 0x1e2632);
+    var grid = new THREE.GridHelper(gridSize, Math.ceil(gridSize), tc.grid1, tc.grid2);
     grid.position.set(gridSize / 3, 0, -gridSize / 3);
     this.scene.add(grid);
     this.scene.add(new THREE.AxesHelper(Math.max(maxDim, 5) * 1.2));
