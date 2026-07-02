@@ -99,10 +99,17 @@
             <!-- ===== LAYOUT ===== -->
             <section class="step" data-step="layout" hidden>
                 <h2>Layout</h2>
-                <p class="hint">↔ Widen the panel for easier layout. Click a part to select it, drag to position, and drag the round handle above it to rotate (snaps to 45°).</p>
-                <div class="sheet-fields">
-                    <label class="field inline"><span>Sheet W</span><input type="number" id="f-sheet-w" step="0.1" min="1"></label>
-                    <label class="field inline"><span>Sheet H</span><input type="number" id="f-sheet-h" step="0.1" min="1"></label>
+                <p class="hint">↔ Widen the panel for easier layout. Click to select (Shift-click for multiple), drag to move, drag the round handle to rotate (snaps to 45°). The dotted box is the stock; its lower-left is the G54 origin.</p>
+                <div id="layout-info">
+                    <span><strong id="info-machine-name"></strong></span>
+                    <span>Bed: <span id="info-machine-size"></span></span>
+                    <span>Tool: <span id="info-tool"></span> kerf</span>
+                </div>
+                <div id="layout-toolbar">
+                    <button type="button" class="btn small" id="btn-flip" disabled>Flip over</button>
+                    <span class="spacer"></span>
+                    <button type="button" class="btn small" id="btn-zoom-out" title="Zoom out">&minus;</button>
+                    <button type="button" class="btn small" id="btn-zoom-in" title="Zoom in">+</button>
                 </div>
                 <canvas id="layout-canvas" width="600" height="400"></canvas>
                 <div id="layout-errors" class="errors" aria-live="polite"></div>
@@ -174,6 +181,7 @@
         authenticated: {{ (authenticated if authenticated is defined else True)|tojson }},
         onshape: {{ (onshape_ctx if onshape_ctx is defined else {})|tojson }},
         bed: { width: {{ machine_x_max|tojson }}, height: {{ machine_y_max|tojson }} },
+        machineName: {{ ((machines.get(current_machine_id) or {}).get('name') or 'Machine')|tojson }},
         defaultTool: {{ default_tool_diameter|tojson }},
       };
     </script>

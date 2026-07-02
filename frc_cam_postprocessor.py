@@ -795,9 +795,32 @@ class FRCPostProcessor:
             except:
                 return []
         
+    def _mirror_geometry_x(self):
+        """Mirror all loaded geometry across the X axis (x -> -x), for a part 'flipped
+        over' to machine its reverse side. Applied before rotate/normalize so toolpaths
+        are regenerated fresh from the mirrored geometry (preserving helical/spiral/climb
+        safety) rather than mangling generated G-code. Splines/arcs are sampled into
+        polylines at load, so mirroring the point geometry is exact for the output."""
+        for c in self.circles:
+            c['center'] = (-c['center'][0], c['center'][1])
+        for ln in self.lines:
+            ln['start'] = (-ln['start'][0], ln['start'][1])
+            ln['end'] = (-ln['end'][0], ln['end'][1])
+        for a in self.arcs:
+            a['center'] = (-a['center'][0], a['center'][1])
+        self.polylines = [[(-x, y) for (x, y) in pl] for pl in self.polylines]
+        if self.layer_data:
+            for info in self.layer_data.values():
+                for c in info.get('circles', []):
+                    c['center'] = (-c['center'][0], c['center'][1])
+                info['polylines'] = [[(-x, y) for (x, y) in pl] for pl in info.get('polylines', [])]
+                if 'polygons' in info:
+                    info['polygons'] = [affinity.scale(p, xfact=-1, yfact=1, origin=(0, 0))
+                                        for p in info['polygons']]
+
     def transform_coordinates(self, origin_corner: str, rotation_angle: int,
                               placement_offset: Tuple[float, float] = (0.0, 0.0),
-                              enforce_bounds: bool = True):
+                              enforce_bounds: bool = True, mirror: bool = False):
         """
         Transform all coordinates based on origin corner and rotation.
 
@@ -810,7 +833,15 @@ class FRCPostProcessor:
             enforce_bounds: when True (default, single-part), error if the part is
                 larger than the machine envelope. Multi-part jobs pass False and rely
                 on job-level validation (validate_job_layout) against the stock sheet.
+            mirror: when True, mirror the part across X (flip it over) before rotating
+                and normalizing. The corner-normalize step re-places it into positive
+                space, so it composes with rotation and placement_offset.
         """
+        # Flip-over mirror is applied first, then rotate/normalize proceed on the
+        # mirrored geometry.
+        if mirror:
+            self._mirror_geometry_x()
+
         # First, find bounding box of ALL entities
         all_x = []
         all_y = []

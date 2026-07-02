@@ -2110,6 +2110,27 @@ class TestMultiPartEngine(unittest.TestCase):
         pp.classify_holes()
         return pp
 
+    def _rect_with_offset_hole(self, mirror):
+        pp = FRCPostProcessor(0.25, 0.125)
+        pp.apply_material_preset('plywood')
+        pp.tabs_enabled = False
+        pp.lines = []; pp.arcs = []; pp.splines = []
+        pp.polylines = [[(0, 0), (6, 0), (6, 4), (0, 4), (0, 0)]]
+        pp.circles = [{'center': (1.0, 2.0), 'radius': 0.3, 'diameter': 0.6}]  # hole near the left
+        pp.transform_coordinates('bottom-left', 0, enforce_bounds=False, mirror=mirror)
+        return pp
+
+    def test_mirror_flips_geometry_x(self):
+        """Flipping a part over mirrors its geometry across X: a hole 1in from the left
+        edge of a 6in part ends up 1in from the right edge (x=5)."""
+        normal = self._rect_with_offset_hole(mirror=False)
+        flipped = self._rect_with_offset_hole(mirror=True)
+        self.assertAlmostEqual(normal.circles[0]['center'][0], 1.0, places=3)
+        self.assertAlmostEqual(flipped.circles[0]['center'][0], 5.0, places=3)
+        # Y is unchanged, and the overall footprint is the same size.
+        self.assertAlmostEqual(flipped.circles[0]['center'][1], 2.0, places=3)
+        self.assertAlmostEqual(flipped.bounding_box()[2], 6.0, places=3)
+
     def test_placement_offset_translates_geometry(self):
         pp = self._square_part(size=4.0, offset=(10.0, 5.0))
         minx, miny, maxx, maxy = pp.bounding_box()

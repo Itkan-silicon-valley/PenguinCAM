@@ -20,9 +20,12 @@
     tool_diameter: parseFloat(CFG.defaultTool) || 0.157,
     thickness: 0.25,
     tab_spacing: 6.0,
-    sheet: { width: CFG.bed.width || 24, height: CFG.bed.height || 24 },
-    parts: [],            // {id,name,width,height,outline,holes,file,cx,cy,rotation}
-    selectedId: null,
+    // The machine envelope is a read-only constraint; the parts' combined bounding box
+    // is the stock (G54 origin = its lower-left).
+    machine: { width: CFG.bed.width || 24, height: CFG.bed.height || 24, name: CFG.machineName || 'Machine' },
+    parts: [],            // {id,name,width,height,outline,holes,file,cx,cy,rotation,flipped}
+    selectedIds: [],
+    zoom: 1,
     lastResponse: null,
   };
   var partSeq = 0;
@@ -45,7 +48,7 @@
     if (!el) return;
     var snapshot = {
       source: state.source, step: state.step, mode: state.mode,
-      tool: state.tool_diameter, sheet: state.sheet,
+      tool: state.tool_diameter, machine: state.machine,
       parts: state.parts.map(function (p) {
         return { name: p.name, w: p.width, h: p.height, cx: p.cx, cy: p.cy, rot: p.rotation };
       }),
@@ -72,7 +75,8 @@
   // bounding-box minimum is (0,0), plus that footprint's width/height. Mirrors the
   // server pinning the rotated bbox-min to placement_offset.
   function placedShape(part) {
-    var pts = part.outline.map(function (pt) { return rotatePoint(pt[0], pt[1], part.rotation); });
+    var fx = part.flipped ? -1 : 1;   // horizontal flip (mirror across X) before rotating
+    var pts = part.outline.map(function (pt) { return rotatePoint(fx * pt[0], pt[1], part.rotation); });
     var minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
     pts.forEach(function (pt) {
       if (pt[0] < minX) minX = pt[0]; if (pt[0] > maxX) maxX = pt[0];
@@ -80,7 +84,7 @@
     });
     var norm = pts.map(function (pt) { return [pt[0] - minX, pt[1] - minY]; });
     var holes = (part.holes || []).map(function (h) {
-      var c = rotatePoint(h.cx, h.cy, part.rotation);
+      var c = rotatePoint(fx * h.cx, h.cy, part.rotation);
       return { cx: c[0] - minX, cy: c[1] - minY, r: h.r };
     });
     return { pts: norm, holes: holes, w: maxX - minX, h: maxY - minY };
@@ -146,35 +150,51 @@
     return min;
   }
 
-  // Mirror of validate_job_layout: sheet fit via bbox, plus a real-geometry overlap
-  // test (so a part nesting into another's concave region isn't a false positive).
+  // Combined footprint of a set of parts (all parts by default). This is the stock;
+  // its lower-left is the G54 origin. Returns null when empty.
+  function combinedBBox(parts) {
+    parts = parts || state.parts;
+    if (!parts.length) return null;
+    var minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    parts.forEach(function (p) {
+      var f = footprint(p);
+      if (f.minX < minX) minX = f.minX; if (f.minY < minY) minY = f.minY;
+      if (f.maxX > maxX) maxX = f.maxX; if (f.maxY > maxY) maxY = f.maxY;
+    });
+    return { minX: minX, minY: minY, maxX: maxX, maxY: maxY, w: maxX - minX, h: maxY - minY };
+  }
+
+  function isSelected(id) { return state.selectedIds.indexOf(id) >= 0; }
+  function selectedParts() { return state.parts.filter(function (p) { return isSelected(p.id); }); }
+
+  // Validate the layout: the combined bounding box (the stock) must fit the machine,
+  // and no two parts may overlap or sit closer than one kerf. Real-geometry overlap so
+  // a part nesting into another's concave region isn't a false positive.
   function validateLayout() {
     var msgs = [];
     var bad = {};
     var gap = state.tool_diameter;
-    var W = state.sheet.width, H = state.sheet.height;
+    var bbox = combinedBBox();
+    var tooBig = false;
+    if (bbox && (bbox.w > state.machine.width + 1e-6 || bbox.h > state.machine.height + 1e-6)) {
+      tooBig = true;
+      msgs.push('Parts (' + bbox.w.toFixed(2) + '" x ' + bbox.h.toFixed(2) + '") exceed the machine (' +
+                state.machine.width + '" x ' + state.machine.height + '").');
+    }
     var items = state.parts.map(function (p) { return { id: p.id, name: p.name, box: footprint(p), poly: placedPolygon(p) }; });
-    items.forEach(function (b) {
-      if (b.box.minX < -1e-6 || b.box.minY < -1e-6 || b.box.maxX > W + 1e-6 || b.box.maxY > H + 1e-6) {
-        bad[b.id] = true;
-        msgs.push(b.name + ' extends outside the sheet.');
-      }
-    });
     for (var i = 0; i < items.length; i++) {
       for (var j = i + 1; j < items.length; j++) {
         var a = items[i].box, c = items[j].box;
-        // Cheap bbox prune: clearly-separated boxes mean clear parts.
         var clearX = (a.maxX + gap <= c.minX + 1e-6) || (c.maxX + gap <= a.minX + 1e-6);
         var clearY = (a.maxY + gap <= c.minY + 1e-6) || (c.maxY + gap <= a.minY + 1e-6);
         if (clearX || clearY) continue;
-        // Boxes are close - test the actual perimeters.
         if (polyMinDist(items[i].poly, items[j].poly) < gap - 1e-6) {
           bad[items[i].id] = true; bad[items[j].id] = true;
           msgs.push(items[i].name + ' and ' + items[j].name + ' overlap or are too close.');
         }
       }
     }
-    return { bad: bad, msgs: msgs };
+    return { bad: bad, msgs: msgs, tooBig: tooBig, bbox: bbox };
   }
 
   /* ------------------------------------------------------------ step nav */
@@ -190,7 +210,7 @@
     $('#btn-back').disabled = idx === 0;
     var nextBtn = $('#btn-next');
     nextBtn.hidden = name === 'preview';
-    if (name === 'layout') { drawLayout(); }
+    if (name === 'layout') { updateLayoutInfo(); drawLayout(); }
     if (name === 'preview') { resetPreview(); }
     dbg('step', name);
   }
@@ -278,7 +298,7 @@
       width: data.width, height: data.height,
       outline: data.outline, holes: data.holes || [],
       file: file,
-      cx: 0, cy: 0, rotation: 0,
+      cx: 0, cy: 0, rotation: 0, flipped: false,
     };
     // Initial placement: bottom edge on Y=0, stacked to the right of existing parts.
     var s = placedShape(p);
@@ -287,14 +307,13 @@
     p.cx = startX + s.w / 2;
     p.cy = s.h / 2;
     state.parts.push(p);
-    if (state.selectedId == null) state.selectedId = p.id;
     renderParts();
     dbg('part-added', { name: p.name, w: p.width, h: p.height });
   }
 
   function removePart(id) {
     state.parts = state.parts.filter(function (p) { return p.id !== id; });
-    if (state.selectedId === id) state.selectedId = state.parts.length ? state.parts[0].id : null;
+    state.selectedIds = state.selectedIds.filter(function (sid) { return sid !== id; });
     renderParts();
     if (state.step === 'layout') drawLayout();
   }
@@ -351,36 +370,34 @@
   }
 
   /* -------------------------------------------------------------- layout */
-  var canvasState = { scale: 1, ox: 0, oy: 0, action: null };
+  var canvasState = { scale: 1, wcx: 0, wcy: 0, ccx: 0, ccy: 0, action: null };
 
+  // Fit the parts' combined bounding box to ~80% of the canvas (times the zoom factor),
+  // centered. With no parts, show a default area.
   function fitTransform(canvas) {
-    var W = state.sheet.width, H = state.sheet.height;
-    var pad = 16;
-    var sc = Math.min((canvas.width - 2 * pad) / W, (canvas.height - 2 * pad) / H);
-    canvasState.scale = sc;
-    canvasState.ox = pad;
-    canvasState.oy = canvas.height - pad; // y flips
+    var bb = combinedBBox();
+    var w = bb ? Math.max(bb.w, 0.001) : 10;
+    var h = bb ? Math.max(bb.h, 0.001) : 10;
+    canvasState.wcx = bb ? (bb.minX + bb.maxX) / 2 : 0;
+    canvasState.wcy = bb ? (bb.minY + bb.maxY) / 2 : 0;
+    canvasState.ccx = canvas.width / 2;
+    canvasState.ccy = canvas.height / 2;
+    canvasState.scale = Math.min(canvas.width / w, canvas.height / h) * 0.8 * state.zoom;
   }
-  function worldToCanvas(x, y) { return [canvasState.ox + x * canvasState.scale, canvasState.oy - y * canvasState.scale]; }
-  function canvasToWorld(cx, cy) { return [(cx - canvasState.ox) / canvasState.scale, (canvasState.oy - cy) / canvasState.scale]; }
+  function worldToCanvas(x, y) {
+    return [canvasState.ccx + (x - canvasState.wcx) * canvasState.scale,
+            canvasState.ccy - (y - canvasState.wcy) * canvasState.scale];
+  }
+  function canvasToWorld(cx, cy) {
+    return [canvasState.wcx + (cx - canvasState.ccx) / canvasState.scale,
+            canvasState.wcy - (cy - canvasState.ccy) / canvasState.scale];
+  }
 
-  function selectedPart() { return state.parts.filter(function (p) { return p.id === state.selectedId; })[0]; }
-
-  // Canvas geometry of a part's rotation handle: outside the footprint, along the
-  // part's "up" direction after rotation (so it points toward the pointer while
-  // rotating and shows orientation at rest).
-  function handleGeom(part) {
-    var pl = placement(part);
-    var ctr = worldToCanvas(part.cx, part.cy);
-    var up = rotatePoint(0, 1, part.rotation);
-    var upc = worldToCanvas(part.cx + up[0], part.cy + up[1]);
-    var dx = upc[0] - ctr[0], dy = upc[1] - ctr[1], len = Math.hypot(dx, dy) || 1;
-    dx /= len; dy /= len;
-    var edge = 0.5 * Math.hypot(pl.w * canvasState.scale, pl.h * canvasState.scale);
-    return {
-      ex: ctr[0] + dx * edge, ey: ctr[1] + dy * edge,           // stem start (box corner radius)
-      hx: ctr[0] + dx * (edge + 26), hy: ctr[1] + dy * (edge + 26) // handle center
-    };
+  // Rotation handle for the current selection: centered above its bounding box (screen
+  // up). Group rotation is delta-based around the selection center.
+  function selectionHandle(selBox) {
+    var topMid = worldToCanvas((selBox.minX + selBox.maxX) / 2, selBox.maxY);
+    return { ex: topMid[0], ey: topMid[1], hx: topMid[0], hy: topMid[1] - 28 };
   }
 
   function drawLayout() {
@@ -390,25 +407,33 @@
     fitTransform(canvas);
     ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-    // Sheet + machine-origin marker.
-    var o = worldToCanvas(0, 0), tr = worldToCanvas(state.sheet.width, state.sheet.height);
-    ctx.fillStyle = '#11161d';
-    ctx.fillRect(Math.min(o[0], tr[0]), tr[1], Math.abs(tr[0] - o[0]), Math.abs(o[1] - tr[1]));
-    ctx.strokeStyle = '#3b4654'; ctx.lineWidth = 1;
-    ctx.strokeRect(o[0], tr[1], (tr[0] - o[0]), (o[1] - tr[1]));
-    ctx.fillStyle = '#3fb950'; ctx.beginPath(); ctx.arc(o[0], o[1], 4, 0, 7); ctx.fill();
-
     var v = validateLayout();
     $('#layout-errors').textContent = v.msgs.join('\n');
+    var flipBtn = $('#btn-flip'); if (flipBtn) flipBtn.disabled = state.selectedIds.length === 0;
 
+    // Stock = combined bounding box (dotted). Red if it exceeds the machine. The G54
+    // origin marker sits at its lower-left.
+    var bb = v.bbox;
+    if (bb) {
+      var a = worldToCanvas(bb.minX, bb.minY), c = worldToCanvas(bb.maxX, bb.maxY);
+      ctx.save();
+      ctx.setLineDash([5, 4]);
+      ctx.strokeStyle = v.tooBig ? '#f85149' : '#5b6876'; ctx.lineWidth = 1;
+      ctx.strokeRect(Math.min(a[0], c[0]), Math.min(a[1], c[1]), Math.abs(c[0] - a[0]), Math.abs(c[1] - a[1]));
+      ctx.setLineDash([]);
+      ctx.fillStyle = '#3fb950'; ctx.beginPath(); ctx.arc(a[0], a[1], 4, 0, 7); ctx.fill();
+      ctx.restore();
+    }
+
+    // Parts.
     state.parts.forEach(function (p) {
       var pl = placement(p), s = pl.shape;
       var invalid = !!v.bad[p.id];
-      var selected = p.id === state.selectedId;
+      var selected = isSelected(p.id);
       ctx.beginPath();
       s.pts.forEach(function (pt, i) {
-        var c = worldToCanvas(pl.x + pt[0], pl.y + pt[1]);
-        if (i) ctx.lineTo(c[0], c[1]); else ctx.moveTo(c[0], c[1]);
+        var pc = worldToCanvas(pl.x + pt[0], pl.y + pt[1]);
+        if (i) ctx.lineTo(pc[0], pc[1]); else ctx.moveTo(pc[0], pc[1]);
       });
       ctx.closePath();
       ctx.fillStyle = invalid ? 'rgba(248,81,73,0.18)' : (selected ? 'rgba(47,129,247,0.22)' : 'rgba(154,167,180,0.12)');
@@ -417,35 +442,38 @@
       ctx.lineWidth = selected ? 2 : 1;
       ctx.stroke();
       s.holes.forEach(function (h) {
-        var c = worldToCanvas(pl.x + h.cx, pl.y + h.cy);
-        ctx.beginPath(); ctx.arc(c[0], c[1], Math.max(1, h.r * canvasState.scale), 0, 7); ctx.strokeStyle = '#9aa7b4'; ctx.stroke();
+        var hc = worldToCanvas(pl.x + h.cx, pl.y + h.cy);
+        ctx.beginPath(); ctx.arc(hc[0], hc[1], Math.max(1, h.r * canvasState.scale), 0, 7); ctx.strokeStyle = '#9aa7b4'; ctx.stroke();
       });
       var lc = worldToCanvas(pl.x, pl.y + pl.h);
       ctx.fillStyle = '#e6edf3'; ctx.font = '11px sans-serif';
-      ctx.fillText(p.name, lc[0] + 3, lc[1] + 12);
+      ctx.fillText(p.name + (p.flipped ? ' (flipped)' : ''), lc[0] + 3, lc[1] + 12);
     });
 
-    // Selection footprint box + rotation handle.
-    var sel = selectedPart();
-    if (sel) {
-      var pl = placement(sel);
-      var a = worldToCanvas(pl.x, pl.y), b = worldToCanvas(pl.x + pl.w, pl.y + pl.h);
+    // Selection box + rotation handle.
+    var selBox = combinedBBox(selectedParts());
+    if (selBox) {
+      var a2 = worldToCanvas(selBox.minX, selBox.minY), b2 = worldToCanvas(selBox.maxX, selBox.maxY);
       ctx.save();
       ctx.strokeStyle = '#2f81f7'; ctx.lineWidth = 1; ctx.setLineDash([4, 3]);
-      ctx.strokeRect(Math.min(a[0], b[0]), Math.min(a[1], b[1]), Math.abs(b[0] - a[0]), Math.abs(b[1] - a[1]));
+      ctx.strokeRect(Math.min(a2[0], b2[0]), Math.min(a2[1], b2[1]), Math.abs(b2[0] - a2[0]), Math.abs(b2[1] - a2[1]));
       ctx.setLineDash([]);
-      var hg = handleGeom(sel);
+      var hg = selectionHandle(selBox);
       ctx.beginPath(); ctx.moveTo(hg.ex, hg.ey); ctx.lineTo(hg.hx, hg.hy);
       ctx.strokeStyle = '#2f81f7'; ctx.lineWidth = 1.5; ctx.stroke();
       ctx.beginPath(); ctx.arc(hg.hx, hg.hy, 6, 0, 7); ctx.fillStyle = '#2f81f7'; ctx.fill();
-      ctx.fillStyle = '#e6edf3'; ctx.font = '11px sans-serif';
-      ctx.fillText(Math.round(((sel.rotation % 360) + 360) % 360) + '°', hg.hx + 9, hg.hy + 4);
       ctx.restore();
     }
+
+    // Combined size readout, upper-right.
+    ctx.save();
+    ctx.textAlign = 'right'; ctx.font = '12px sans-serif';
+    ctx.fillStyle = v.tooBig ? '#f85149' : '#9aa7b4';
+    ctx.fillText(bb ? (bb.w.toFixed(2) + '" x ' + bb.h.toFixed(2) + '"') : 'no parts', canvas.width - 8, 16);
+    ctx.restore();
   }
 
   function hitTest(wx, wy) {
-    // topmost part whose footprint contains the point
     for (var i = state.parts.length - 1; i >= 0; i--) {
       var b = footprint(state.parts[i]);
       if (wx >= b.minX && wx <= b.maxX && wy >= b.minY && wy <= b.maxY) return state.parts[i];
@@ -453,22 +481,7 @@
     return null;
   }
 
-  // Rotate a part to face the pointer, pivoting on its center (so it stays put).
-  // Snaps within 5 degrees of a 45-degree multiple.
-  function rotateToPointer(part, wx, wy) {
-    var deg = 90 - Math.atan2(wy - part.cy, wx - part.cx) * 180 / Math.PI;
-    deg = ((deg % 360) + 360) % 360;
-    var snapped = Math.round(deg / 45) * 45;
-    if (Math.abs(snapped - deg) <= 5) deg = snapped % 360;
-    part.rotation = deg;
-  }
-
   function bindLayout() {
-    $('#f-sheet-w').value = state.sheet.width;
-    $('#f-sheet-h').value = state.sheet.height;
-    $('#f-sheet-w').addEventListener('input', function () { state.sheet.width = parseFloat(this.value) || state.sheet.width; drawLayout(); });
-    $('#f-sheet-h').addEventListener('input', function () { state.sheet.height = parseFloat(this.value) || state.sheet.height; drawLayout(); });
-
     var canvas = $('#layout-canvas');
     function evtCanvas(e) {
       var rect = canvas.getBoundingClientRect();
@@ -478,23 +491,38 @@
     }
     function down(e) {
       var c = evtCanvas(e), w = canvasToWorld(c[0], c[1]);
-      var sel = selectedPart();
-      if (sel) {
-        var hg = handleGeom(sel);
+      var shift = e.shiftKey;
+      var selBox = combinedBBox(selectedParts());
+      // Rotation handle rotates the whole selection about its center.
+      if (selBox) {
+        var hg = selectionHandle(selBox);
         if (Math.hypot(c[0] - hg.hx, c[1] - hg.hy) <= 12) {
-          canvasState.action = { type: 'rotate', part: sel };
+          var pivot = [(selBox.minX + selBox.maxX) / 2, (selBox.minY + selBox.maxY) / 2];
+          canvasState.action = {
+            type: 'rotate', pivot: pivot,
+            refAngle: Math.atan2(w[1] - pivot[1], w[0] - pivot[0]),
+            snap: selectedParts().map(function (p) { return { p: p, cx: p.cx, cy: p.cy, rot: p.rotation }; })
+          };
           e.preventDefault();
           return;
         }
       }
       var hit = hitTest(w[0], w[1]);
       if (hit) {
-        state.selectedId = hit.id;
-        canvasState.action = { type: 'drag', part: hit, grab: [w[0] - hit.cx, w[1] - hit.cy] };
+        if (shift) {
+          if (isSelected(hit.id)) state.selectedIds = state.selectedIds.filter(function (id) { return id !== hit.id; });
+          else state.selectedIds.push(hit.id);
+        } else {
+          if (!isSelected(hit.id)) state.selectedIds = [hit.id];
+          canvasState.action = {
+            type: 'drag', startWorld: w,
+            snap: selectedParts().map(function (p) { return { p: p, cx: p.cx, cy: p.cy }; })
+          };
+        }
         drawLayout();
         e.preventDefault();
-      } else if (sel) {
-        state.selectedId = null;  // click empty space to deselect
+      } else if (!shift) {
+        state.selectedIds = [];  // click empty space to deselect
         drawLayout();
       }
     }
@@ -503,14 +531,19 @@
       if (!act) return;
       var c = evtCanvas(e), w = canvasToWorld(c[0], c[1]);
       if (act.type === 'drag') {
-        act.part.cx = w[0] - act.grab[0];
-        act.part.cy = w[1] - act.grab[1];
-        // Keep the footprint on the sheet side of the machine origin (no negative coords).
-        var pl = placement(act.part);
-        if (pl.x < 0) act.part.cx -= pl.x;
-        if (pl.y < 0) act.part.cy -= pl.y;
+        var dx = w[0] - act.startWorld[0], dy = w[1] - act.startWorld[1];
+        act.snap.forEach(function (s) { s.p.cx = s.cx + dx; s.p.cy = s.cy + dy; });
       } else if (act.type === 'rotate') {
-        rotateToPointer(act.part, w[0], w[1]);
+        var cur = Math.atan2(w[1] - act.pivot[1], w[0] - act.pivot[0]);
+        var cwDeg = -(cur - act.refAngle) * 180 / Math.PI;  // clockwise-positive delta
+        var snapped = Math.round(cwDeg / 45) * 45;
+        if (Math.abs(snapped - cwDeg) <= 5) cwDeg = snapped;
+        act.snap.forEach(function (s) {
+          var vv = rotatePoint(s.cx - act.pivot[0], s.cy - act.pivot[1], cwDeg);
+          s.p.cx = act.pivot[0] + vv[0];
+          s.p.cy = act.pivot[1] + vv[1];
+          s.p.rotation = (((s.rot + cwDeg) % 360) + 360) % 360;
+        });
       }
       drawLayout();
       e.preventDefault();
@@ -522,6 +555,19 @@
     canvas.addEventListener('touchstart', down, { passive: false });
     canvas.addEventListener('touchmove', move, { passive: false });
     canvas.addEventListener('touchend', up);
+
+    $('#btn-flip').addEventListener('click', function () {
+      selectedParts().forEach(function (p) { p.flipped = !p.flipped; });
+      drawLayout();
+    });
+    $('#btn-zoom-in').addEventListener('click', function () { state.zoom = Math.min(5, state.zoom * 1.25); drawLayout(); });
+    $('#btn-zoom-out').addEventListener('click', function () { state.zoom = Math.max(0.2, state.zoom / 1.25); drawLayout(); });
+  }
+
+  function updateLayoutInfo() {
+    var el = $('#info-machine-name'); if (el) el.textContent = state.machine.name;
+    el = $('#info-machine-size'); if (el) el.textContent = state.machine.width + '" x ' + state.machine.height + '"';
+    el = $('#info-tool'); if (el) el.textContent = (+state.tool_diameter).toFixed(3) + '"';
   }
 
   /* ------------------------------------------------------------- preview */
@@ -545,15 +591,22 @@
 
   function generateJob() {
     var fd = new FormData();
+    // The parts' combined bounding box is the stock; its lower-left is the G54 origin,
+    // so placements are normalized relative to it.
+    var bb = combinedBBox() || { minX: 0, minY: 0, w: 0, h: 0 };
     var job = {
       material: state.material, tool_diameter: state.tool_diameter,
       thickness: state.thickness, tab_spacing: state.tab_spacing,
-      stock: { width: state.sheet.width, height: state.sheet.height },
+      stock: { width: bb.w, height: bb.h },
       name: 'job', parts: [],
     };
     state.parts.forEach(function (p, i) {
       var pl = placement(p);
-      job.parts.push({ file_index: i, name: p.name, place_x: pl.x, place_y: pl.y, rotation: p.rotation });
+      job.parts.push({
+        file_index: i, name: p.name,
+        place_x: pl.x - bb.minX, place_y: pl.y - bb.minY,
+        rotation: p.rotation, mirror: !!p.flipped,
+      });
       fd.append('file_' + i, p.file, p.name + '.dxf');
     });
     fd.append('job', JSON.stringify(job));
@@ -579,7 +632,8 @@
     fd.append('tool_diameter', state.tool_diameter);
     fd.append('thickness', state.thickness);
     fd.append('origin_corner', 'bottom-left');
-    fd.append('rotation', 0);
+    fd.append('rotation', Math.round(p.rotation) % 360);
+    fd.append('mirror', p.flipped ? '1' : '0');
     fd.append('tab_spacing', state.tab_spacing);
     fd.append('timestamp', timestamp());
     fd.append('suggested_filename', p.name);
@@ -629,8 +683,9 @@
         resetButton: $('#reset-view'), emptyState: $('#viewer-empty'),
       });
     }
-    var W = (resp.stock && resp.stock.width) || state.sheet.width;
-    var D = (resp.stock && resp.stock.height) || state.sheet.height;
+    var bb = combinedBBox();
+    var W = (resp.stock && resp.stock.width) || (bb ? bb.w : state.machine.width);
+    var D = (resp.stock && resp.stock.height) || (bb ? bb.h : state.machine.height);
     viewer.load(resp.gcode, {
       stockWidth: W, stockDepth: D,
       stockHeight: state.thickness, toolDiameter: state.tool_diameter,

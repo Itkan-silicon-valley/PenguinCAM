@@ -600,6 +600,7 @@ def process_file():
         tool_diameter = float(request.form.get('tool_diameter', 0.157))
         origin_corner = request.form.get('origin_corner', 'bottom-left')
         rotation = int(request.form.get('rotation', 0))
+        mirror = request.form.get('mirror', '0') == '1'  # "flip over" (horizontal mirror)
         suggested_filename = request.form.get('suggested_filename', '')
 
         # Get timestamp from client (in user's local timezone)
@@ -744,7 +745,7 @@ def process_file():
 
                 # Load and process DXF
                 pp.load_dxf(input_path)
-                pp.transform_coordinates(origin_corner, rotation)
+                pp.transform_coordinates(origin_corner, rotation, mirror=mirror)
                 pp.identify_perimeter_and_pockets()  # Must come BEFORE classify_holes to remove perimeter circles
                 pp.classify_holes()
 
@@ -928,6 +929,7 @@ def process_job():
             place_x = float(part.get('place_x', 0.0))
             place_y = float(part.get('place_y', 0.0))
             rotation = float(part.get('rotation', 0))
+            mirror = bool(part.get('mirror'))
 
             pp = FRCPostProcessor(material_thickness=thickness, tool_diameter=tool_diameter,
                                   units='inch', config=team_config)
@@ -937,7 +939,8 @@ def process_job():
             pp.tab_spacing = tab_spacing
             pp.load_dxf(saved_paths[fidx])
             pp.transform_coordinates('bottom-left', rotation,
-                                     placement_offset=(place_x, place_y), enforce_bounds=False)
+                                     placement_offset=(place_x, place_y),
+                                     enforce_bounds=False, mirror=mirror)
             pp.identify_perimeter_and_pockets()
             pp.classify_holes()
             bbox = pp.bounding_box()
