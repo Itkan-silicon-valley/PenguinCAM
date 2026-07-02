@@ -230,6 +230,17 @@
     return true;
   }
 
+  // Jump to a step via the stepbar. Backward is always allowed; forward must clear the
+  // same gates as pressing Next through each intervening step.
+  function navigateTo(name) {
+    var target = STEPS.indexOf(name), cur = STEPS.indexOf(state.step);
+    if (target < 0 || target === cur) return;
+    if (target > cur) {
+      for (var i = cur; i < target; i++) { if (!canLeave(STEPS[i])) return; }
+    }
+    gotoStep(name);
+  }
+
   /* --------------------------------------------------------------- setup */
   function bindSetup() {
     var machineSel = $('#f-machine');
@@ -732,6 +743,17 @@
       var idx = STEPS.indexOf(state.step);
       if (idx > 0) gotoStep(STEPS[idx - 1]);
     });
+
+    // Clickable stepper pills (delegated), keyboard-activatable.
+    var bar = $('#stepbar');
+    function pillActivate(e) {
+      var li = e.target.closest ? e.target.closest('li[data-step]') : null;
+      if (!li) return;
+      if (e.type === 'keydown' && e.key !== 'Enter' && e.key !== ' ') return;
+      e.preventDefault();
+      navigateTo(li.getAttribute('data-step'));
+    }
+    if (bar) { bar.addEventListener('click', pillActivate); bar.addEventListener('keydown', pillActivate); }
   }
 
   function bindConnect() {
