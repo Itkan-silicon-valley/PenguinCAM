@@ -210,7 +210,7 @@
     $('#btn-back').disabled = idx === 0;
     var nextBtn = $('#btn-next');
     nextBtn.hidden = name === 'preview';
-    if (name === 'layout') { updateLayoutInfo(); drawLayout(); }
+    if (name === 'layout') { updateLayoutInfo(); resetHandleDir(); refitView(); drawLayout(); }
     if (name === 'preview') { resetPreview(); }
     dbg('step', name);
   }
@@ -370,11 +370,14 @@
   }
 
   /* -------------------------------------------------------------- layout */
-  var canvasState = { scale: 1, wcx: 0, wcy: 0, ccx: 0, ccy: 0, action: null };
+  var canvasState = { scale: 1, wcx: 0, wcy: 0, ccx: 0, ccy: 0, action: null, handleDir: [0, 1] };
 
-  // Fit the parts' combined bounding box to ~80% of the canvas (times the zoom factor),
-  // centered. With no parts, show a default area.
-  function fitTransform(canvas) {
+  // Fit the parts' combined bounding box to ~80% of the canvas (times zoom), centered.
+  // Called only on explicit events (entering Layout, zoom) — NOT every frame, so the
+  // view stays put while dragging/rotating and part motion is actually visible.
+  function refitView() {
+    var canvas = $('#layout-canvas');
+    if (!canvas) return;
     var bb = combinedBBox();
     var w = bb ? Math.max(bb.w, 0.001) : 10;
     var h = bb ? Math.max(bb.h, 0.001) : 10;
@@ -393,18 +396,31 @@
             canvasState.wcy - (cy - canvasState.ccy) / canvasState.scale];
   }
 
-  // Rotation handle for the current selection: centered above its bounding box (screen
-  // up). Group rotation is delta-based around the selection center.
+  // The rotation handle orbits the selection center along canvasState.handleDir (a
+  // world-space unit vector that follows the pointer while rotating and persists after).
+  // The bounding box stays axis-aligned; only the handle moves around it.
   function selectionHandle(selBox) {
-    var topMid = worldToCanvas((selBox.minX + selBox.maxX) / 2, selBox.maxY);
-    return { ex: topMid[0], ey: topMid[1], hx: topMid[0], hy: topMid[1] - 28 };
+    var cxw = (selBox.minX + selBox.maxX) / 2, cyw = (selBox.minY + selBox.maxY) / 2;
+    var ctr = worldToCanvas(cxw, cyw);
+    var dir = canvasState.handleDir || [0, 1];
+    var dp = worldToCanvas(cxw + dir[0], cyw + dir[1]);
+    var ux = dp[0] - ctr[0], uy = dp[1] - ctr[1], ul = Math.hypot(ux, uy) || 1; ux /= ul; uy /= ul;
+    var a = worldToCanvas(selBox.minX, selBox.minY), b = worldToCanvas(selBox.maxX, selBox.maxY);
+    var half = 0.5 * Math.hypot(b[0] - a[0], b[1] - a[1]);
+    return { ex: ctr[0] + ux * half, ey: ctr[1] + uy * half, hx: ctr[0] + ux * (half + 26), hy: ctr[1] + uy * (half + 26) };
+  }
+
+  // Point the handle sensibly when the selection changes: along a single part's "up",
+  // or north for a group.
+  function resetHandleDir() {
+    var sel = selectedParts();
+    canvasState.handleDir = (sel.length === 1) ? rotatePoint(0, 1, sel[0].rotation) : [0, 1];
   }
 
   function drawLayout() {
     var canvas = $('#layout-canvas');
     if (!canvas) return;
     var ctx = canvas.getContext('2d');
-    fitTransform(canvas);
     ctx.clearRect(0, 0, canvas.width, canvas.height);
 
     var v = validateLayout();
@@ -512,8 +528,9 @@
         if (shift) {
           if (isSelected(hit.id)) state.selectedIds = state.selectedIds.filter(function (id) { return id !== hit.id; });
           else state.selectedIds.push(hit.id);
+          resetHandleDir();
         } else {
-          if (!isSelected(hit.id)) state.selectedIds = [hit.id];
+          if (!isSelected(hit.id)) { state.selectedIds = [hit.id]; resetHandleDir(); }
           canvasState.action = {
             type: 'drag', startWorld: w,
             snap: selectedParts().map(function (p) { return { p: p, cx: p.cx, cy: p.cy }; })
@@ -535,6 +552,9 @@
         act.snap.forEach(function (s) { s.p.cx = s.cx + dx; s.p.cy = s.cy + dy; });
       } else if (act.type === 'rotate') {
         var cur = Math.atan2(w[1] - act.pivot[1], w[0] - act.pivot[0]);
+        // Handle follows the pointer around the box (and persists after release).
+        var hl = Math.hypot(w[0] - act.pivot[0], w[1] - act.pivot[1]) || 1;
+        canvasState.handleDir = [(w[0] - act.pivot[0]) / hl, (w[1] - act.pivot[1]) / hl];
         var cwDeg = -(cur - act.refAngle) * 180 / Math.PI;  // clockwise-positive delta
         var snapped = Math.round(cwDeg / 45) * 45;
         if (Math.abs(snapped - cwDeg) <= 5) cwDeg = snapped;
@@ -560,8 +580,8 @@
       selectedParts().forEach(function (p) { p.flipped = !p.flipped; });
       drawLayout();
     });
-    $('#btn-zoom-in').addEventListener('click', function () { state.zoom = Math.min(5, state.zoom * 1.25); drawLayout(); });
-    $('#btn-zoom-out').addEventListener('click', function () { state.zoom = Math.max(0.2, state.zoom / 1.25); drawLayout(); });
+    $('#btn-zoom-in').addEventListener('click', function () { state.zoom = Math.min(5, state.zoom * 1.25); refitView(); drawLayout(); });
+    $('#btn-zoom-out').addEventListener('click', function () { state.zoom = Math.max(0.2, state.zoom / 1.25); refitView(); drawLayout(); });
   }
 
   function updateLayoutInfo() {
