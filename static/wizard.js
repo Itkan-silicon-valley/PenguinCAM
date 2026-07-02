@@ -406,8 +406,15 @@
     var dp = worldToCanvas(cxw + dir[0], cyw + dir[1]);
     var ux = dp[0] - ctr[0], uy = dp[1] - ctr[1], ul = Math.hypot(ux, uy) || 1; ux /= ul; uy /= ul;
     var a = worldToCanvas(selBox.minX, selBox.minY), b = worldToCanvas(selBox.maxX, selBox.maxY);
-    var half = 0.5 * Math.hypot(b[0] - a[0], b[1] - a[1]);
-    return { ex: ctr[0] + ux * half, ey: ctr[1] + uy * half, hx: ctr[0] + ux * (half + 26), hy: ctr[1] + uy * (half + 26) };
+    var hw = Math.abs(b[0] - a[0]) / 2, hh = Math.abs(b[1] - a[1]) / 2;
+    // Distance from center to the box edge along the handle direction (ray-rectangle
+    // hit), so the stem meets the box exactly instead of a circumscribed circle.
+    var tEdge = Math.min(
+      Math.abs(ux) > 1e-6 ? hw / Math.abs(ux) : Infinity,
+      Math.abs(uy) > 1e-6 ? hh / Math.abs(uy) : Infinity
+    );
+    if (!isFinite(tEdge)) tEdge = 0;
+    return { ex: ctr[0] + ux * tEdge, ey: ctr[1] + uy * tEdge, hx: ctr[0] + ux * (tEdge + 26), hy: ctr[1] + uy * (tEdge + 26) };
   }
 
   // Point the handle sensibly when the selection changes: along a single part's "up",
