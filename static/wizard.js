@@ -223,6 +223,15 @@
     nextBtn.hidden = name === 'preview';
     if (name === 'layout') { updateLayoutInfo(); resetHandleDir(); refitView(); drawLayout(); }
     if (name === 'preview') { resetPreview(); }
+    // Keep Onshape in continuous face-selection mode only while on the Parts step.
+    if (state.source === 'onshape' && window.PenguinCAM.startFaceSelection) {
+      if (name === 'parts') {
+        var el = $('#select-status'); if (el) el.textContent = 'Select a face in Onshape…';
+        window.PenguinCAM.startFaceSelection();
+      } else {
+        window.PenguinCAM.stopFaceSelection();
+      }
+    }
     dbg('step', name);
   }
 
@@ -359,26 +368,20 @@
     if (state.source === 'onshape') {
       $('#upload-source').hidden = true;
       $('#onshape-source').hidden = false;
-      var sel = $('#btn-select-face');
-      // The Onshape adapter calls this when a face has been exported to a DXF blob.
+      // Face selection is continuous while on the Parts step (armed by gotoStep); the
+      // #select-status label just reflects state — no button.
+      function setSel(msg) { var el = $('#select-status'); if (el) el.textContent = msg; }
       window.PenguinCAM.onPart = function (data, fileOrBlob) {
         var file = fileOrBlob instanceof File ? fileOrBlob : new File([fileOrBlob], (data.name || 'part') + '.dxf');
         addPartFromOutline(data, file);
       };
       window.PenguinCAM.onSelectionBusy = function (busy) {
-        if (!sel) return;
-        sel.disabled = busy;
-        sel.textContent = busy ? 'Exporting selected face…' : 'Select a face in Onshape';
+        setSel(busy ? 'Importing face, please wait…' : 'Select a face in Onshape…');
       };
       window.PenguinCAM.onSelectionError = function (msg) {
         dbg('onshape:error', msg);
-        if (sel) { sel.disabled = false; sel.textContent = 'Select a face in Onshape'; }
-        alert('Onshape selection failed: ' + msg);
+        setSel('Import failed: ' + msg + '. Select a face to try again.');
       };
-      if (sel) sel.addEventListener('click', function () {
-        if (window.PenguinCAM.requestOnshapeSelection) window.PenguinCAM.requestOnshapeSelection();
-        else dbg('onshape', 'adapter not loaded');
-      });
     } else {
       var dz = $('#dropzone'), input = $('#f-dxf');
       dz.addEventListener('click', function () { input.click(); });

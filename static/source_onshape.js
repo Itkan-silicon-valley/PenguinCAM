@@ -8,11 +8,12 @@
  * the job submit stays self-contained (serverless-safe).
  *
  * Contract with wizard.js:
- *   window.PenguinCAM.requestOnshapeSelection()        - ask Onshape for a face
- *   window.PenguinCAM.onPart(outlineData, dx, File)    - a part is ready to add
- *   window.PenguinCAM.onSelectionBusy(bool)            - export in progress
- *   window.PenguinCAM.onSelectionError(msg)            - something failed
- *   window.PenguinCAM.debug(label, data)               - optional debug logging
+ *   window.PenguinCAM.startFaceSelection()   - begin continuous face-selection (Parts step)
+ *   window.PenguinCAM.stopFaceSelection()    - stop (left the Parts step)
+ *   window.PenguinCAM.onPart(outlineData, File) - a part is ready to add
+ *   window.PenguinCAM.onSelectionBusy(bool)  - import in progress
+ *   window.PenguinCAM.onSelectionError(msg)  - something failed
+ *   window.PenguinCAM.debug(label, data)     - optional debug logging
  */
 (function () {
   'use strict';
@@ -33,7 +34,13 @@
     dbg('onshape:init', ctx);
   }
 
-  P.requestOnshapeSelection = function () {
+  // Continuous face-selection: while the Parts step is open we keep a face-restricted
+  // requestSelection armed, so the user just clicks faces (no button) and can't select
+  // non-faces. We only act on REQUESTED_SELECTION (the restricted response) and ignore
+  // Onshape's generic SELECTION events. active gates stray responses after leaving.
+  var active = false;
+
+  function arm() {
     counter++;
     post({
       messageName: 'requestSelection',
@@ -44,22 +51,26 @@
       bodyTypeSpecifier: ['SOLID'],
       requiredSelectionCount: 1
     });
-    dbg('onshape:requestSelection', counter);
-  };
+    dbg('onshape:arm', counter);
+  }
+
+  P.startFaceSelection = function () { active = true; arm(); };
+  P.stopFaceSelection = function () { active = false; };
 
   window.addEventListener('message', function (e) {
     if (!isOnshapeOrigin(e.origin)) return;
     var d = e.data || {};
-    if (d.messageName !== 'REQUESTED_SELECTION' && d.messageName !== 'SELECTION') return;
+    if (d.messageName !== 'REQUESTED_SELECTION') return;  // ignore generic SELECTION (non-faces)
+    if (!active) return;                                  // ignore stray responses off the Parts step
     var sels = d.selections || [];
     var status = (d.status && d.status.statusCode) || (sels.length ? 'SUCCESS' : '');
-    dbg('onshape:' + d.messageName, { n: sels.length, status: status });
-    if (status === 'PENDING') return;            // user hasn't picked yet
-    if (!sels.length) return;                     // deselection / timeout - ignore
+    dbg('onshape:REQUESTED_SELECTION', { n: sels.length, status: status });
+    if (status === 'PENDING') return;                     // user hasn't picked yet
+    if (!sels.length) { arm(); return; }                  // deselection / timeout - re-arm
     var s = sels[0];
     var faceId = s.selectionId || s.entityId || s.id;
     var partId = s.partId || s.bodyId || null;
-    if (!faceId) { if (P.onSelectionError) P.onSelectionError('No face id in selection'); return; }
+    if (!faceId) { arm(); return; }
     exportFace(faceId, partId);
   });
 
@@ -79,6 +90,7 @@
         if (P.onSelectionBusy) P.onSelectionBusy(false);
         if (!res.ok || !res.j.success) {
           if (P.onSelectionError) P.onSelectionError((res.j && res.j.error) || 'export failed');
+          if (active) arm();  // let them try another face
           return;
         }
         var bin = atob(res.j.dxf);
@@ -87,10 +99,12 @@
         var file = new File([arr], (res.j.name || 'part') + '.dxf', { type: 'application/dxf' });
         dbg('onshape:export-ok', { name: res.j.name, w: res.j.width, h: res.j.height });
         if (P.onPart) P.onPart(res.j, file);
+        if (active) arm();  // imported — go straight back into select-a-face mode
       })
       .catch(function (err) {
         if (P.onSelectionBusy) P.onSelectionBusy(false);
         if (P.onSelectionError) P.onSelectionError(String(err));
+        if (active) arm();
       });
   }
 
