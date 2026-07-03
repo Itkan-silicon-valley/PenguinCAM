@@ -501,7 +501,10 @@
 
     var v = validateLayout();
     $('#layout-errors').textContent = v.msgs.join('\n');
-    var flipBtn = $('#btn-flip'); if (flipBtn) flipBtn.disabled = state.selectedIds.length === 0;
+    // Flip is hidden in 2.5D: a mirror there isn't recoverable (features live at
+    // specific depths on one face), so flipping would cut a genuinely wrong part.
+    var flipBtn = $('#btn-flip');
+    if (flipBtn) { flipBtn.hidden = state.mode === '2.5d'; flipBtn.disabled = state.selectedIds.length === 0; }
 
     // Theme-aware colors (read the CSS variables so the canvas matches light/dark).
     var col = {
@@ -662,6 +665,7 @@
     canvas.addEventListener('touchend', up);
 
     $('#btn-flip').addEventListener('click', function () {
+      if (state.mode === '2.5d') return;  // flip not allowed in 2.5D
       selectedParts().forEach(function (p) { p.flipped = !p.flipped; });
       drawLayout();
     });
@@ -734,7 +738,7 @@
     fd.append('thickness', state.thickness);
     fd.append('origin_corner', 'bottom-left');
     fd.append('rotation', Math.round(p.rotation) % 360);
-    fd.append('mirror', p.flipped ? '1' : '0');
+    fd.append('mirror', '0');  // 2.5D never mirrors (flip disabled in this mode)
     fd.append('tab_spacing', state.tab_spacing);
     fd.append('timestamp', timestamp());
     fd.append('suggested_filename', p.name);
