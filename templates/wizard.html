@@ -35,6 +35,9 @@
         </header>
 
         <main id="wiz-body">
+            <!-- Running summary of decisions made on earlier steps (grows as you advance). -->
+            <div id="wiz-summary" hidden aria-label="Job summary"></div>
+
             <!-- ===== SETUP ===== -->
             <section class="step" data-step="setup">
                 <h2>Setup</h2>
@@ -118,7 +121,6 @@
             <!-- ===== PREVIEW ===== -->
             <section class="step" data-step="preview" hidden>
                 <h2>Preview &amp; Save</h2>
-                <button type="button" id="btn-generate" class="btn">Regenerate G-code</button>
                 <div id="gen-status" class="hint"></div>
                 <div id="preview-result" hidden>
                     <div id="preview-stats"></div>

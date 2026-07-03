@@ -208,6 +208,40 @@
     return { bad: bad, msgs: msgs, tooBig: tooBig, bbox: bbox };
   }
 
+  // Running summary of decisions, revealed progressively: material/thickness/tool from
+  // Setup (shown on Parts+), part count (Layout+), stock bbox size (Preview). Lets the
+  // user confirm at the end what they chose without navigating back.
+  function updateSummary() {
+    var box = $('#wiz-summary');
+    if (!box) return;
+    var idx = STEPS.indexOf(state.step);
+    if (idx < STEPS.indexOf('parts')) { box.hidden = true; return; }
+    box.hidden = false;
+
+    var chips = [];
+    var msel = $('#f-material');
+    chips.push(msel && msel.options[msel.selectedIndex] ? msel.options[msel.selectedIndex].text : state.material);
+    chips.push(state.mode === '2.5d' ? '2.5D · thickness from CAD' : (state.thickness + '" thick'));
+    chips.push('⌀ ' + (+state.tool_diameter).toFixed(3) + '" tool');
+    if (idx >= STEPS.indexOf('layout')) {
+      chips.push(state.parts.length + ' part' + (state.parts.length === 1 ? '' : 's'));
+    }
+    if (idx >= STEPS.indexOf('preview')) {
+      var st = state.lastResponse && state.lastResponse.stock;
+      var w = st ? st.width : null, h = st ? st.height : null;
+      if (w == null) { var bb = combinedBBox(); if (bb) { w = bb.w; h = bb.h; } }
+      if (w != null) chips.push('stock ' + (+w).toFixed(2) + ' x ' + (+h).toFixed(2) + '"');
+    }
+
+    box.innerHTML = '';
+    chips.forEach(function (c) {
+      var s = document.createElement('span');
+      s.className = 'chip';
+      s.textContent = c;
+      box.appendChild(s);
+    });
+  }
+
   /* ------------------------------------------------------------ step nav */
   function gotoStep(name) {
     state.step = name;
@@ -232,6 +266,7 @@
         window.PenguinCAM.stopFaceSelection();
       }
     }
+    updateSummary();
     dbg('step', name);
   }
 
@@ -638,16 +673,12 @@
     $('#gen-status').textContent = '';
   }
 
-  function bindPreview() { $('#btn-generate').addEventListener('click', generate); }
-
   function generate() {
     $('#preview-errors').textContent = '';
-    $('#gen-status').textContent = 'Generating...';
-    $('#btn-generate').disabled = true;
-    var done = function () { $('#btn-generate').disabled = false; };
+    $('#gen-status').textContent = 'Generating…';
 
-    if (state.mode === '2.5d') { generateSingle().then(done, done); }
-    else { generateJob().then(done, done); }
+    if (state.mode === '2.5d') { generateSingle(); }
+    else { generateJob(); }
   }
 
   function generateJob() {
@@ -727,6 +758,7 @@
     $('#preview-stats').textContent = [n, t].filter(Boolean).join(' · ');
     $('#download-link').href = '/download/' + resp.filename;
     show3DPreview(resp);
+    updateSummary();  // refresh the stock chip with the server-authoritative size
   }
 
   function show3DPreview(resp) {
@@ -820,7 +852,6 @@
     bindSetup();
     bindParts();
     bindLayout();
-    bindPreview();
     bindNav();
     bindConnect();
     // Best-effort live theme sync: apply if Onshape posts a theme update while open.
