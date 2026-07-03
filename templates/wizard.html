@@ -151,7 +151,6 @@
                         <button type="button" class="btn small" id="reset-view">Reset view</button>
                     </div>
                     <p class="hint">Origin (0,0,0) = lower-left, sacrifice board. Drag to orbit, scroll to zoom.</p>
-                    <a id="download-link" class="btn primary" href="#" download>Download .nc</a>
                 </div>
                 <div id="preview-errors" class="errors" aria-live="polite"></div>
             </section>
@@ -160,6 +159,16 @@
         <footer id="wiz-nav">
             <button type="button" id="btn-back" class="btn" disabled>Back</button>
             <button type="button" id="btn-next" class="btn primary">Next</button>
+            <!-- Final action (Preview step). Split button: main action + a caret to switch
+                 between Download and Send to Google Drive (caret only when Drive is configured). -->
+            <div id="final-action" class="split-btn" hidden>
+                <button type="button" id="btn-do" class="btn primary" disabled>Download Program</button>
+                <button type="button" id="btn-do-caret" class="btn primary split-caret" aria-label="Choose action" hidden>&#9662;</button>
+                <ul id="do-menu" class="do-menu" role="menu" hidden>
+                    <li role="menuitem" data-action="download">Download Program</li>
+                    <li role="menuitem" data-action="drive">Send to Google Drive</li>
+                </ul>
+            </div>
         </footer>
     </div>
 
@@ -186,6 +195,7 @@
         bed: { width: {{ machine_x_max|tojson }}, height: {{ machine_y_max|tojson }} },
         machineName: {{ ((machines.get(current_machine_id) or {}).get('name') or 'Machine')|tojson }},
         defaultTool: {{ default_tool_diameter|tojson }},
+        driveEnabled: {{ (drive_enabled if drive_enabled is defined else False)|tojson }},
       };
     </script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>

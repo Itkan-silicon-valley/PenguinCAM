@@ -26,6 +26,7 @@
     parts: [],            // {id,name,width,height,outline,holes,file,cx,cy,rotation,flipped}
     selectedIds: [],
     zoom: 1,
+    saveAction: 'download',   // 'download' | 'drive' (final-step action)
     lastResponse: null,
   };
   var partSeq = 0;
@@ -254,9 +255,17 @@
     var idx = STEPS.indexOf(name);
     $('#btn-back').disabled = idx === 0;
     var nextBtn = $('#btn-next');
-    nextBtn.hidden = name === 'preview';
+    var isPreview = name === 'preview';
+    nextBtn.hidden = isPreview;
+    $('#final-action').hidden = !isPreview;
     if (name === 'layout') { updateLayoutInfo(); resetHandleDir(); refitView(); drawLayout(); }
-    if (name === 'preview') { resetPreview(); generate(); }  // auto-generate on entry
+    if (isPreview) {
+      state.saveAction = preferredAction();
+      $('#btn-do').disabled = true;   // enabled once generation finishes
+      setupFinalAction();
+      resetPreview();
+      generate();                     // auto-generate on entry
+    }
     // Keep Onshape in continuous face-selection mode only while on the Parts step.
     if (state.source === 'onshape' && window.PenguinCAM.startFaceSelection) {
       if (name === 'parts') {
@@ -756,7 +765,7 @@
     var t = resp.cycle_time ? ('Estimated cycle time: ' + resp.cycle_time) : '';
     var n = resp.parts ? (resp.parts.length + ' part(s)') : '1 part';
     $('#preview-stats').textContent = [n, t].filter(Boolean).join(' · ');
-    $('#download-link').href = '/download/' + resp.filename;
+    $('#btn-do').disabled = false;   // gcode ready — enable the save/download action
     show3DPreview(resp);
     updateSummary();  // refresh the stock chip with the server-authoritative size
   }
@@ -784,6 +793,109 @@
       stockHeight: state.thickness, toolDiameter: state.tool_diameter,
     });
     dbg('preview', { w: W, d: D });
+  }
+
+  /* ------------------------------------------------- final action (save) */
+  var SAVE_PREF_KEY = 'penguincam_save_action';
+  function readSavePref() { try { return localStorage.getItem(SAVE_PREF_KEY); } catch (e) { return null; } }
+  function writeSavePref(a) { try { localStorage.setItem(SAVE_PREF_KEY, a); } catch (e) {} }
+  function actionLabel(a) { return a === 'drive' ? 'Send to Google Drive' : 'Download Program'; }
+
+  // Choose the default action: remembered preference, but only 'drive' if Drive is
+  // configured now (falls back to download if a saved 'drive' pref is no longer valid).
+  function preferredAction() {
+    var pref = readSavePref();
+    return (pref === 'drive' && CFG.driveEnabled) ? 'drive' : 'download';
+  }
+
+  // Configure the split button: caret + Drive option only when Drive is configured.
+  function setupFinalAction() {
+    var driveOk = !!CFG.driveEnabled;
+    if (state.saveAction === 'drive' && !driveOk) state.saveAction = 'download';
+    $('#btn-do-caret').hidden = !driveOk;
+    $('#final-action').classList.toggle('has-caret', driveOk);
+    var driveItem = document.querySelector('#do-menu li[data-action="drive"]');
+    if (driveItem) driveItem.hidden = !driveOk;
+    $('#btn-do').textContent = actionLabel(state.saveAction);
+  }
+
+  function chooseAction(a) {
+    state.saveAction = a;
+    writeSavePref(a);
+    $('#btn-do').textContent = actionLabel(a);
+    $('#do-menu').hidden = true;
+    performAction(a);
+  }
+
+  function performAction(a) {
+    var resp = state.lastResponse;
+    if (!resp || !resp.filename) return;  // not generated yet
+    if (a === 'drive') driveSave(resp.filename);
+    else doDownload(resp.filename);
+  }
+
+  function doDownload(token) {
+    // Open in a new top-level tab rather than an in-frame anchor: a sandboxed Onshape
+    // iframe can block in-frame downloads, but the response forces attachment so the
+    // new tab downloads and closes. (Relies on popups, which OAuth already uses.)
+    window.open('/download/' + token, '_blank');
+    $('#gen-status').textContent = 'Download started.';
+  }
+
+  function driveSave(token) {
+    var status = $('#gen-status'), errs = $('#preview-errors');
+    errs.textContent = '';
+    status.textContent = 'Checking Google Drive…';
+    fetch('/drive/status', { credentials: 'same-origin' })
+      .then(function (r) { return r.json(); })
+      .then(function (st) {
+        if (!st.enabled) { errs.textContent = 'Google Drive is not configured for your team.'; status.textContent = ''; return; }
+        if (!st.authenticated) {
+          status.textContent = 'Complete Google sign-in in the popup…';
+          var popup = window.open('/auth/login', 'penguincam_gauth', 'width=600,height=700');
+          if (!popup) { errs.textContent = 'Popup blocked — allow popups, then try again.'; status.textContent = ''; return; }
+          var iv = setInterval(function () {
+            if (popup.closed) { clearInterval(iv); driveUpload(token); }
+          }, 500);
+          setTimeout(function () { clearInterval(iv); }, 180000);
+          return;
+        }
+        driveUpload(token);
+      })
+      .catch(function (e) { errs.textContent = 'Drive check failed: ' + e; status.textContent = ''; });
+  }
+
+  function driveUpload(token) {
+    var status = $('#gen-status'), errs = $('#preview-errors'), btn = $('#btn-do');
+    status.textContent = 'Uploading to Google Drive…';
+    btn.disabled = true;
+    // POST as JSON so require_auth returns 401 (not an HTML redirect) if still unauthed.
+    fetch('/drive/upload/' + token, {
+      method: 'POST', credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' }, body: '{}'
+    })
+      .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j }; }); })
+      .then(function (res) {
+        btn.disabled = false;
+        if (res.ok && res.j.success) { status.textContent = res.j.message || 'Saved to Google Drive.'; }
+        else { errs.textContent = (res.j && res.j.message) || 'Drive upload failed.'; status.textContent = ''; }
+      })
+      .catch(function (e) { btn.disabled = false; errs.textContent = 'Drive upload failed: ' + e; status.textContent = ''; });
+  }
+
+  function bindFinalAction() {
+    $('#btn-do').addEventListener('click', function () { if (!this.disabled) performAction(state.saveAction); });
+    $('#btn-do-caret').addEventListener('click', function (e) {
+      e.stopPropagation();
+      var m = $('#do-menu'); m.hidden = !m.hidden;
+    });
+    $('#do-menu').addEventListener('click', function (e) {
+      var li = e.target.closest('li[data-action]');
+      if (li) chooseAction(li.getAttribute('data-action'));
+    });
+    document.addEventListener('click', function (e) {
+      if (!e.target.closest('#final-action')) $('#do-menu').hidden = true;
+    });
   }
 
   /* ----------------------------------------------------------------- init */
@@ -853,6 +965,7 @@
     bindParts();
     bindLayout();
     bindNav();
+    bindFinalAction();
     bindConnect();
     // Best-effort live theme sync: apply if Onshape posts a theme update while open.
     // (The load-time theme is already set server-side from the ?theme= URL param.)
