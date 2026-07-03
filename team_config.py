@@ -185,9 +185,12 @@ class TeamConfig:
                 if key != 'version':
                     machine_config[key] = value
 
-            # Ensure machine has a name
+            # Ensure the wrapped machine has a display name. In a v1 config the
+            # name lives nested under `machine.name`, not at the top level, so
+            # promote it (falling back to a generic label only if truly absent).
             if 'name' not in machine_config:
-                machine_config['name'] = 'Default Machine'
+                nested_name = machine_config.get('machine', {}).get('name')
+                machine_config['name'] = nested_name or 'Default Machine'
 
             return {
                 'version': 2,
