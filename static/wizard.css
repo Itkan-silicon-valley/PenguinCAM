@@ -215,11 +215,16 @@ fieldset.field { border: 1px solid var(--line); border-radius: 6px; padding: 8px
 
 /* Final-action split button (Preview step). */
 .split-btn { position: relative; display: flex; flex: 1; }
+/* `display: flex` above overrides the HTML `hidden` attribute; restore it so the
+   button only shows on the Preview step. */
+#final-action[hidden] { display: none; }
 .split-btn #btn-do { flex: 1; }
 .split-btn.has-caret #btn-do { border-top-right-radius: 0; border-bottom-right-radius: 0; }
 .split-caret {
   flex: 0 0 auto;
-  padding: 8px 10px;
+  padding: 8px 16px;
+  font-size: 16px;
+  line-height: 1;
   border-top-left-radius: 0;
   border-bottom-left-radius: 0;
   border-left: 1px solid rgba(0, 0, 0, 0.25);
