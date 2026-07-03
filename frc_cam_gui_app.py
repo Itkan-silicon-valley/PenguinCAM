@@ -887,11 +887,9 @@ def process_job():
         machine_id = job.get('machine_id')
         timestamp_str = request.form.get('timestamp', '')
 
-        stock = job.get('stock', {})
-        stock_w = float(stock.get('width', 0))
-        stock_h = float(stock.get('height', 0))
-        if stock_w <= 0 or stock_h <= 0:
-            return jsonify({'error': 'Stock sheet width and height are required'}), 400
+        # Stock size (and G54 origin) are derived server-side from the placed parts'
+        # combined bounding box; the client's stock field is advisory only. This avoids
+        # a client/server bbox mismatch flagging a part as "outside" its own stock.
 
         # Save each uploaded DXF to a distinct path so parts don't clobber each other.
         job_dir = tempfile.mkdtemp(prefix='job_', dir=UPLOAD_FOLDER)
@@ -915,8 +913,7 @@ def process_job():
         machine_x = team_config.machine_x_max
         machine_y = team_config.machine_y_max
 
-        log(f"[JOB] {len(parts_spec)} parts, stock {stock_w:.1f}x{stock_h:.1f}, "
-            f"tool {tool_diameter}, material {material}, thickness {thickness}")
+        log(f"[JOB] {len(parts_spec)} parts, tool {tool_diameter}, material {material}, thickness {thickness}")
 
         # Pass 1: build + place each part; collect footprints for layout validation.
         prepared = []
@@ -954,9 +951,17 @@ def process_job():
         if gen_errors:
             return jsonify({'success': False, 'part_errors': gen_errors}), 400
 
-        # Validate layout before the expensive body generation. Kerf = tool diameter.
-        layout_errors = validate_job_layout(placed, stock_w, stock_h, machine_x, machine_y,
-                                            min_gap=tool_diameter)
+        # Stock = the parts' combined bounding box (server-authoritative).
+        boxes = [p['bbox'] for p in placed if p.get('bbox')]
+        if boxes:
+            stock_w = max(b[2] for b in boxes) - min(b[0] for b in boxes)
+            stock_h = max(b[3] for b in boxes) - min(b[1] for b in boxes)
+        else:
+            stock_w = stock_h = 0.0
+
+        # Validate before the expensive body generation: the combined bbox must fit the
+        # machine, and parts must not overlap (kerf = tool diameter).
+        layout_errors = validate_job_layout(placed, machine_x, machine_y, min_gap=tool_diameter)
         if layout_errors:
             log(f"[JOB] layout invalid: {layout_errors}")
             return jsonify({'success': False, 'part_errors': layout_errors}), 400
@@ -1010,7 +1015,7 @@ def process_job():
             'gcode': result.gcode,
             'cycle_time': result.stats.get('cycle_time_display'),
             'cycle_time_seconds': result.stats.get('cycle_time_seconds'),
-            'stock': {'width': stock_w, 'height': stock_h},
+            'stock': {'width': round(stock_w, 4), 'height': round(stock_h, 4)},
             'parts': response_parts,
         })
 

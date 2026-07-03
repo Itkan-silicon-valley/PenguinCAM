@@ -63,7 +63,9 @@ class TestProcessJobRoute(unittest.TestCase):
         payload = resp.get_json()
         self.assertTrue(payload['success'])
         self.assertEqual(len(payload['parts']), 2)
-        self.assertEqual(payload['stock'], {'width': 24, 'height': 24})
+        # Stock is the parts' combined bounding box (A 4x4 at x0, B 3x3 at x6 => 9x4).
+        self.assertAlmostEqual(payload['stock']['width'], 9.0, places=2)
+        self.assertAlmostEqual(payload['stock']['height'], 4.0, places=2)
         self.assertIn('MULTI-PART JOB', payload['gcode'])
         self.assertEqual(payload['gcode'].count('M30'), 1)
         # Part B's reported footprint is shifted right by its placement.
@@ -83,15 +85,19 @@ class TestProcessJobRoute(unittest.TestCase):
         self.assertFalse(payload['success'])
         self.assertTrue(any('overlap' in e['error'].lower() for e in payload['part_errors']))
 
-    def test_out_of_bounds_rejected(self):
-        a = _square_dxf_bytes(4.0)
+    def test_exceeds_machine_rejected(self):
+        # Two parts spread far apart -> combined bounding box (~204") exceeds any machine.
+        a, b = _square_dxf_bytes(4.0), _square_dxf_bytes(4.0)
         resp = self._post_job(
-            parts=[{'file_index': 0, 'name': 'A', 'place_x': 22, 'place_y': 22, 'rotation': 0}],
-            files={'file_0': a},
+            parts=[
+                {'file_index': 0, 'name': 'A', 'place_x': 0, 'place_y': 0, 'rotation': 0},
+                {'file_index': 1, 'name': 'B', 'place_x': 200, 'place_y': 0, 'rotation': 0},
+            ],
+            files={'file_0': a, 'file_1': b},
         )
         self.assertEqual(resp.status_code, 400)
         payload = resp.get_json()
-        self.assertTrue(any('outside the stock' in e['error'].lower() for e in payload['part_errors']))
+        self.assertTrue(any('exceed' in e['error'].lower() for e in payload['part_errors']))
 
     def test_missing_job_spec(self):
         resp = self.client.post('/process-job', data={}, content_type='multipart/form-data')

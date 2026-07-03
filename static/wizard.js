@@ -222,7 +222,7 @@
     var nextBtn = $('#btn-next');
     nextBtn.hidden = name === 'preview';
     if (name === 'layout') { updateLayoutInfo(); resetHandleDir(); refitView(); drawLayout(); }
-    if (name === 'preview') { resetPreview(); }
+    if (name === 'preview') { resetPreview(); generate(); }  // auto-generate on entry
     // Keep Onshape in continuous face-selection mode only while on the Parts step.
     if (state.source === 'onshape' && window.PenguinCAM.startFaceSelection) {
       if (name === 'parts') {

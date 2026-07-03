@@ -2218,28 +2218,31 @@ class TestMultiPartEngine(unittest.TestCase):
             {'name': 'A', 'bbox': (0, 0, 4, 4)},
             {'name': 'B', 'bbox': (2, 2, 6, 6)},
         ]
-        errors = validate_job_layout(parts, 24, 24, 24, 24)
+        errors = validate_job_layout(parts, 24, 24)
         self.assertTrue(any('overlap' in e['error'].lower() for e in errors))
 
-    def test_validate_detects_out_of_bounds(self):
-        parts = [{'name': 'A', 'bbox': (20, 20, 30, 30)}]
-        errors = validate_job_layout(parts, 24, 24, 48, 48)
-        self.assertTrue(any('outside the stock' in e['error'].lower() for e in errors))
+    def test_validate_combined_bbox_exceeds_machine(self):
+        # A single part isn't "outside a sheet" (it IS the stock); the only fit check is
+        # that the combined bbox fits the machine.
+        big = [{'name': 'A', 'bbox': (0, 0, 30, 30)}]
+        self.assertTrue(any('exceed' in e['error'].lower() for e in validate_job_layout(big, 24, 24)))
+        small = [{'name': 'A', 'bbox': (0, 0, 10, 10)}]
+        self.assertEqual(validate_job_layout(small, 24, 24), [])  # fits, single part is its own stock
 
     def test_validate_passes_clean_layout(self):
         parts = [
             {'name': 'A', 'bbox': (0, 0, 4, 4)},
             {'name': 'B', 'bbox': (6, 0, 10, 4)},
         ]
-        self.assertEqual(validate_job_layout(parts, 24, 24, 24, 24), [])
+        self.assertEqual(validate_job_layout(parts, 24, 24), [])
 
     def test_validate_min_gap_kerf(self):
         parts = [
             {'name': 'A', 'bbox': (0, 0, 4, 4)},
             {'name': 'B', 'bbox': (4.1, 0, 8.1, 4)},
         ]
-        self.assertEqual(validate_job_layout(parts, 24, 24, 24, 24, min_gap=0.0), [])
-        self.assertTrue(validate_job_layout(parts, 24, 24, 24, 24, min_gap=0.25))
+        self.assertEqual(validate_job_layout(parts, 24, 24, min_gap=0.0), [])
+        self.assertTrue(validate_job_layout(parts, 24, 24, min_gap=0.25))
 
     def test_validate_concave_nesting_not_flagged(self):
         """A small part nested in an L-shaped part's notch: bounding boxes overlap, but
@@ -2251,7 +2254,7 @@ class TestMultiPartEngine(unittest.TestCase):
             {'name': 'L', 'bbox': (0, 0, 6, 6), 'polygon': L},
             {'name': 'small', 'bbox': (2.5, 2.5, 5.5, 5.5), 'polygon': small},
         ]
-        self.assertEqual(validate_job_layout(parts, 24, 24, 24, 24, min_gap=0.157), [])
+        self.assertEqual(validate_job_layout(parts, 24, 24, min_gap=0.157), [])
 
     def test_validate_real_overlap_still_flagged(self):
         """Same L-shape but the small part intrudes into the solid arm -> flagged."""
@@ -2262,7 +2265,7 @@ class TestMultiPartEngine(unittest.TestCase):
             {'name': 'L', 'bbox': (0, 0, 6, 6), 'polygon': L},
             {'name': 'X', 'bbox': (1, 1, 4, 4), 'polygon': overlapping},
         ]
-        errors = validate_job_layout(parts, 24, 24, 24, 24, min_gap=0.157)
+        errors = validate_job_layout(parts, 24, 24, min_gap=0.157)
         self.assertTrue(any('overlap' in e['error'].lower() for e in errors))
 
 

@@ -5111,13 +5111,15 @@ class FRCPostProcessor:
         return gcode
 
 
-def validate_job_layout(parts, stock_width, stock_height, machine_x_max, machine_y_max, min_gap=0.0):
-    """Validate a multi-part job layout against the stock sheet and machine.
+def validate_job_layout(parts, machine_x_max, machine_y_max, min_gap=0.0):
+    """Validate a multi-part job layout. The parts' combined bounding box IS the stock,
+    so the only fit check is that it fits the machine; there's no separate sheet to be
+    "outside" of. Parts also must not overlap or sit closer than min_gap.
 
     Args:
-        parts: list of dicts, each with 'name' and 'bbox' = (minX, minY, maxX, maxY)
-               in sheet coordinates (origin at the sheet's machine-zero corner).
-        stock_width, stock_height: stock sheet size (inches).
+        parts: list of dicts, each with 'name' and 'bbox' = (minX, minY, maxX, maxY),
+               and optionally 'polygon' (a placed Shapely polygon for real-geometry
+               overlap testing).
         machine_x_max, machine_y_max: machine travel envelope (inches).
         min_gap: required clearance between parts (inches). Pass the tool diameter to
                  reject parts closer than one kerf. Defaults to 0 (touching allowed).
@@ -5129,31 +5131,22 @@ def validate_job_layout(parts, stock_width, stock_height, machine_x_max, machine
     errors = []
     tol = 1e-6
 
-    # Sheet must fit the machine.
-    if stock_width > machine_x_max + tol or stock_height > machine_y_max + tol:
-        errors.append({
-            'part_index': None,
-            'name': None,
-            'error': (f"Stock sheet ({stock_width:.2f}\" x {stock_height:.2f}\") exceeds machine "
-                      f"bounds ({machine_x_max:.1f}\" x {machine_y_max:.1f}\").")
-        })
-
-    # Each part must lie within the sheet.
-    for i, part in enumerate(parts):
-        bbox = part.get('bbox')
-        name = part.get('name', f'part {i + 1}')
-        if bbox is None:
-            errors.append({'part_index': i, 'name': name, 'error': f"{name}: no geometry to place."})
-            continue
-        minx, miny, maxx, maxy = bbox
-        if minx < -tol or miny < -tol or maxx > stock_width + tol or maxy > stock_height + tol:
+    # The combined bounding box (the stock) must fit the machine.
+    boxes = [p.get('bbox') for p in parts if p.get('bbox')]
+    if boxes:
+        w = max(b[2] for b in boxes) - min(b[0] for b in boxes)
+        h = max(b[3] for b in boxes) - min(b[1] for b in boxes)
+        if w > machine_x_max + tol or h > machine_y_max + tol:
             errors.append({
-                'part_index': i,
-                'name': name,
-                'error': (f"{name} extends outside the stock sheet "
-                          f"(part X=[{minx:.2f}, {maxx:.2f}], Y=[{miny:.2f}, {maxy:.2f}]; "
-                          f"sheet {stock_width:.2f}\" x {stock_height:.2f}\").")
+                'part_index': None,
+                'name': None,
+                'error': (f"Parts ({w:.2f}\" x {h:.2f}\") exceed the machine "
+                          f"({machine_x_max:.1f}\" x {machine_y_max:.1f}\").")
             })
+    for i, part in enumerate(parts):
+        if part.get('bbox') is None:
+            errors.append({'part_index': i, 'name': part.get('name', f'part {i + 1}'),
+                           'error': f"{part.get('name', 'part')}: no geometry to place."})
 
     # Parts must not overlap (or sit closer than min_gap). When a placed perimeter
     # polygon is supplied, test the real geometry (so a part can nest into another's
