@@ -2269,5 +2269,88 @@ class TestMultiPartEngine(unittest.TestCase):
         self.assertTrue(any('overlap' in e['error'].lower() for e in errors))
 
 
+class TestTubePatternTwoFace(unittest.TestCase):
+    """Tube pattern G-code: one-face (pattern mirrored) and two-face (distinct per side)."""
+
+    def _make_face(self, holes):
+        """Build a tube-face processor for a 1x2 face with the given holes.
+
+        holes: list of ((cx, cy), diameter).
+        """
+        pp = FRCPostProcessor(0.125, 0.157)  # 0.125" wall thickness
+        pp.apply_material_preset('aluminum')
+        pp.tube_height = 2.0
+        pp.circles = [{'center': c, 'diameter': d} for (c, d) in holes]
+        pp.polylines = [[(0, 0), (1, 0), (1, 2), (0, 2), (0, 0)]]  # tube face rectangle
+        pp.identify_perimeter_and_pockets()  # remove the perimeter (tube face) first
+        pp.classify_holes()
+        return pp
+
+    def _assert_clean(self, gcode):
+        """Guard: pure ASCII, no nested parenthesis comments (machine requirements)."""
+        for line in gcode.split('\n'):
+            body = line.split(';')[0]
+            depth = 0
+            for ch in body:
+                if ch == '(':
+                    depth += 1
+                elif ch == ')':
+                    depth -= 1
+                self.assertLessEqual(depth, 1, f"Nested comment: {line}")
+            try:
+                line.encode('ascii')
+            except UnicodeEncodeError:
+                self.fail(f"Non-ASCII in tube gcode: {line}")
+
+    def test_one_face_mirror(self):
+        """One-face mode: two phases, mirror note, G55, flip pause, clean output."""
+        pp = self._make_face([((0.3, 1.0), 0.25)])
+        result = pp.generate_tube_pattern_gcode(
+            tube_height=2.0, square_end=False, cut_to_length=False,
+            tube_width=1.0, tube_length=2.0, suggested_filename='tube')
+        self.assertTrue(result.success)
+        g = result.gcode
+        self.assertIn('PHASE 1: FIRST FACE', g)
+        self.assertIn('PHASE 2: SECOND FACE', g)
+        self.assertIn('One-face mode', g)
+        self.assertIn('G55', g)
+        self.assertIn('M0', g)
+        self.assertFalse(result.stats['two_face'])
+        self._assert_clean(g)
+
+    def test_two_face_distinct(self):
+        """Two-face mode: distinct patterns, note + stats reflect both faces."""
+        face1 = self._make_face([((0.3, 1.0), 0.25)])
+        face2 = self._make_face([((0.2, 0.6), 0.25), ((0.8, 1.4), 0.25)])
+        result = face1.generate_tube_pattern_gcode(
+            tube_height=2.0, square_end=False, cut_to_length=False,
+            tube_width=1.0, tube_length=2.0, suggested_filename='tube',
+            second_face_pp=face2)
+        self.assertTrue(result.success)
+        g = result.gcode
+        self.assertIn('Two-face mode', g)
+        self.assertIn('PHASE 1: FIRST FACE', g)
+        self.assertIn('PHASE 2: SECOND FACE', g)
+        self.assertIn('M0', g)
+        self.assertTrue(result.stats['two_face'])
+        # Total holes = face1(1) + face2(2); per-face count reflects face 1.
+        self.assertEqual(result.stats['num_holes'], 3)
+        self.assertEqual(result.stats['num_holes_per_face'], 1)
+        self._assert_clean(g)
+
+    def test_two_face_differs_from_one_face(self):
+        """A distinct face 2 changes phase-2 output vs. mirroring face 1."""
+        one = self._make_face([((0.3, 1.0), 0.25)])
+        g_one = one.generate_tube_pattern_gcode(
+            tube_height=2.0, square_end=False, cut_to_length=False,
+            tube_width=1.0, tube_length=2.0).gcode
+        f1 = self._make_face([((0.3, 1.0), 0.25)])
+        f2 = self._make_face([((0.8, 0.5), 0.25)])
+        g_two = f1.generate_tube_pattern_gcode(
+            tube_height=2.0, square_end=False, cut_to_length=False,
+            tube_width=1.0, tube_length=2.0, second_face_pp=f2).gcode
+        self.assertNotEqual(g_one, g_two)
+
+
 if __name__ == '__main__':
     unittest.main()

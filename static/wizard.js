@@ -9,7 +9,12 @@
   var CFG = window.PenguinCAM || { source: 'upload', bed: { width: 24, height: 24 }, defaultTool: 0.157 };
   var DEBUG = /(?:^|[?&])debug=1(?:&|$)/.test(location.search);
 
-  var STEPS = ['setup', 'parts', 'layout', 'preview'];
+  var ALL_STEPS = ['setup', 'parts', 'layout', 'preview'];
+  // The step sequence is mode-dependent: tubing has no Layout step (a tube's two faces
+  // aren't laid out on a sheet).
+  function steps() {
+    return state.mode === 'tubing' ? ['setup', 'parts', 'preview'] : ALL_STEPS;
+  }
 
   var state = {
     source: CFG.source,
@@ -20,6 +25,10 @@
     tool_diameter: parseFloat(CFG.defaultTool) || 0.157,
     thickness: 0.25,
     tab_spacing: 6.0,
+    // Tubing-only settings.
+    tubeHeight: 1.0,
+    squareEnd: false,
+    cutToLength: false,
     // The machine envelope is a read-only constraint; the parts' combined bounding box
     // is the stock (G54 origin = its lower-left).
     machine: { width: CFG.bed.width || 24, height: CFG.bed.height || 24, name: CFG.machineName || 'Machine' },
@@ -215,23 +224,34 @@
   function updateSummary() {
     var box = $('#wiz-summary');
     if (!box) return;
-    var idx = STEPS.indexOf(state.step);
-    if (idx < STEPS.indexOf('parts')) { box.hidden = true; return; }
+    var list = steps();
+    var idx = list.indexOf(state.step);
+    if (idx < list.indexOf('parts')) { box.hidden = true; return; }
     box.hidden = false;
 
     var chips = [];
-    var msel = $('#f-material');
-    chips.push(msel && msel.options[msel.selectedIndex] ? msel.options[msel.selectedIndex].text : state.material);
-    chips.push(state.mode === '2.5d' ? '2.5D · thickness from CAD' : (state.thickness + '" thick'));
-    chips.push('⌀ ' + (+state.tool_diameter).toFixed(3) + '" tool');
-    if (idx >= STEPS.indexOf('layout')) {
-      chips.push(state.parts.length + ' part' + (state.parts.length === 1 ? '' : 's'));
+    if (state.mode === 'tubing') {
+      chips.push('Aluminum Tube');
+      chips.push(state.thickness + '" wall');
+      chips.push('tube ' + (+state.tubeHeight).toFixed(3) + '" tall');
+    } else {
+      var msel = $('#f-material');
+      chips.push(msel && msel.options[msel.selectedIndex] ? msel.options[msel.selectedIndex].text : state.material);
+      chips.push(state.mode === '2.5d' ? '2.5D · thickness from CAD' : (state.thickness + '" thick'));
     }
-    if (idx >= STEPS.indexOf('preview')) {
-      var st = state.lastResponse && state.lastResponse.stock;
-      var w = st ? st.width : null, h = st ? st.height : null;
-      if (w == null) { var bb = combinedBBox(); if (bb) { w = bb.w; h = bb.h; } }
-      if (w != null) chips.push('stock ' + (+w).toFixed(2) + ' x ' + (+h).toFixed(2) + '"');
+    chips.push('⌀ ' + (+state.tool_diameter).toFixed(3) + '" tool');
+    if (state.mode === 'tubing') {
+      chips.push(state.parts.length + ' face' + (state.parts.length === 1 ? '' : 's'));
+    } else {
+      if (idx >= list.indexOf('layout')) {
+        chips.push(state.parts.length + ' part' + (state.parts.length === 1 ? '' : 's'));
+      }
+      if (idx >= list.indexOf('preview')) {
+        var st = state.lastResponse && state.lastResponse.stock;
+        var w = st ? st.width : null, h = st ? st.height : null;
+        if (w == null) { var bb = combinedBBox(); if (bb) { w = bb.w; h = bb.h; } }
+        if (w != null) chips.push('stock ' + (+w).toFixed(2) + ' x ' + (+h).toFixed(2) + '"');
+      }
     }
 
     box.innerHTML = '';
@@ -244,15 +264,28 @@
   }
 
   /* ------------------------------------------------------------ step nav */
+  // Number and show only the steps in the current (mode-dependent) sequence. Numbers
+  // reflect sequence position, so they don't renumber as you advance or complete steps.
+  function renderStepbar() {
+    var list = steps();
+    $all('#stepbar li').forEach(function (li) {
+      var i = list.indexOf(li.getAttribute('data-step'));
+      if (i < 0) { li.hidden = true; }
+      else { li.hidden = false; li.setAttribute('data-num', i + 1); }
+    });
+  }
+
   function gotoStep(name) {
     state.step = name;
+    renderStepbar();
     $all('.step').forEach(function (s) { s.hidden = s.getAttribute('data-step') !== name; });
+    var order = steps();
     $all('#stepbar li').forEach(function (li) {
       var s = li.getAttribute('data-step');
       li.classList.toggle('active', s === name);
-      li.classList.toggle('done', STEPS.indexOf(s) < STEPS.indexOf(name));
+      li.classList.toggle('done', order.indexOf(s) >= 0 && order.indexOf(s) < order.indexOf(name));
     });
-    var idx = STEPS.indexOf(name);
+    var idx = order.indexOf(name);
     $('#btn-back').disabled = idx === 0;
     var nextBtn = $('#btn-next');
     var isPreview = name === 'preview';
@@ -297,10 +330,11 @@
   // Jump to a step via the stepbar. Backward is always allowed; forward must clear the
   // same gates as pressing Next through each intervening step.
   function navigateTo(name) {
-    var target = STEPS.indexOf(name), cur = STEPS.indexOf(state.step);
+    var order = steps();
+    var target = order.indexOf(name), cur = order.indexOf(state.step);
     if (target < 0 || target === cur) return;
     if (target > cur) {
-      for (var i = cur; i < target; i++) { if (!canLeave(STEPS[i])) return; }
+      for (var i = cur; i < target; i++) { if (!canLeave(order[i])) return; }
     }
     gotoStep(name);
   }
@@ -313,23 +347,47 @@
     $all('input[name="mode"]').forEach(function (r) {
       r.addEventListener('change', function () {
         state.mode = this.value;
-        var is25 = state.mode === '2.5d';
-        $('#thickness-field').style.display = is25 ? 'none' : '';
-        $('#thickness-derived').style.display = is25 ? '' : 'none';
-        updatePartsModeNote();
+        applyModeUI();
         dbg('mode', state.mode);
       });
     });
 
     $('#f-tool').addEventListener('input', function () { state.tool_diameter = parseFloat(this.value) || state.tool_diameter; });
-    $('#f-material').addEventListener('change', function () { state.material = this.value; });
+    $('#f-material').addEventListener('change', function () { if (state.mode !== 'tubing') state.material = this.value; });
     $('#f-thickness').addEventListener('input', function () { state.thickness = parseFloat(this.value) || state.thickness; });
+    $('#f-tube-height').addEventListener('input', function () { state.tubeHeight = parseFloat(this.value) || state.tubeHeight; });
+    $('#f-square-end').addEventListener('change', function () { state.squareEnd = this.checked; });
+    $('#f-cut-to-length').addEventListener('change', function () { state.cutToLength = this.checked; });
+    applyModeUI();
+  }
+
+  // Reshape the Setup form for the selected mode. Tubing forces the aluminum-tube
+  // material (hiding the selector), relabels thickness as wall thickness, and reveals
+  // the tube-only fields; 2.5D hides thickness (derived from CAD).
+  function applyModeUI() {
+    var is25 = state.mode === '2.5d';
+    var isTube = state.mode === 'tubing';
+    $('#thickness-field').style.display = is25 ? 'none' : '';
+    $('#thickness-derived').style.display = is25 ? '' : 'none';
+    var tl = $('#thickness-label'); if (tl) tl.textContent = isTube ? 'Tube wall thickness (in)' : 'Material thickness (in)';
+    var mf = $('#material-field'); if (mf) mf.style.display = isTube ? 'none' : '';
+    if (isTube) {
+      state.material = 'aluminum_tube';
+    } else {
+      var msel = $('#f-material'); if (msel) state.material = msel.value;
+    }
+    var tf = $('#tube-fields'); if (tf) tf.hidden = !isTube;
+    renderStepbar();
+    updatePartsModeNote();
   }
 
   function updatePartsModeNote() {
     var note = $('#parts-mode-note');
+    if (!note) return;
     if (state.mode === '2.5d') {
       note.textContent = '2.5D mode: one part per job (thickness comes from the CAD layers).';
+    } else if (state.mode === 'tubing') {
+      note.textContent = 'Tubing: add 1 face (mirrored onto the opposite side) or 2 faces (a distinct pattern per side).';
     } else {
       note.textContent = 'Add as many parts as fit on the sheet.';
     }
@@ -365,6 +423,10 @@
   function addPartFromOutline(data, file) {
     if (state.mode === '2.5d' && state.parts.length >= 1) {
       alert('2.5D mode allows only one part. Remove the current part first, or switch to 2D mode.');
+      return;
+    }
+    if (state.mode === 'tubing' && state.parts.length >= 2) {
+      alert('Tubing allows at most two faces (one per side). Remove a face first.');
       return;
     }
     var p = {
@@ -690,8 +752,43 @@
     $('#preview-errors').textContent = '';
     $('#gen-status').textContent = 'Generating…';
 
-    if (state.mode === '2.5d') { generateSingle(); }
+    if (state.mode === 'tubing') { generateTube(); }
+    else if (state.mode === '2.5d') { generateSingle(); }
     else { generateJob(); }
+  }
+
+  // Shared POST /process handler for the single-file paths (2.5D and tubing).
+  function submitToProcess(fd, label) {
+    dbg(label + ':req');
+    return fetch('/process', { method: 'POST', body: fd })
+      .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j }; }); })
+      .then(function (res) {
+        if (!res.ok || res.j.error) { $('#preview-errors').textContent = res.j.details || res.j.error || 'Generation failed'; $('#gen-status').textContent = ''; return; }
+        dbg(label + ':ok', { time: res.j.cycle_time });
+        state.lastResponse = res.j;
+        showResult(res.j);
+      })
+      .catch(function (e) { $('#preview-errors').textContent = 'Request failed: ' + e; $('#gen-status').textContent = ''; });
+  }
+
+  function generateTube() {
+    var p = state.parts[0];
+    if (!p) { $('#preview-errors').textContent = 'Add a tube face first.'; $('#gen-status').textContent = ''; return Promise.resolve(); }
+    var fd = new FormData();
+    fd.append('file', p.file, p.name + '.dxf');
+    // A second face (optional) machines a distinct pattern on the opposite side; with
+    // only one face, the server mirrors it onto the other side.
+    if (state.parts[1]) fd.append('file_face2', state.parts[1].file, state.parts[1].name + '.dxf');
+    fd.append('material', 'aluminum_tube');
+    fd.append('tool_diameter', state.tool_diameter);
+    fd.append('thickness', state.thickness);       // tube wall thickness
+    fd.append('rotation', 0);                       // no layout step in tubing mode
+    fd.append('tube_height', state.tubeHeight);
+    fd.append('square_end', state.squareEnd ? '1' : '0');
+    fd.append('cut_to_length', state.cutToLength ? '1' : '0');
+    fd.append('timestamp', timestamp());
+    fd.append('suggested_filename', p.name);
+    return submitToProcess(fd, 'tube');
   }
 
   function generateJob() {
@@ -742,16 +839,7 @@
     fd.append('tab_spacing', state.tab_spacing);
     fd.append('timestamp', timestamp());
     fd.append('suggested_filename', p.name);
-    dbg('process:req', p.name);
-    return fetch('/process', { method: 'POST', body: fd })
-      .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j }; }); })
-      .then(function (res) {
-        if (!res.ok || res.j.error) { $('#preview-errors').textContent = res.j.details || res.j.error || 'Generation failed'; $('#gen-status').textContent = ''; return; }
-        dbg('process:ok', { time: res.j.cycle_time });
-        state.lastResponse = res.j;
-        showResult(res.j);
-      })
-      .catch(function (e) { $('#preview-errors').textContent = 'Request failed: ' + e; $('#gen-status').textContent = ''; });
+    return submitToProcess(fd, 'process');
   }
 
   function showGenErrors(j) {
@@ -767,7 +855,9 @@
     $('#gen-status').textContent = '';
     $('#preview-result').hidden = false;
     var t = resp.cycle_time ? ('Estimated cycle time: ' + resp.cycle_time) : '';
-    var n = resp.parts ? (resp.parts.length + ' part(s)') : '1 part';
+    var n;
+    if (state.mode === 'tubing') { n = state.parts.length + ' face' + (state.parts.length === 1 ? '' : 's'); }
+    else { n = resp.parts ? (resp.parts.length + ' part(s)') : '1 part'; }
     $('#preview-stats').textContent = [n, t].filter(Boolean).join(' · ');
     $('#btn-do').disabled = false;   // gcode ready — enable the save/download action
     show3DPreview(resp);
@@ -789,12 +879,22 @@
         resetButton: $('#reset-view'), emptyState: $('#viewer-empty'),
       });
     }
-    var bb = combinedBBox();
-    var W = (resp.stock && resp.stock.width) || (bb ? bb.w : state.machine.width);
-    var D = (resp.stock && resp.stock.height) || (bb ? bb.h : state.machine.height);
+    var W, D, stockH;
+    if (state.mode === 'tubing') {
+      // A tube face, not a sheet: use the first face's dimensions and the tube height.
+      var p0 = state.parts[0];
+      W = p0 ? p0.width : state.machine.width;
+      D = p0 ? p0.height : state.machine.height;
+      stockH = state.tubeHeight;
+    } else {
+      var bb = combinedBBox();
+      W = (resp.stock && resp.stock.width) || (bb ? bb.w : state.machine.width);
+      D = (resp.stock && resp.stock.height) || (bb ? bb.h : state.machine.height);
+      stockH = state.thickness;
+    }
     viewer.load(resp.gcode, {
       stockWidth: W, stockDepth: D,
-      stockHeight: state.thickness, toolDiameter: state.tool_diameter,
+      stockHeight: stockH, toolDiameter: state.tool_diameter,
     });
     dbg('preview', { w: W, d: D });
   }
@@ -905,14 +1005,16 @@
   /* ----------------------------------------------------------------- init */
   function bindNav() {
     $('#btn-next').addEventListener('click', function () {
-      var idx = STEPS.indexOf(state.step);
-      if (idx < STEPS.length - 1 && canLeave(state.step)) {
-        gotoStep(STEPS[idx + 1]);
+      var order = steps();
+      var idx = order.indexOf(state.step);
+      if (idx < order.length - 1 && canLeave(state.step)) {
+        gotoStep(order[idx + 1]);
       }
     });
     $('#btn-back').addEventListener('click', function () {
-      var idx = STEPS.indexOf(state.step);
-      if (idx > 0) gotoStep(STEPS[idx - 1]);
+      var order = steps();
+      var idx = order.indexOf(state.step);
+      if (idx > 0) gotoStep(order[idx - 1]);
     });
 
     // Clickable stepper pills (delegated), keyboard-activatable.

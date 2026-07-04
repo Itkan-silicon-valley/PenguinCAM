@@ -72,12 +72,11 @@ html, body {
   user-select: none;
   transition: background 0.12s, color 0.12s;
 }
-/* Static positional numbers — never renumber regardless of done/active state. */
-#stepbar li::before { opacity: 0.65; }
-#stepbar li:nth-child(1)::before { content: "1. "; }
-#stepbar li:nth-child(2)::before { content: "2. "; }
-#stepbar li:nth-child(3)::before { content: "3. "; }
-#stepbar li:nth-child(4)::before { content: "4. "; }
+/* Numbers come from data-num, assigned by JS to the visible steps (the step list is
+   mode-dependent — tubing mode has no Layout step). They reflect position in the
+   sequence, not done/active state, so they never renumber as you advance. */
+#stepbar li::before { content: attr(data-num) ". "; opacity: 0.65; }
+#stepbar li[hidden] { display: none; }
 #stepbar li:hover { background: #2c3644; color: var(--ink); }
 #stepbar li:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 #stepbar li.done { color: var(--ok); }

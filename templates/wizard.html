@@ -27,10 +27,10 @@
                 {% endif %}
             </div>
             <ol id="stepbar" aria-label="Steps">
-                <li data-step="setup" class="active" role="button" tabindex="0">Setup</li>
-                <li data-step="parts" role="button" tabindex="0">Parts</li>
-                <li data-step="layout" role="button" tabindex="0">Layout</li>
-                <li data-step="preview" role="button" tabindex="0">Preview</li>
+                <li data-step="setup" data-num="1" class="active" role="button" tabindex="0">Setup</li>
+                <li data-step="parts" data-num="2" role="button" tabindex="0">Parts</li>
+                <li data-step="layout" data-num="3" role="button" tabindex="0">Layout</li>
+                <li data-step="preview" data-num="4" role="button" tabindex="0">Preview</li>
             </ol>
         </header>
 
@@ -57,6 +57,7 @@
                     <legend>Mode</legend>
                     <label class="radio"><input type="radio" name="mode" value="2d" checked> 2D — flat plate (multi-part)</label>
                     <label class="radio"><input type="radio" name="mode" value="2.5d"> 2.5D — derive thickness from CAD (single part)</label>
+                    <label class="radio"><input type="radio" name="mode" value="tubing"> Tubing — machine both faces of a tube</label>
                 </fieldset>
 
                 <label class="field">
@@ -64,7 +65,7 @@
                     <input type="number" id="f-tool" step="0.001" min="0.01" value="{{ default_tool_diameter }}">
                 </label>
 
-                <label class="field">
+                <label class="field" id="material-field">
                     <span>Material</span>
                     <select id="f-material">
                         {% for mid, m in materials.items() if mid != 'aluminum_tube' %}
@@ -74,12 +75,28 @@
                 </label>
 
                 <label class="field" id="thickness-field">
-                    <span>Material thickness (in)</span>
+                    <span id="thickness-label">Material thickness (in)</span>
                     <input type="number" id="f-thickness" step="0.001" min="0.01" value="0.25">
                 </label>
                 <p class="hint" id="thickness-derived" style="display:none">
                     Thickness is derived from the CAD part in 2.5D mode.
                 </p>
+
+                <!-- Tubing-only settings (shown when mode = tubing). -->
+                <div id="tube-fields" hidden>
+                    <label class="field">
+                        <span>Tube height (in)</span>
+                        <input type="number" id="f-tube-height" step="0.001" min="0.01" value="1.0">
+                    </label>
+                    <label class="field inline">
+                        <input type="checkbox" id="f-square-end">
+                        <span>Square the tube end before machining</span>
+                    </label>
+                    <label class="field inline">
+                        <input type="checkbox" id="f-cut-to-length">
+                        <span>Machine the far end to length</span>
+                    </label>
+                </div>
             </section>
 
             <!-- ===== PARTS ===== -->

@@ -570,6 +570,45 @@ def onshape_panel():
     """Canonical wizard panel route."""
     return _serve_onshape_panel()
 
+def _detect_tube_dims(dxf_path, rotation):
+    """Detect a tube face's width x length from a DXF's geometry bounds.
+
+    Returns (tube_width, tube_length) in inches, or (None, None) if bounds could
+    not be read. Rotation of 90/270 swaps width and length to match how the part
+    is placed in the jig.
+    """
+    try:
+        doc = ezdxf.readfile(dxf_path)
+        msp = doc.modelspace()
+        all_x, all_y = [], []
+        for entity in msp:
+            if entity.dxftype() == 'CIRCLE':
+                center = entity.dxf.center
+                radius = entity.dxf.radius
+                all_x.extend([center.x - radius, center.x + radius])
+                all_y.extend([center.y - radius, center.y + radius])
+            elif entity.dxftype() in ['LWPOLYLINE', 'POLYLINE']:
+                points = list(entity.get_points())
+                if points:
+                    all_x.extend([p[0] for p in points])
+                    all_y.extend([p[1] for p in points])
+            elif entity.dxftype() == 'LINE':
+                all_x.extend([entity.dxf.start.x, entity.dxf.end.x])
+                all_y.extend([entity.dxf.start.y, entity.dxf.end.y])
+
+        if not (all_x and all_y):
+            return None, None
+        dxf_width = max(all_x) - min(all_x)
+        dxf_height = max(all_y) - min(all_y)
+        # Account for rotation: swap dimensions if rotated 90 or 270 degrees.
+        if rotation in [90, 270]:
+            return dxf_height, dxf_width
+        return dxf_width, dxf_height
+    except Exception as e:
+        log(f"⚠️  Could not extract tube dimensions from DXF: {e}")
+        return None, None
+
+
 @app.route('/process', methods=['POST'])
 @limiter.limit("10 per minute")  # Strict limit - CPU intensive operation
 def process_file():
@@ -629,44 +668,9 @@ def process_file():
         tube_width = None
         tube_length = None
         if is_aluminum_tube:
-            try:
-                doc = ezdxf.readfile(input_path)
-                msp = doc.modelspace()
-
-                # Collect all geometry bounds
-                all_x = []
-                all_y = []
-
-                for entity in msp:
-                    if entity.dxftype() == 'CIRCLE':
-                        center = entity.dxf.center
-                        radius = entity.dxf.radius
-                        all_x.extend([center.x - radius, center.x + radius])
-                        all_y.extend([center.y - radius, center.y + radius])
-                    elif entity.dxftype() in ['LWPOLYLINE', 'POLYLINE']:
-                        points = list(entity.get_points())
-                        if points:
-                            all_x.extend([p[0] for p in points])
-                            all_y.extend([p[1] for p in points])
-                    elif entity.dxftype() == 'LINE':
-                        all_x.extend([entity.dxf.start.x, entity.dxf.end.x])
-                        all_y.extend([entity.dxf.start.y, entity.dxf.end.y])
-
-                if all_x and all_y:
-                    dxf_width = max(all_x) - min(all_x)
-                    dxf_height = max(all_y) - min(all_y)
-
-                    # Account for rotation: swap dimensions if rotated 90° or 270°
-                    if rotation in [90, 270]:
-                        tube_width = dxf_height
-                        tube_length = dxf_width
-                        log(f"📏 Detected tube dimensions (after {rotation}° rotation): {tube_width:.3f}\" x {tube_length:.3f}\"")
-                    else:
-                        tube_width = dxf_width
-                        tube_length = dxf_height
-                        log(f"📏 Detected tube dimensions: {tube_width:.3f}\" x {tube_length:.3f}\"")
-            except Exception as e:
-                log(f"⚠️  Could not extract tube dimensions from DXF: {e}")
+            tube_width, tube_length = _detect_tube_dims(input_path, rotation)
+            if tube_width is not None:
+                log(f"📏 Detected tube dimensions (after {rotation}° rotation): {tube_width:.3f}\" x {tube_length:.3f}\"")
 
         # Generate suggested filename base (without extension or timestamp)
         if suggested_filename:
@@ -691,30 +695,45 @@ def process_file():
         # Call post-processor API based on mode
         try:
             if is_aluminum_tube:
-                # Tube mode - use tube-pattern API
-                pp = FRCPostProcessor(
-                    material_thickness=thickness,
-                    tool_diameter=tool_diameter,
-                    units='inch',
-                    config=team_config
-                )
-
-                # Store tube height for Z-offset calculations
-                pp.tube_height = tube_height
-
-                # Apply material preset (for specific machine if selected)
-                pp.apply_material_preset(material, machine_id)
-
-                # Add user name if authenticated
+                # Tube mode - use tube-pattern API. Each face is prepared identically;
+                # face 2 (if provided) carries a distinct pattern for the opposite side.
                 user_name = session.get('user_name')
-                if user_name:
-                    pp.user_name = user_name
 
-                # Load and process DXF
-                pp.load_dxf(input_path)
-                pp.transform_coordinates('bottom-left', rotation)  # Tube jig is always bottom-left
-                pp.identify_perimeter_and_pockets()  # Must come BEFORE classify_holes to remove perimeter circles
-                pp.classify_holes()
+                def _prepare_tube_face(dxf_path):
+                    face_pp = FRCPostProcessor(
+                        material_thickness=thickness,
+                        tool_diameter=tool_diameter,
+                        units='inch',
+                        config=team_config
+                    )
+                    face_pp.tube_height = tube_height  # Store for Z-offset calculations
+                    face_pp.apply_material_preset(material, machine_id)
+                    if user_name:
+                        face_pp.user_name = user_name
+                    face_pp.load_dxf(dxf_path)
+                    face_pp.transform_coordinates('bottom-left', rotation)  # Tube jig is always bottom-left
+                    face_pp.identify_perimeter_and_pockets()  # Must come BEFORE classify_holes to remove perimeter circles
+                    face_pp.classify_holes()
+                    return face_pp
+
+                pp = _prepare_tube_face(input_path)
+
+                # Optional distinct second face. When absent, face 1 is mirrored onto the
+                # opposite side (one-face mode).
+                second_face_pp = None
+                face2 = request.files.get('file_face2')
+                if face2 is not None and face2.filename:
+                    if not face2.filename.lower().endswith('.dxf'):
+                        return jsonify({'error': 'Second face must be a DXF file'}), 400
+                    face2_path = os.path.join(UPLOAD_FOLDER, 'input_face2.dxf')
+                    face2.save(face2_path)
+                    second_face_pp = _prepare_tube_face(face2_path)
+                    # Both faces are opposite walls of the same tube, so their widths
+                    # should match; warn (don't fail) if they differ noticeably.
+                    f2_width, _ = _detect_tube_dims(face2_path, rotation)
+                    if tube_width and f2_width and abs(f2_width - tube_width) > 0.05:
+                        log(f"⚠️  Tube face widths differ: face1={tube_width:.3f}\" face2={f2_width:.3f}\" "
+                            f"(using face1 width for both)")
 
                 # Generate G-code using API
                 result = pp.generate_tube_pattern_gcode(
@@ -724,7 +743,8 @@ def process_file():
                     tube_width=tube_width,
                     tube_length=tube_length,
                     suggested_filename=base_name,
-                    timestamp=timestamp_str
+                    timestamp=timestamp_str,
+                    second_face_pp=second_face_pp
                 )
             else:
                 # Standard mode - use standard API

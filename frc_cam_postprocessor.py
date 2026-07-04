@@ -4437,16 +4437,23 @@ class FRCPostProcessor:
     def generate_tube_pattern_gcode(self, tube_height: float,
                                    square_end: bool, cut_to_length: bool,
                                    tube_width: float = None, tube_length: float = None,
-                                   suggested_filename: str = None, timestamp: str = None) -> PostProcessorResult:
+                                   suggested_filename: str = None, timestamp: str = None,
+                                   second_face_pp: 'FRCPostProcessor' = None) -> PostProcessorResult:
         """
-        Generate G-code for machining DXF pattern on both faces of a tube.
+        Generate G-code for machining DXF pattern(s) on both faces of a tube.
 
         The tube sits in a jig with the end facing the spindle. This method:
         1. Optionally squares the tube end (if square_end=True)
-        2. Machines the DXF pattern on the first face
+        2. Machines the first face's DXF pattern
         3. Pauses (M0) for the operator to flip the tube 180° around Y-axis
-        4. Machines the DXF pattern on the second face (Y-mirrored)
+        4. Machines the second face (X-mirrored to account for the physical flip)
         5. Optionally machines tube to length (if cut_to_length=True - stub)
+
+        The second face's pattern is either:
+        - the same pattern as face 1 mirrored onto the opposite side (one-face mode,
+          second_face_pp is None), or
+        - a distinct pattern (two-face mode) when second_face_pp is provided — its
+          geometry is X-mirrored the same way to land correctly on the flipped tube.
 
         The jig uses G55 work coordinate system with:
         - Origin at bottom-left corner of tube face
@@ -4461,19 +4468,26 @@ class FRCPostProcessor:
             tube_width: Width of tube face (X dimension) in inches (optional, calculated from DXF if not provided)
             tube_length: Length of tube face (Y dimension) in inches (optional, for future use)
             suggested_filename: Optional filename (without timestamp, will be added)
+            second_face_pp: Optional processor already loaded with a distinct second-face
+                pattern. When None, face 2 = face 1 mirrored (one-face mode).
 
         Returns:
             PostProcessorResult with gcode string and stats
         """
-        # Check for validation errors first
-        if self.errors:
-            print(f"\n❌ Cannot generate G-code: {len(self.errors)} validation error(s) found")
-            for error in self.errors:
+        # Check for validation errors first (both faces, in two-face mode).
+        combined_errors = list(self.errors)
+        if second_face_pp is not None:
+            combined_errors.extend(second_face_pp.errors)
+        if combined_errors:
+            print(f"\n❌ Cannot generate G-code: {len(combined_errors)} validation error(s) found")
+            for error in combined_errors:
                 print(f"   - {error}")
             return PostProcessorResult(
                 success=False,
-                errors=self.errors.copy()
+                errors=combined_errors
             )
+
+        two_face = second_face_pp is not None
 
         gcode = []
 
@@ -4491,6 +4505,10 @@ class FRCPostProcessor:
         gcode.append(f'( Tube height: {tube_height:.3f}" )')
         gcode.append(f'( Tool: {self.tool_diameter:.3f}" end mill )')
         gcode.append(f'( Material: {self.spindle_speed} RPM, {self.feed_rate:.1f} ipm )')
+        if two_face:
+            gcode.append('( Two-face mode: distinct pattern machined on each side )')
+        else:
+            gcode.append('( One-face mode: face 1 pattern mirrored onto opposite side )')
         gcode.append('( )')
         gcode.append('( SETUP INSTRUCTIONS: )')
         gcode.append('( 1. Mount tube in jig with end facing spindle )')
@@ -4610,9 +4628,15 @@ class FRCPostProcessor:
                 gcode.append(line)
             gcode.append('')
 
-        # Machine the pattern on this face (X-mirrored, Y offset for facing alignment)
-        gcode.append('( Machine pattern on second face - X-mirrored )')
-        gcode.append('( Pattern is X-mirrored [tube flipped end-for-end] so holes align opposite )')
+        # Machine the pattern on this face (X-mirrored, Y offset for facing alignment).
+        # In two-face mode the second face has its own distinct pattern; otherwise it is
+        # face 1's pattern mirrored onto the opposite side.
+        if two_face:
+            gcode.append('( Machine second face pattern - X-mirrored )')
+            gcode.append('( Distinct second-face pattern, X-mirrored [tube flipped end-for-end] )')
+        else:
+            gcode.append('( Machine pattern on second face - X-mirrored )')
+            gcode.append('( Pattern is X-mirrored [tube flipped end-for-end] so holes align opposite )')
         z_offset = tube_height - self.material_thickness
         gcode.append(f'( Z offset: +{z_offset:.3f}" [tube_height - wall_thickness] )')
         # Y offset: 0 for Phase 2 - work zero is re-established after flip, face is at Y=0"
@@ -4620,8 +4644,10 @@ class FRCPostProcessor:
         gcode.append(f'( Y offset: {y_offset_phase2:.4f}" [face at Y=0, no offset needed] )')
         gcode.append('')
 
-        # Mirror X coordinates around tube centerline (tube flipped end-for-end)
-        mirrored_toolpath = self._generate_toolpath_gcode_mirrored_x(
+        # Mirror X coordinates around tube centerline (tube flipped end-for-end). The
+        # geometry source is the second face's processor in two-face mode, else self.
+        face2_source = second_face_pp if two_face else self
+        mirrored_toolpath = face2_source._generate_toolpath_gcode_mirrored_x(
             z_offset=z_offset, tube_width=tube_width, y_offset=y_offset_phase2
         )
         gcode.extend(mirrored_toolpath)
@@ -4646,9 +4672,17 @@ class FRCPostProcessor:
         # Estimate cycle time
         time_estimate = self._estimate_cycle_time(gcode)
 
-        # Collect stats
-        num_holes = len(self.holes) if hasattr(self, 'holes') else 0
-        num_pockets = len(self.pockets) if hasattr(self, 'pockets') else 0
+        # Collect stats. In one-face mode both sides share face 1's counts; in two-face
+        # mode each side has its own, so sum them for the total.
+        face1_holes = len(self.holes) if hasattr(self, 'holes') else 0
+        face1_pockets = len(self.pockets) if hasattr(self, 'pockets') else 0
+        if two_face:
+            face2_holes = len(second_face_pp.holes) if hasattr(second_face_pp, 'holes') else 0
+            face2_pockets = len(second_face_pp.pockets) if hasattr(second_face_pp, 'pockets') else 0
+        else:
+            face2_holes, face2_pockets = face1_holes, face1_pockets
+        num_holes = face1_holes + face2_holes
+        num_pockets = face1_pockets + face2_pockets
 
         # Generate filename with timestamp
         base_name = suggested_filename if suggested_filename else "tube_pattern"
@@ -4657,6 +4691,9 @@ class FRCPostProcessor:
         filename = f"{base_name}_{timestamp_for_file}.nc"
 
         # Build operation notes based on configuration
+        phase2_note = ('Phase 2: Machine distinct pattern on opposite face'
+                       if two_face else
+                       'Phase 2: Machine pattern on opposite face (mirrored)')
         operation_notes = []
         if square_end:
             operation_notes.extend([
@@ -4665,13 +4702,13 @@ class FRCPostProcessor:
                 'Phase 0: Square opposite end',
                 'Phase 1: Machine pattern on first face',
                 'Flip tube 180° around Y-axis (M0)',
-                'Phase 2: Machine pattern on opposite face (mirrored)'
+                phase2_note
             ])
         else:
             operation_notes.extend([
                 'Phase 1: Machine pattern on first face',
                 'Flip tube 180° around Y-axis (M0)',
-                'Phase 2: Machine pattern on opposite face (mirrored)'
+                phase2_note
             ])
         if cut_to_length:
             operation_notes.append(f'Cut to length: Y={tube_length}" (each phase)')
@@ -4691,8 +4728,9 @@ class FRCPostProcessor:
                 'cut_to_length': cut_to_length,
                 'num_holes': num_holes,
                 'num_pockets': num_pockets,
-                'num_holes_per_face': num_holes,
-                'num_pockets_per_face': num_pockets,
+                'num_holes_per_face': face1_holes,
+                'num_pockets_per_face': face1_pockets,
+                'two_face': two_face,
                 'has_perimeter': False,
                 'total_lines': len(gcode),
                 'cycle_time_seconds': time_estimate['total'],
