@@ -27,6 +27,7 @@ from urllib.parse import urlencode
 import ezdxf
 import logging
 import metrics
+import feeds_speeds
 
 # Configure logging for Vercel
 logging.basicConfig(
@@ -1622,6 +1623,42 @@ def onshape_status():
 def docs_redirect():
     """Redirect /docs to the static documentation"""
     return redirect('/static/docs/index.html')
+
+@app.route('/docs/feeds-speeds')
+def feeds_speeds_page():
+    """Serve the standalone feeds & speeds calculator page."""
+    return redirect('/static/docs/feeds-speeds.html')
+
+@app.route('/api/feeds-speeds/presets')
+def feeds_speeds_presets():
+    """Expose the model's machine/material/tool presets for the calculator UI."""
+    return jsonify({
+        'machines': feeds_speeds.MACHINES,
+        'materials': feeds_speeds.MATERIALS,
+        'tools': feeds_speeds.TOOL_PRESETS,
+        'reference_tool': feeds_speeds.REFERENCE_TOOL,
+    })
+
+@app.route('/api/feeds-speeds', methods=['POST'])
+@limiter.limit("120 per minute")
+def api_feeds_speeds():
+    """Compute derived feeds & speeds from machine + material + tool inputs.
+
+    Body: {machine, material, tool: {diameter, flutes}, operation}. The machine and
+    material may each be a preset key or an inline dict of overrides (see
+    feeds_speeds._resolve), so the public calculator works without PenguinCAM presets.
+    """
+    data = request.get_json(silent=True) or {}
+    try:
+        result = feeds_speeds.calculate_feeds(
+            data.get('machine', 'omio_x8'),
+            data.get('material', 'plywood'),
+            data.get('tool') or feeds_speeds.TOOL_PRESETS['4mm_1f'],
+            operation=data.get('operation', 'profile'),
+        )
+    except (ValueError, TypeError, KeyError) as exc:
+        return jsonify({'error': str(exc)}), 400
+    return jsonify(result)
 
 @app.route('/set-machine', methods=['POST'])
 @limiter.limit("30 per minute")

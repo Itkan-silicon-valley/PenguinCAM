@@ -1,0 +1,180 @@
+/* Feeds & Speeds calculator - layout on top of docs style.css */
+
+.disclaimer {
+    border-left: 3px solid var(--primary);
+}
+
+.fs-grid {
+    display: grid;
+    grid-template-columns: minmax(240px, 1fr) minmax(240px, 1.1fr) minmax(260px, 1.3fr);
+    gap: 1.5rem;
+    margin: 2rem 0;
+    align-items: start;
+}
+
+@media (max-width: 1100px) {
+    .fs-grid { grid-template-columns: 1fr; }
+}
+
+.fs-col {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 1.25rem;
+}
+
+.fs-col h2 {
+    margin-top: 0;
+    font-size: 1.15rem;
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 0.5rem;
+}
+
+/* --- Inputs --- */
+.fs-inputs fieldset {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 0.75rem 1rem 1rem;
+    margin-bottom: 1rem;
+}
+
+.fs-inputs legend {
+    font-size: 0.8rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--primary);
+    padding: 0 0.4rem;
+}
+
+.fs-inputs label {
+    display: block;
+    font-size: 0.85rem;
+    color: var(--text-dim);
+    margin-bottom: 0.6rem;
+}
+
+.fs-inputs input,
+.fs-inputs select {
+    display: block;
+    width: 100%;
+    margin-top: 0.2rem;
+    padding: 0.4rem 0.5rem;
+    background: var(--bg-light);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font-size: 0.95rem;
+}
+
+.fs-inputs input:focus,
+.fs-inputs select:focus {
+    outline: none;
+    border-color: var(--primary);
+}
+
+/* --- Results --- */
+.result-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0.75rem;
+}
+
+.result-card {
+    background: var(--bg-light);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 0.75rem;
+    display: flex;
+    flex-direction: column;
+}
+
+.result-card.primary {
+    border-color: var(--primary);
+    background: rgba(253, 181, 21, 0.08);
+}
+
+.result-label {
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-dim);
+}
+
+.result-value {
+    font-size: 1.6rem;
+    font-weight: 700;
+    color: var(--text);
+    line-height: 1.2;
+}
+
+.result-unit {
+    font-size: 0.75rem;
+    color: var(--text-dim);
+}
+
+.warnings {
+    margin-top: 1rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+}
+
+.warning {
+    background: rgba(239, 68, 68, 0.12);
+    border-left: 3px solid #ef4444;
+    border-radius: 4px;
+    padding: 0.5rem 0.75rem;
+    font-size: 0.85rem;
+    color: var(--text);
+}
+
+.copy-buttons {
+    margin-top: 1.25rem;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+}
+
+.copy-buttons button {
+    background: var(--surface-hover);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.45rem 0.8rem;
+    font-size: 0.85rem;
+    cursor: pointer;
+}
+
+.copy-buttons button:hover {
+    border-color: var(--primary);
+    color: var(--primary);
+}
+
+.copy-buttons button.copied {
+    border-color: var(--primary);
+    background: rgba(253, 181, 21, 0.15);
+}
+
+/* --- Explanation --- */
+.explanation {
+    color: var(--text);
+    font-size: 0.95rem;
+}
+
+.fs-explain h3 {
+    font-size: 0.95rem;
+    margin: 1.25rem 0 0.5rem;
+    color: var(--text-dim);
+}
+
+.formulas {
+    background: var(--bg-light);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 0.75rem;
+    font-family: "SFMono-Regular", Menlo, Consolas, monospace;
+    font-size: 0.8rem;
+    color: var(--text);
+    white-space: pre-wrap;
+    overflow-x: auto;
+}
