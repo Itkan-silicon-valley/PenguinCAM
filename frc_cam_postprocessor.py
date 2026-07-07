@@ -1439,43 +1439,21 @@ class FRCPostProcessor:
 
         # Sort pockets to minimize travel time
         self._sort_pockets()
-    
-    def generate_gcode(self, suggested_filename: str = None, timestamp: str = None,
-                       include_header_footer: bool = True) -> PostProcessorResult:
-        """
-        Generate complete G-code for standard plate operations (single or multi-layer)
+
+    def _generate_interior_gcode(self, emit_contour_pauses: bool) -> List[str]:
+        """Generate the interior-feature toolpath (holes + pockets) for this part.
+
+        This is phase "A" of a part: all circular holes (helical/peck + spiral clearing,
+        or contouring for large through-holes) followed by all pockets (fully cleared or
+        contoured). Returns only the toolpath lines - no header/footer/perimeter.
 
         Args:
-            suggested_filename: Optional filename (without timestamp, will be added)
-            include_header_footer: when False, return only the feature toolpath body
-                (no header/footer). Used by assemble_job_gcode to stitch one part of a
-                multi-part job under a single shared header/footer. Defaults to True
-                (normal single-part output, unchanged).
-
-        Returns:
-            PostProcessorResult with gcode string and stats
+            emit_contour_pauses: when True, emit the standalone "PAUSE FOR FIXTURING"
+                sequence before contoured holes/pockets (single-part behavior, gated by
+                pause_before_perimeter). The multi-part job assembler passes False because
+                it emits a single shared pause between all interiors and all perimeters.
         """
-        # Check for validation errors first
-        if self.errors:
-            print(f"\n❌ Cannot generate G-code: {len(self.errors)} validation error(s) found")
-            for error in self.errors:
-                print(f"   - {error}")
-            return PostProcessorResult(
-                success=False,
-                errors=self.errors.copy()
-            )
-
-        # Multi-layer processing
-        if self.layer_data:
-            return self._generate_multilayer_gcode(suggested_filename, timestamp)
-
-        # Use provided timestamp (from client's timezone) or generate one
-        if not timestamp:
-            timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-        # Generate header (skipped for job-body mode; assemble_job_gcode adds one shared header)
-        gcode = self._generate_gcode_header(timestamp, is_multilayer=False) if include_header_footer else []
-        warnings = []
+        gcode = []
 
         # Holes (all circular features - helical entry + spiral clearing, or contouring for large holes)
         if self.holes:
@@ -1527,7 +1505,7 @@ class FRCPostProcessor:
             if contoured_holes:
                 # Optional pause before contoured holes for teams using screw fixturing
                 # Same logic as perimeter/pockets - any operation with tabs needs secure fixturing
-                if self.pause_before_perimeter:
+                if emit_contour_pauses:
                     gcode.extend(self._generate_pause_and_park_gcode(
                         'PAUSE FOR FIXTURING',
                         [
@@ -1555,7 +1533,7 @@ class FRCPostProcessor:
                     gcode.append(f"(Hole {i} - {diameter:.3f}\" dia, {area:.3f} sq in - CONTOUR ONLY)")
                     gcode.extend(self._generate_pocket_contour_gcode(circle_points))
                     gcode.append("")
-        
+
         # Pockets
         if self.pockets:
             gcode.append("(===== POCKETS =====)")
@@ -1601,7 +1579,7 @@ class FRCPostProcessor:
             if contoured_pockets:
                 # Optional pause before pocket contours for teams using screw fixturing
                 # Same logic as perimeter - any operation with tabs needs secure fixturing
-                if self.pause_before_perimeter:
+                if emit_contour_pauses:
                     gcode.extend(self._generate_pause_and_park_gcode(
                         'PAUSE FOR FIXTURING',
                         [
@@ -1617,7 +1595,52 @@ class FRCPostProcessor:
                     gcode.append(f"(Pocket {i} - {area:.3f} sq in - CONTOUR ONLY)")
                     gcode.extend(self._generate_pocket_contour_gcode(pocket))
                     gcode.append("")
-        
+
+        return gcode
+
+    def generate_gcode(self, suggested_filename: str = None, timestamp: str = None,
+                       include_header_footer: bool = True) -> PostProcessorResult:
+        """
+        Generate complete G-code for standard plate operations (single or multi-layer)
+
+        Args:
+            suggested_filename: Optional filename (without timestamp, will be added)
+            include_header_footer: when False, return only the feature toolpath body
+                (no header/footer). Defaults to True (normal single-part output).
+                (Multi-part jobs no longer use this - they call generate_part_phases and
+                assemble_job_gcode collates the phases across parts.)
+
+        Returns:
+            PostProcessorResult with gcode string and stats
+        """
+        # Check for validation errors first
+        if self.errors:
+            print(f"\n❌ Cannot generate G-code: {len(self.errors)} validation error(s) found")
+            for error in self.errors:
+                print(f"   - {error}")
+            return PostProcessorResult(
+                success=False,
+                errors=self.errors.copy()
+            )
+
+        # Multi-layer processing
+        if self.layer_data:
+            return self._generate_multilayer_gcode(suggested_filename, timestamp)
+
+        # Use provided timestamp (from client's timezone) or generate one
+        if not timestamp:
+            timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        # Generate header (skipped for job-body mode; assemble_job_gcode adds one shared header)
+        gcode = self._generate_gcode_header(timestamp, is_multilayer=False) if include_header_footer else []
+        warnings = []
+
+        # Interior features (holes + pockets). Extracted to a shared helper so the
+        # multi-part job assembler can collate interiors across parts. In single-part
+        # output the contoured-feature fixturing pauses still fire when
+        # pause_before_perimeter is set (unchanged behavior).
+        gcode.extend(self._generate_interior_gcode(emit_contour_pauses=self.pause_before_perimeter))
+
         # Perimeter (with optional pause for screw fixturing)
         if self.perimeter:
             # Optional pause before perimeter for teams using screw fixturing
@@ -1686,6 +1709,55 @@ class FRCPostProcessor:
                 'dwell_time': self._format_time(time_estimate['dwell'])
             }
         )
+
+    def generate_part_phases(self) -> dict:
+        """Produce this part's toolpath split into the three job phases.
+
+        Used by the multi-part job assembler (assemble_job_gcode) so it can collate
+        phases across all parts: all interiors, then one shared refixturing pause, then
+        all perimeters, then all tab removals. For a single-part job this reproduces the
+        normal single-part order.
+
+        No per-feature fixturing pauses are emitted here - the job assembler emits a
+        single shared pause between the interior and perimeter phases. Assumes a
+        single-layer part (multi-part jobs are 2D standard mode; 2.5D is single-part).
+
+        Returns a dict:
+            {'interior': [str], 'perimeter': [str], 'tab_removal': [str], 'errors': [str]}
+        Coordinates are already in absolute job space (transform_coordinates applied the
+        placement offset), so phases from different parts can be freely interleaved.
+        """
+        # Fail fast on pre-existing validation errors (same guard as generate_gcode).
+        if self.errors:
+            return {'interior': [], 'perimeter': [], 'tab_removal': [],
+                    'errors': self.errors.copy()}
+
+        if self.layer_data:
+            return {'interior': [], 'perimeter': [], 'tab_removal': [],
+                    'errors': ['Multi-part jobs support single-layer (2D) parts only; '
+                               'this part has multiple depth layers (2.5D).']}
+
+        self._deferred_tab_positions = []
+
+        # Phase A: interiors (holes + pockets), no per-feature pauses.
+        interior = self._generate_interior_gcode(emit_contour_pauses=False)
+
+        # Phase C: perimeter cut, deferring tab removal to phase D.
+        perimeter = []
+        if self.perimeter:
+            if self.tabs_enabled:
+                perimeter.append("(===== PERIMETER WITH TABS =====)")
+            else:
+                perimeter.append("(===== PERIMETER (NO TABS) =====)")
+            perimeter.extend(self._generate_perimeter_gcode(self.perimeter, defer_tab_removal=True))
+
+        # Phase D: tab removal, using the positions captured during the perimeter pass.
+        tab_removal = []
+        if self.config.remove_tabs and self._deferred_tab_positions:
+            tab_removal = self._generate_tab_removal_gcode(self._deferred_tab_positions)
+
+        return {'interior': interior, 'perimeter': perimeter,
+                'tab_removal': tab_removal, 'errors': list(self.errors)}
 
     def _generate_gcode_header(self, timestamp: str = None, is_multilayer: bool = False,
                                is_job: bool = False, job_part_count: int = None) -> List[str]:
@@ -1767,8 +1839,9 @@ class FRCPostProcessor:
             # Operations
             if is_job:
                 # Per-part operations are listed in each PART section; the job-level
-                # header just records that this is a multi-part program.
-                operations_str = f"Multi-part job ({job_part_count} parts)"
+                # header just records that this is a multi-part program. No nested parens
+                # in the comment (CNC controllers choke on them).
+                operations_str = f"Multi-part job - {job_part_count} parts"
             else:
                 operations = []
                 if self.holes:
@@ -3478,7 +3551,8 @@ class FRCPostProcessor:
                                contour_type: str,
                                offset_direction: int,
                                clockwise: bool,
-                               remove_tabs_at_end: bool) -> List[str]:
+                               remove_tabs_at_end: bool,
+                               defer_tab_removal: bool = False) -> List[str]:
         """Generate G-code for contour cutting (perimeter or pocket contour) with tabs
 
         Shared logic for both perimeter and pocket contour operations.
@@ -3491,6 +3565,10 @@ class FRCPostProcessor:
             offset_direction: +1 for outward offset (perimeter), -1 for inward (pocket)
             clockwise: True for CW (perimeter), False for CCW (pocket interior)
             remove_tabs_at_end: Whether to generate tab removal pass (False for pockets)
+            defer_tab_removal: when True, don't emit the tab-removal pass inline; instead
+                stash the computed tab positions on self._deferred_tab_positions so the
+                caller (multi-part job assembler) can emit all parts' tab removals as a
+                final collated phase. Used only for the perimeter in job mode.
         """
         gcode = []
 
@@ -3809,60 +3887,84 @@ class FRCPostProcessor:
             gcode.append(f"G0 Z{self.retract_height:.4f}  ; Retract")
 
         # ===== TAB REMOVAL PASS =====
-        # Remove tabs in star pattern to gradually release the part (only if tabs were created and removal is enabled)
-        # Note: Pocket contours NEVER remove tabs (center material remains for manual removal)
-        if all_tab_positions and remove_tabs_at_end:
-            gcode.append("")
-            gcode.append("(===== TAB REMOVAL PASS =====)")
-            gcode.append(f"(Removing {len(all_tab_positions)} tabs in star pattern)")
-
-            # all_tab_positions is already sorted by tab_idx (see above).
-
-            # Generate star pattern order: alternates between first and second half
-            # For 4 tabs (0,1,2,3): order is 0,2,1,3
-            # For 6 tabs (0,1,2,3,4,5): order is 0,3,1,4,2,5
-            num_tabs = len(all_tab_positions)
-            star_order = []
-            half = num_tabs // 2
-            for i in range(half):
-                star_order.append(i)
-                if i + half < num_tabs:
-                    star_order.append(i + half)
-            # Handle odd number of tabs
-            if num_tabs % 2 == 1:
-                star_order.append(num_tabs - 1)
-
-            gcode.append(f"(Star pattern order: {', '.join(str(i+1) for i in star_order)})")
-            gcode.append("")
-
-            # Remove each tab in star order
-            for removal_num, tab_order_idx in enumerate(star_order, 1):
-                tab_idx, waypoints = all_tab_positions[tab_order_idx]
-                start_x, start_y = waypoints[0]
-
-                gcode.append(f"(Tab {tab_idx + 1} removal - #{removal_num} in sequence)")
-
-                # Rapid to retract height (like moving between holes)
-                gcode.append(f"G0 Z{self.retract_height:.4f}")
-
-                # Rapid to position just before the tab (in the kerf)
-                gcode.append(f"G0 X{start_x:.4f} Y{start_y:.4f}  ; Move to tab start (in kerf)")
-
-                # Plunge to cut depth in empty kerf at approach rate (faster - no material)
-                gcode.append(f"G1 Z{self.cut_depth:.4f} F{self.approach_rate}  ; Plunge in kerf")
-
-                # Cut through each piece of the tab in contour order so curved
-                # tabs (spanning multiple short chord segments) get fully removed.
-                for ex, ey in waypoints[1:]:
-                    gcode.append(f"G1 X{ex:.4f} Y{ey:.4f} F{self.feed_rate}  ; Cut through tab")
-
-                # Retract after each tab
-                gcode.append(f"G0 Z{self.retract_height:.4f}  ; Retract")
-                gcode.append("")
+        # Remove tabs in star pattern to gradually release the part (only if tabs were created
+        # and removal is enabled). Note: Pocket contours NEVER remove tabs (center material
+        # remains for manual removal).
+        # In job mode (defer_tab_removal) the caller collates all parts' tab removals into a
+        # final phase, so we stash the positions instead of emitting the pass inline here.
+        if defer_tab_removal:
+            self._deferred_tab_positions = all_tab_positions
+        elif all_tab_positions and remove_tabs_at_end:
+            gcode.extend(self._generate_tab_removal_gcode(all_tab_positions))
 
         return gcode
 
-    def _generate_perimeter_gcode(self, perimeter_points: List[Tuple[float, float]]) -> List[str]:
+    def _generate_tab_removal_gcode(self, all_tab_positions) -> List[str]:
+        """Generate the star-pattern tab-removal pass for a perimeter's tabs.
+
+        Args:
+            all_tab_positions: list of (tab_idx, waypoints) sorted by tab_idx, as captured
+                on the final perimeter pass. waypoints[0] is the kerf entry point; the rest
+                are the cut-through points for that tab.
+
+        Returns the tab-removal toolpath lines (empty list if there are no tabs).
+        """
+        gcode = []
+        if not all_tab_positions:
+            return gcode
+
+        gcode.append("")
+        gcode.append("(===== TAB REMOVAL PASS =====)")
+        gcode.append(f"(Removing {len(all_tab_positions)} tabs in star pattern)")
+
+        # all_tab_positions is already sorted by tab_idx.
+
+        # Generate star pattern order: alternates between first and second half
+        # For 4 tabs (0,1,2,3): order is 0,2,1,3
+        # For 6 tabs (0,1,2,3,4,5): order is 0,3,1,4,2,5
+        num_tabs = len(all_tab_positions)
+        star_order = []
+        half = num_tabs // 2
+        for i in range(half):
+            star_order.append(i)
+            if i + half < num_tabs:
+                star_order.append(i + half)
+        # Handle odd number of tabs
+        if num_tabs % 2 == 1:
+            star_order.append(num_tabs - 1)
+
+        gcode.append(f"(Star pattern order: {', '.join(str(i+1) for i in star_order)})")
+        gcode.append("")
+
+        # Remove each tab in star order
+        for removal_num, tab_order_idx in enumerate(star_order, 1):
+            tab_idx, waypoints = all_tab_positions[tab_order_idx]
+            start_x, start_y = waypoints[0]
+
+            gcode.append(f"(Tab {tab_idx + 1} removal - #{removal_num} in sequence)")
+
+            # Rapid to retract height (like moving between holes)
+            gcode.append(f"G0 Z{self.retract_height:.4f}")
+
+            # Rapid to position just before the tab (in the kerf)
+            gcode.append(f"G0 X{start_x:.4f} Y{start_y:.4f}  ; Move to tab start (in kerf)")
+
+            # Plunge to cut depth in empty kerf at approach rate (faster - no material)
+            gcode.append(f"G1 Z{self.cut_depth:.4f} F{self.approach_rate}  ; Plunge in kerf")
+
+            # Cut through each piece of the tab in contour order so curved
+            # tabs (spanning multiple short chord segments) get fully removed.
+            for ex, ey in waypoints[1:]:
+                gcode.append(f"G1 X{ex:.4f} Y{ey:.4f} F{self.feed_rate}  ; Cut through tab")
+
+            # Retract after each tab
+            gcode.append(f"G0 Z{self.retract_height:.4f}  ; Retract")
+            gcode.append("")
+
+        return gcode
+
+    def _generate_perimeter_gcode(self, perimeter_points: List[Tuple[float, float]],
+                                  defer_tab_removal: bool = False) -> List[str]:
         """Generate G-code for perimeter with tabs and tool compensation (offset outward)
 
         Wrapper function that calls _generate_contour_gcode with perimeter-specific parameters.
@@ -3874,7 +3976,8 @@ class FRCPostProcessor:
             contour_type="perimeter",
             offset_direction=+1,  # Outward offset
             clockwise=True,       # CW for climb milling on outside features
-            remove_tabs_at_end=self.config.remove_tabs  # Config-based tab removal
+            remove_tabs_at_end=self.config.remove_tabs,  # Config-based tab removal
+            defer_tab_removal=defer_tab_removal
         )
 
     def _generate_pocket_contour_gcode(self, pocket_points: List[Tuple[float, float]]) -> List[str]:
@@ -5228,16 +5331,24 @@ def validate_job_layout(parts, machine_x_max, machine_y_max, min_gap=0.0):
 
 
 def assemble_job_gcode(part_jobs, header_pp, timestamp=None, suggested_filename=None):
-    """Stitch per-part G-code bodies into one multi-part program.
+    """Stitch per-part G-code phases into one multi-part program, collated by phase.
+
+    Rather than running each part to completion before the next, the whole job is
+    ordered by phase across all parts: all interiors -> one shared refixturing pause
+    (if configured) -> all perimeters -> all tab removals. This makes the
+    "pause before perimeter" option sensible for a whole sheet (fixture every part
+    once, between interiors and perimeters). A single-part job reduces to the normal
+    single-part order.
 
     Args:
         part_jobs: ordered list of dicts:
             {'name': str, 'place_x': float, 'place_y': float, 'rotation': float,
-             'body': [str]}  -- 'body' is the toolpath-only output from
-             generate_gcode(include_header_footer=False).gcode.split('\\n').
+             'interior': [str], 'perimeter': [str], 'tab_removal': [str]}
+            -- the three phase line-lists from FRCPostProcessor.generate_part_phases().
         header_pp: an FRCPostProcessor carrying the shared job parameters (material,
-            tool, thickness, spindle, park Z). Used to build the single header/footer
-            and estimate total cycle time. (v1: one tool/material per job.)
+            tool, thickness, spindle, park Z, pause_before_perimeter). Used to build the
+            single header/footer, the shared pause, and estimate total cycle time.
+            (v1: one tool/material per job.)
         timestamp, suggested_filename: as in generate_gcode.
 
     Returns:
@@ -5248,17 +5359,51 @@ def assemble_job_gcode(part_jobs, header_pp, timestamp=None, suggested_filename=
 
     gcode = header_pp._generate_gcode_header(timestamp, is_job=True, job_part_count=len(part_jobs))
 
-    for i, pj in enumerate(part_jobs, 1):
+    def _part_label(i, pj):
         name = pj.get('name', f'part {i}')
         px = pj.get('place_x', 0.0)
         py = pj.get('place_y', 0.0)
         rot = pj.get('rotation', 0)
         # Sanitize the name for a comment (no nested parens, ASCII only).
         safe_name = str(name).replace('(', '[').replace(')', ']')
+        return f"(--- PART {i}: {safe_name} @ X{px:.4f} Y{py:.4f} ROT {rot:g} deg ---)"
+
+    def _emit_phase(section_title, phase_key):
+        """Append every part's body for one phase, each under its part label + safe Z.
+        Returns True if any part contributed lines to this phase."""
+        bodies = [(i, pj) for i, pj in enumerate(part_jobs, 1) if pj.get(phase_key)]
+        if not bodies:
+            return False
         gcode.append("")
-        gcode.append(f"(===== PART {i}: {safe_name} @ X{px:.4f} Y{py:.4f} ROT {rot:g} deg =====)")
-        gcode.append(f"G53 G0 Z{header_pp.machine_park_z:.4f}  ; Safe Z between parts")
-        gcode.extend(pj.get('body', []))
+        gcode.append(f"(===== {section_title} =====)")
+        for i, pj in bodies:
+            gcode.append("")
+            gcode.append(_part_label(i, pj))
+            gcode.append(f"G53 G0 Z{header_pp.machine_park_z:.4f}  ; Safe Z between parts")
+            gcode.extend(pj[phase_key])
+        return True
+
+    # Phase A: all parts' interior features.
+    _emit_phase("PHASE: INTERIOR FEATURES", 'interior')
+
+    # Phase B: one shared refixturing pause between interiors and perimeters, if
+    # configured. Only meaningful when there are perimeters still to cut.
+    has_perimeters = any(pj.get('perimeter') for pj in part_jobs)
+    if header_pp.pause_before_perimeter and has_perimeters:
+        gcode.extend(header_pp._generate_pause_and_park_gcode(
+            'PAUSE FOR FIXTURING',
+            [
+                "All parts' internal features complete",
+                'Install screws through holes into sacrifice board on ALL parts',
+                'Fixture every part securely before perimeter cutting'
+            ]
+        ))
+
+    # Phase C: all parts' perimeters (tab removal deferred to phase D).
+    _emit_phase("PHASE: PERIMETERS", 'perimeter')
+
+    # Phase D: all parts' tab removals (only parts whose perimeter left tabs).
+    _emit_phase("PHASE: TAB REMOVAL", 'tab_removal')
 
     gcode.extend(header_pp._generate_gcode_footer())
 

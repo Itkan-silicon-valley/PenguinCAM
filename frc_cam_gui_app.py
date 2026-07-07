@@ -991,15 +991,16 @@ def process_job():
         part_jobs = []
         response_parts = []
         for i, item in enumerate(prepared):
-            body_res = item['pp'].generate_gcode(include_header_footer=False, timestamp=timestamp_str)
-            if not body_res.success:
-                for e in body_res.errors:
+            phases = item['pp'].generate_part_phases()
+            if phases['errors']:
+                for e in phases['errors']:
                     gen_errors.append({'part_index': i, 'name': item['name'], 'error': e})
                 continue
             part_jobs.append({
                 'name': item['name'], 'place_x': item['place_x'],
                 'place_y': item['place_y'], 'rotation': item['rotation'],
-                'body': body_res.gcode.split('\n'),
+                'interior': phases['interior'], 'perimeter': phases['perimeter'],
+                'tab_removal': phases['tab_removal'],
             })
             minx, miny, maxx, maxy = item['bbox']
             response_parts.append({

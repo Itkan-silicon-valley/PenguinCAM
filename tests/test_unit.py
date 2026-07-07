@@ -2146,15 +2146,20 @@ class TestMultiPartEngine(unittest.TestCase):
         self.assertNotIn('(PenguinCAM', body, "Body should not contain the header title")
         self.assertNotIn('G54', body, "Body should not set the work coordinate system")
 
+    def _phase_job(self, pp, name, place_x, place_y):
+        """Build a part_job dict from a part's phase split (new assemble contract)."""
+        phases = pp.generate_part_phases()
+        return {'name': name, 'place_x': place_x, 'place_y': place_y, 'rotation': 0,
+                'interior': phases['interior'], 'perimeter': phases['perimeter'],
+                'tab_removal': phases['tab_removal']}
+
     def test_assemble_emits_single_header_and_footer(self):
         import re
         p1 = self._square_part(size=4.0, offset=(0.0, 0.0))
         p2 = self._square_part(size=4.0, offset=(6.0, 0.0))
         part_jobs = [
-            {'name': 'A', 'place_x': 0.0, 'place_y': 0.0, 'rotation': 0,
-             'body': p1.generate_gcode(include_header_footer=False).gcode.split('\n')},
-            {'name': 'B', 'place_x': 6.0, 'place_y': 0.0, 'rotation': 0,
-             'body': p2.generate_gcode(include_header_footer=False).gcode.split('\n')},
+            self._phase_job(p1, 'A', 0.0, 0.0),
+            self._phase_job(p2, 'B', 6.0, 0.0),
         ]
         result = assemble_job_gcode(part_jobs, header_pp=p1, timestamp='2026-06-30 12:00:00')
         self.assertTrue(result.success)
@@ -2183,19 +2188,19 @@ class TestMultiPartEngine(unittest.TestCase):
         p1 = self._square_part(size=4.0, offset=(0.0, 0.0))
         p2 = self._square_part(size=4.0, offset=(6.0, 0.0))
         part_jobs = [
-            {'name': 'A', 'place_x': 0.0, 'place_y': 0.0, 'rotation': 0,
-             'body': p1.generate_gcode(include_header_footer=False).gcode.split('\n')},
-            {'name': 'B', 'place_x': 6.0, 'place_y': 0.0, 'rotation': 0,
-             'body': p2.generate_gcode(include_header_footer=False).gcode.split('\n')},
+            self._phase_job(p1, 'A', 0.0, 0.0),
+            self._phase_job(p2, 'B', 6.0, 0.0),
         ]
         g = assemble_job_gcode(part_jobs, header_pp=p1, timestamp='2026-06-30 12:00:00').gcode
         lines = g.split('\n')
 
         def section_x(marker):
+            # Collect the X coords of cutting moves under one part's block, which runs
+            # from its "--- PART n ---" label to the next part label or phase/finish marker.
             start = next(i for i, l in enumerate(lines) if marker in l)
             end = len(lines)
             for j in range(start + 1, len(lines)):
-                if '===== PART' in lines[j] or '===== FINISH' in lines[j]:
+                if '--- PART' in lines[j] or 'PHASE:' in lines[j] or 'FINISH' in lines[j]:
                     end = j
                     break
             xs = []
@@ -2212,6 +2217,80 @@ class TestMultiPartEngine(unittest.TestCase):
         self.assertTrue(xs_a and xs_b)
         self.assertLess(max(xs_a), 5.0, "Part A should be near the origin")
         self.assertGreater(max(xs_b), 6.0, "Part B should be shifted right by its offset")
+
+    def _tabbed_part_with_hole(self, size, offset):
+        """A square part with tabs enabled and one small hole (an interior feature),
+        with the refixturing pause turned on - exercises all three job phases."""
+        pp = FRCPostProcessor(0.25, 0.157)
+        pp.apply_material_preset('plywood')
+        pp.tabs_enabled = True
+        pp.pause_before_perimeter = True
+        pp.circles = [{'center': (offset[0] + 1.0, offset[1] + 1.0), 'radius': 0.3, 'diameter': 0.6}]
+        pp.lines = []; pp.arcs = []; pp.splines = []
+        pp.polylines = [[(0.0, 0.0), (size, 0.0), (size, size), (0.0, size), (0.0, 0.0)]]
+        pp.transform_coordinates('bottom-left', 0, placement_offset=offset, enforce_bounds=False)
+        pp.identify_perimeter_and_pockets()
+        pp.classify_holes()
+        return pp
+
+    def test_job_collates_phases_across_parts(self):
+        """A multi-part job runs all interiors, then ONE shared refixturing pause, then
+        all perimeters, then all tab removals - not each part start-to-finish."""
+        p1 = self._tabbed_part_with_hole(4.0, (0.0, 0.0))
+        p2 = self._tabbed_part_with_hole(4.0, (6.0, 0.0))
+        part_jobs = [self._phase_job(p1, 'A', 0.0, 0.0), self._phase_job(p2, 'B', 6.0, 0.0)]
+        # _phase_job zeroes rotation; that's fine for ordering checks.
+        g = assemble_job_gcode(part_jobs, header_pp=p1, timestamp='2026-06-30 12:00:00').gcode
+        lines = g.split('\n')
+
+        def idx(marker):
+            return next(i for i, l in enumerate(lines) if marker in l)
+
+        # Collated phase order.
+        i_interior = idx('PHASE: INTERIOR FEATURES')
+        i_pause = idx('PAUSE FOR FIXTURING')
+        i_perim = idx('PHASE: PERIMETERS')
+        i_tabs = idx('PHASE: TAB REMOVAL')
+        self.assertLess(i_interior, i_pause)
+        self.assertLess(i_pause, i_perim)
+        self.assertLess(i_perim, i_tabs)
+
+        # Exactly one shared pause for the whole sheet.
+        self.assertEqual(sum(1 for l in lines if l.strip().startswith('M0')), 1)
+
+        # Both parts appear in each of the three phases (interiors before the pause).
+        interior_block = "\n".join(lines[i_interior:i_pause])
+        self.assertIn('PART 1: A', interior_block)
+        self.assertIn('PART 2: B', interior_block)
+        perim_block = "\n".join(lines[i_perim:i_tabs])
+        self.assertIn('PART 1: A', perim_block)
+        self.assertIn('PART 2: B', perim_block)
+        tab_block = "\n".join(lines[i_tabs:])
+        self.assertEqual(tab_block.count('TAB REMOVAL PASS'), 2)
+
+    def test_job_no_pause_when_not_configured(self):
+        """With pause_before_perimeter off, no refixturing pause is emitted even though
+        the phases are still collated."""
+        p1 = self._tabbed_part_with_hole(4.0, (0.0, 0.0))
+        p2 = self._tabbed_part_with_hole(4.0, (6.0, 0.0))
+        p1.pause_before_perimeter = False
+        p2.pause_before_perimeter = False
+        part_jobs = [self._phase_job(p1, 'A', 0.0, 0.0), self._phase_job(p2, 'B', 6.0, 0.0)]
+        g = assemble_job_gcode(part_jobs, header_pp=p1, timestamp='2026-06-30 12:00:00').gcode
+        self.assertNotIn('PAUSE FOR FIXTURING', g)
+        self.assertEqual(sum(1 for l in g.split('\n') if l.strip().startswith('M0')), 0)
+
+    def test_single_part_job_reduces_to_normal_order(self):
+        """A one-part job keeps the interiors -> pause -> perimeter -> tab-removal order."""
+        p1 = self._tabbed_part_with_hole(4.0, (0.0, 0.0))
+        g = assemble_job_gcode([self._phase_job(p1, 'A', 0.0, 0.0)],
+                               header_pp=p1, timestamp='2026-06-30 12:00:00').gcode
+        lines = g.split('\n')
+        order = [i for i, l in enumerate(lines)
+                 if any(m in l for m in ('PHASE: INTERIOR', 'PAUSE FOR FIXTURING',
+                                         'PHASE: PERIMETERS', 'PHASE: TAB REMOVAL'))]
+        self.assertEqual(order, sorted(order))
+        self.assertEqual(sum(1 for l in lines if l.strip().startswith('M0')), 1)
 
     def test_validate_detects_overlap(self):
         parts = [
