@@ -409,8 +409,28 @@ def _compute_dxf_outline(path):
               'cy': round(h['center'][1] - miny, 4),
               'r': round(h['diameter'] / 2.0, 4)}
              for h in (pp.holes or [])]
+    # For 2.5D parts the interesting features (pockets/rings/steps) live in the depth
+    # layers as HATCH-derived polygons, not as holes/circles — so the thumbnail would
+    # otherwise show just the bare perimeter. Surface each layer polygon's rings as
+    # `inner` outlines so the layout preview is recognizable. Dedupe by rounded bounds
+    # and drop rings that coincide with the perimeter (already drawn as `outline`).
+    inner = []
+    if pp.layer_data:
+        seen = set()
+        perim_key = (0.0, 0.0, round(width, 2), round(height, 2))
+        for info in pp.layer_data.values():
+            for poly in info.get('polygons', []):
+                for ring in [poly.exterior, *poly.interiors]:
+                    key = tuple(round(v, 2) for v in ring.bounds)
+                    if key in seen or key == perim_key:
+                        continue
+                    seen.add(key)
+                    inner.append([[round(x - minx, 4), round(y - miny, 4)]
+                                  for (x, y) in ring.coords])
+                    if len(inner) >= 50:  # guard against pathological part counts
+                        break
     return {'width': round(width, 4), 'height': round(height, 4),
-            'outline': outline, 'holes': holes}
+            'outline': outline, 'holes': holes, 'inner': inner}
 
 
 @app.route('/')

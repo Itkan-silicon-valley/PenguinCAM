@@ -32,7 +32,7 @@
     // The machine envelope is a read-only constraint; the parts' combined bounding box
     // is the stock (G54 origin = its lower-left).
     machine: { width: CFG.bed.width || 24, height: CFG.bed.height || 24, name: CFG.machineName || 'Machine' },
-    parts: [],            // {id,name,width,height,outline,holes,file,cx,cy,rotation,flipped}
+    parts: [],            // {id,name,width,height,outline,holes,inner,file,cx,cy,rotation,flipped}
     selectedIds: [],
     zoom: 1,
     saveAction: 'download',   // 'download' | 'drive' (final-step action)
@@ -108,7 +108,14 @@
       var c = rotatePoint(fx * h.cx, h.cy, part.rotation);
       return { cx: c[0] - minX, cy: c[1] - minY, r: h.r };
     });
-    return { pts: norm, holes: holes, w: maxX - minX, h: maxY - minY };
+    // Internal feature rings (2.5D pockets/steps) ride the same flip+rotate+normalize.
+    var inner = (part.inner || []).map(function (ring) {
+      return ring.map(function (pt) {
+        var c = rotatePoint(fx * pt[0], pt[1], part.rotation);
+        return [c[0] - minX, c[1] - minY];
+      });
+    });
+    return { pts: norm, holes: holes, inner: inner, w: maxX - minX, h: maxY - minY };
   }
 
   // Parts are stored by their center (cx, cy) so rotation happens in place. The
@@ -398,9 +405,11 @@
     var W = 44, H = 44, pad = 4;
     var scale = Math.min((W - 2 * pad) / (part.width || 1), (H - 2 * pad) / (part.height || 1));
     function map(x, y) { return [pad + x * scale, H - pad - y * scale]; }
-    var d = part.outline.map(function (pt, i) { var m = map(pt[0], pt[1]); return (i ? 'L' : 'M') + m[0].toFixed(1) + ' ' + m[1].toFixed(1); }).join(' ') + ' Z';
+    function ringPath(ring) { return ring.map(function (pt, i) { var m = map(pt[0], pt[1]); return (i ? 'L' : 'M') + m[0].toFixed(1) + ' ' + m[1].toFixed(1); }).join(' ') + ' Z'; }
+    var d = ringPath(part.outline);
     var holes = (part.holes || []).map(function (h) { var m = map(h.cx, h.cy); return '<circle cx="' + m[0].toFixed(1) + '" cy="' + m[1].toFixed(1) + '" r="' + Math.max(1, h.r * scale).toFixed(1) + '" fill="none" stroke="#9aa7b4"/>'; }).join('');
-    return '<svg width="' + W + '" height="' + H + '" viewBox="0 0 ' + W + ' ' + H + '"><path d="' + d + '" fill="none" stroke="#2f81f7" stroke-width="1.5"/>' + holes + '</svg>';
+    var inner = (part.inner || []).map(function (ring) { return '<path d="' + ringPath(ring) + '" fill="none" stroke="#9aa7b4" stroke-width="1"/>'; }).join('');
+    return '<svg width="' + W + '" height="' + H + '" viewBox="0 0 ' + W + ' ' + H + '"><path d="' + d + '" fill="none" stroke="#2f81f7" stroke-width="1.5"/>' + inner + holes + '</svg>';
   }
 
   function renderParts() {
@@ -437,7 +446,7 @@
       id: ++partSeq,
       name: data.name || ('part ' + (partSeq)),
       width: data.width, height: data.height,
-      outline: data.outline, holes: data.holes || [],
+      outline: data.outline, holes: data.holes || [], inner: data.inner || [],
       file: file,
       cx: 0, cy: 0, rotation: 0, flipped: false,
     };
@@ -614,6 +623,14 @@
       s.holes.forEach(function (h) {
         var hc = worldToCanvas(pl.x + h.cx, pl.y + h.cy);
         ctx.beginPath(); ctx.arc(hc[0], hc[1], Math.max(1, h.r * canvasState.scale), 0, 7); ctx.strokeStyle = col.muted; ctx.stroke();
+      });
+      (s.inner || []).forEach(function (ring) {
+        ctx.beginPath();
+        ring.forEach(function (pt, i) {
+          var rc = worldToCanvas(pl.x + pt[0], pl.y + pt[1]);
+          if (i) ctx.lineTo(rc[0], rc[1]); else ctx.moveTo(rc[0], rc[1]);
+        });
+        ctx.closePath(); ctx.strokeStyle = col.muted; ctx.lineWidth = 1; ctx.stroke();
       });
       var lc = worldToCanvas(pl.x, pl.y + pl.h);
       ctx.fillStyle = col.ink; ctx.font = '11px sans-serif';
