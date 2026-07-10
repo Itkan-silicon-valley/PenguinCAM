@@ -429,6 +429,10 @@
       alert('Tubing allows at most two faces (one per side). Remove a face first.');
       return;
     }
+    // In 2.5D the thickness is derived from the CAD layers server-side (the field
+    // is hidden in the UI). Adopt it so the summary/preview show the real value;
+    // the G-code path re-derives it from the DXF regardless.
+    if (state.mode === '2.5d' && data.thickness) state.thickness = data.thickness;
     var p = {
       id: ++partSeq,
       name: data.name || ('part ' + (partSeq)),
@@ -1067,6 +1071,9 @@
   function init() {
     if (DEBUG) { $('#debug-overlay').hidden = false; }
     window.PenguinCAM.debug = dbg; // let the Onshape adapter log into the debug overlay
+    // Expose the live mode so the Onshape panel adapter can request a 2.5D
+    // (multi-layer) export instead of a flat one when the user picked 2.5D.
+    window.PenguinCAM.getMode = function () { return state.mode; };
     bindSetup();
     bindParts();
     bindLayout();

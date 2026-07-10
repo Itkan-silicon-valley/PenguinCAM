@@ -23,7 +23,6 @@ import atexit
 import time
 import threading
 from datetime import datetime
-from urllib.parse import urlencode
 import ezdxf
 import logging
 import metrics
@@ -320,96 +319,6 @@ def get_onshape_client_or_401():
         }), 401
 
     return client, None, None
-
-def extract_onshape_params(params):
-    """Extract Onshape parameters from request params dict"""
-    return {
-        'document_id': params.get('documentId') or params.get('did'),
-        'workspace_id': params.get('workspaceId') or params.get('wid'),
-        'element_id': params.get('elementId') or params.get('eid'),
-        'face_id': params.get('faceId') or params.get('fid'),
-        'body_id': params.get('partId') or params.get('bodyId') or params.get('bid')
-    }
-
-def fetch_face_normal_and_body(client, document_id, workspace_id, element_id, face_id, body_id):
-    """
-    Fetch face normal and body information for a given face_id.
-
-    Returns:
-        tuple: (face_normal dict, auto_selected_body_id, part_name_from_body)
-    """
-    log(f"Face ID provided: {face_id}, fetching face normal...")
-
-    face_normal = None
-    auto_selected_body_id = None
-    part_name_from_body = None
-
-    try:
-        # Get all faces to find the normal for the selected face
-        faces_data = client.list_faces(document_id, workspace_id, element_id)
-
-        if faces_data and 'bodies' in faces_data:
-            # Debug: Log all face IDs to find mismatch
-            all_face_ids = []
-            for body in faces_data['bodies']:
-                for face in body.get('faces', []):
-                    all_face_ids.append(face.get('id'))
-            log(f"🔍 All face IDs in response ({len(all_face_ids)} total): {all_face_ids[:20]}{'...' if len(all_face_ids) > 20 else ''}")
-            log(f"🔍 Looking for face_id: {face_id}")
-
-            # Search through all bodies and faces to find the matching face_id
-            for body in faces_data['bodies']:
-                bid = body.get('id')
-                for face in body.get('faces', []):
-                    if face.get('id') == face_id:
-                        # Found the matching face! Extract its normal
-                        surface = face.get('surface', {})
-                        face_normal = surface.get('normal', {})
-                        part_name_from_body = body.get('properties', {}).get('name', 'Unnamed')
-
-                        # Set body_id if not already provided
-                        if not body_id:
-                            auto_selected_body_id = bid
-
-                        log(f"✅ Found face {face_id} in body {bid} ({part_name_from_body})")
-                        log(f"   Normal: ({face_normal.get('x', 0):.3f}, {face_normal.get('y', 0):.3f}, {face_normal.get('z', 0):.3f})")
-                        break
-                if face_normal:
-                    break
-
-        if not face_normal:
-            log(f"⚠️  Warning: Could not find normal for face {face_id}, using default view")
-
-    except Exception as e:
-        log(f"⚠️  Warning: Error fetching face normal: {e}")
-        log("   Continuing with default view matrix")
-
-    return face_normal, auto_selected_body_id, part_name_from_body
-
-def generate_onshape_filename(doc_name, part_name):
-    """
-    Generate a clean filename from Onshape document and part names.
-    Falls back to timestamp if names are unavailable or generic.
-    """
-    # Clean function for filename sanitization
-    def clean_name(name):
-        return re.sub(r'[^\w\s-]', '', name).strip().replace(' ', '_')[:50]
-
-    if doc_name and part_name:
-        # Best case: combine both
-        doc_clean = clean_name(doc_name)
-        part_clean = clean_name(part_name)
-        return f"{doc_clean}_{part_clean}"
-
-    elif part_name:
-        # Fallback: part name only
-        part_clean = clean_name(part_name)
-        if part_clean and part_clean != 'Unnamed_Part':
-            return part_clean
-
-    # Last resort: timestamp (server's local time)
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    return f"Onshape_Part_{timestamp}"
 
 # ============================================================================
 # Routes
@@ -1129,8 +1038,9 @@ def download_file(token):
 @limiter.limit("30 per minute")
 def debug_download_dxf():
     """
-    Debug endpoint: Download the multi-layer DXF file from the most recent Onshape import.
-    This allows manual testing of the postprocessor with the exact DXF that was generated.
+    Debug endpoint: Download the exact DXF from the most recent Onshape face export
+    (flat or 2.5D multi-layer). Lets you reproduce a part offline against the
+    postprocessor with the identical geometry the server generated.
     """
     try:
         # Get DXF token from session
@@ -1138,7 +1048,7 @@ def debug_download_dxf():
         if not dxf_token:
             return jsonify({
                 'error': 'No debug DXF available',
-                'message': 'Import a part from Onshape first. The DXF is only available for multi-layer (2.5D) imports.'
+                'message': 'Import a part from Onshape first.'
             }), 404
 
         # Look up file by token
@@ -1424,38 +1334,24 @@ def onshape_oauth_callback():
             session['user_name'] = user_name
             session['user_email'] = user_email
 
-        # Check if there's a pending import (came from Onshape extension)
-        pending_import = session.get('pending_onshape_import')
-
-        # Only load config during auth if NOT coming from Onshape extension
-        # (Extension flow will load config during export endpoint)
-        if not pending_import:
-            log("ℹ️  Direct authentication (not from Onshape) - loading config now")
-            config_yaml = client.fetch_config_file()
-            if config_yaml:
-                log(f"🔍 DEBUG: Raw YAML length: {len(config_yaml)} bytes")
-                log(f"🔍 DEBUG: First 500 chars of YAML: {config_yaml[:500]}")
-                team_config = TeamConfig.from_yaml(config_yaml)
-                log(f"✅ Team config loaded: {team_config.team_name} (#{team_config.team_number})")
-                log(f"🔍 DEBUG: team_config._data keys: {list(team_config._data.keys())}")
-                log(f"🔍 DEBUG: team_config._data has 'team' key? {'team' in team_config._data}")
-                if 'team' in team_config._data:
-                    log(f"🔍 DEBUG: team_config._data['team'] = {team_config._data['team']}")
-                session['team_config_data'] = team_config._data
-                session['team_config'] = team_config.to_dict()
-                session['team_number'] = team_config.team_number
-                session['team_config_url'] = getattr(client, 'last_config_url', None)
-                session['using_default_config'] = False
-            else:
-                log("⚠️  No team config found - using defaults")
-                team_config = TeamConfig()
-                session['team_config_data'] = {}
-                session['team_config'] = team_config.to_dict()
-                session['team_number'] = team_config.team_number
-                session.pop('team_config_url', None)
-                session['using_default_config'] = True
+        # Load the team's config file (lives in the user's own Onshape documents).
+        config_yaml = client.fetch_config_file()
+        if config_yaml:
+            team_config = TeamConfig.from_yaml(config_yaml)
+            log(f"✅ Team config loaded: {team_config.team_name} (#{team_config.team_number})")
+            session['team_config_data'] = team_config._data
+            session['team_config'] = team_config.to_dict()
+            session['team_number'] = team_config.team_number
+            session['team_config_url'] = getattr(client, 'last_config_url', None)
+            session['using_default_config'] = False
         else:
-            log("ℹ️  Authentication from Onshape extension - will load config during export")
+            log("⚠️  No team config found - using defaults")
+            team_config = TeamConfig()
+            session['team_config_data'] = {}
+            session['team_config'] = team_config.to_dict()
+            session['team_number'] = team_config.team_number
+            session.pop('team_config_url', None)
+            session['using_default_config'] = True
 
         log("="*60 + "\n")
 
@@ -1474,18 +1370,9 @@ def onshape_oauth_callback():
         # Popup mode (embedded panel connect): close the popup; the panel detects the
         # close and verifies auth.
         if session.pop('onshape_oauth_popup', None):
-            session.pop('pending_onshape_import', None)
             return redirect('/onshape/auth-complete')
 
-        # Get pending import (if any)
-        pending_import = session.pop('pending_onshape_import', None)
-
-        if pending_import:
-            # Redirect back to import with original parameters
-            params = urlencode({k: v for k, v in pending_import.items() if v})
-            return redirect(f'/onshape/import?{params}')
-
-        # Otherwise redirect to main page with success message
+        # Direct (non-popup) auth: back to the app.
         return redirect('/?onshape_connected=true')
         
     except Exception as e:
@@ -1512,12 +1399,73 @@ def onshape_authed():
     return jsonify({'authenticated': authed})
 
 
+def build_multilayer_dxf(client, did, wid, eid, face_id, body_id, face_normal,
+                         cached_faces_data=None):
+    """Build a single multi-layer (2.5D) DXF for the selected reference face.
+
+    Resolves the reference face's normal (if not already known) and origin, then
+    asks the Onshape client to bin all parallel faces by depth and merge them into
+    one depth-layered DXF. Returns (dxf_bytes, detected_thickness).
+
+    This is the sole home of the 2.5D DXF construction. The G-code path derives
+    the actual stock thickness from the DXF layers themselves (see the
+    postprocessor's load_dxf), so detected_thickness here is informational.
+    Raises RuntimeError with a user-facing message on failure.
+    """
+    faces_data = cached_faces_data or client.list_faces(did, wid, eid)
+    if not faces_data:
+        raise RuntimeError("Failed to retrieve face data from Onshape. Your "
+                           "authentication token may have expired. Please "
+                           "re-authenticate with Onshape.")
+
+    # Locate the selected reference face (for the normal fallback + origin).
+    reference_face = None
+    for body in faces_data.get('bodies', []):
+        if body_id and body.get('id') != body_id:
+            continue
+        for face in body.get('faces', []):
+            if face.get('id') == face_id:
+                reference_face = face
+                break
+        if reference_face:
+            break
+
+    if reference_face is None:
+        raise RuntimeError("Could not find the selected face for multi-layer "
+                           "export. Please select a flat top face.")
+
+    surface = reference_face.get('surface', {}) or {}
+    if not face_normal:
+        face_normal = surface.get('normal', {'x': 0, 'y': 0, 'z': 1})
+    reference_origin = surface.get('origin', {'x': 0, 'y': 0, 'z': 0})
+
+    result = client.export_multilayer_dxf(
+        did, wid, eid,
+        face_id, body_id, face_normal, reference_origin,
+        body_id=body_id, cached_faces_data=faces_data
+    )
+    # Backwards-compatible unpack if the client doesn't return thickness.
+    if isinstance(result, tuple):
+        dxf_bytes, detected_thickness = result
+    else:
+        dxf_bytes, detected_thickness = result, None
+
+    if not dxf_bytes:
+        raise RuntimeError("Onshape returned no multi-layer DXF for that face. "
+                           "Make sure the selected face is a flat top face of a "
+                           "2.5D part.")
+    return dxf_bytes, detected_thickness
+
+
 @app.route('/onshape/export-face', methods=['POST'])
 @limiter.limit("30 per minute")
 def onshape_export_face():
-    """Export a single selected Onshape face to a flat DXF and return its bytes
-    (base64) plus the outline/dims for the layout canvas. The browser holds the DXF
-    bytes and re-submits them at /process-job time (serverless-safe; no server cache)."""
+    """Export a selected Onshape face and return its DXF bytes (base64) plus the
+    outline/dims for the layout canvas. The browser holds the DXF bytes and
+    re-submits them at /process-job time (serverless-safe; no server cache).
+
+    In 2.5D mode (request field multilayer=true) this builds a depth-layered DXF
+    of all parallel faces; otherwise it exports a single flat face."""
     client, err_resp, err_code = get_onshape_client_or_401()
     if err_resp:
         return err_resp, err_code
@@ -1528,16 +1476,21 @@ def onshape_export_face():
     eid = data.get('elementId')
     fid = data.get('faceId')
     bid = data.get('partId') or data.get('bodyId')
+    multilayer = str(data.get('multilayer', '')).lower() in ('true', '1', 'yes')
     if not all([did, wid, eid, fid]):
         return jsonify({'error': 'Missing selection IDs (need document/workspace/element/face).'}), 400
 
-    log(f"[EXPORT] face did={str(did)[:8]} eid={str(eid)[:8]} fid={fid} bid={bid}")
+    log(f"[EXPORT] face did={str(did)[:8]} eid={str(eid)[:8]} fid={fid} bid={bid} "
+        f"mode={'2.5D' if multilayer else 'flat'}")
     path = None
+    keep_dxf = False  # set once the DXF is registered for debug download (see finally)
     try:
         # Resolve the selected face's normal (for correct flatten orientation) and the
-        # part name (for the parts list) in one bodydetails call.
+        # part name (for the parts list) in one bodydetails call. Reused below for the
+        # 2.5D depth-layer construction so we don't re-fetch faces.
         face_normal = None
         name = data.get('name')
+        faces = None
         try:
             faces = client.list_faces(did, wid, eid)
             for body in (faces or {}).get('bodies', []):
@@ -1550,7 +1503,13 @@ def onshape_export_face():
         except Exception:
             pass
 
-        dxf_bytes = client.export_face_to_dxf(did, wid, eid, fid, body_id=bid, face_normal=face_normal)
+        detected_thickness = None
+        if multilayer:
+            dxf_bytes, detected_thickness = build_multilayer_dxf(
+                client, did, wid, eid, fid, bid, face_normal, cached_faces_data=faces
+            )
+        else:
+            dxf_bytes = client.export_face_to_dxf(did, wid, eid, fid, body_id=bid, face_normal=face_normal)
         session_manager.update_session_tokens(client)
         if not dxf_bytes:
             return jsonify({'error': 'Onshape returned no DXF for that face.'}), 502
@@ -1567,14 +1526,42 @@ def onshape_export_face():
 
         geo['name'] = name or 'Onshape part'
         geo['success'] = True
+        geo['multilayer'] = multilayer
+        # Thickness is derived from the CAD layers server-side (2.5D only); pass it
+        # back so the wizard's summary/preview reflect the CAD-authoritative value.
+        if detected_thickness:
+            geo['thickness'] = detected_thickness
         geo['dxf'] = base64.b64encode(dxf_bytes).decode('ascii')
-        log(f"[EXPORT] ok name='{geo['name']}' {geo['width']}x{geo['height']}")
+
+        # Retain the exact DXF behind a session token so it can be re-downloaded
+        # for debugging via /debug/download-dxf. Invaluable for reproducing a bad
+        # part offline against the postprocessor. The token manager expires the
+        # file after ~1 hour; until then it owns the file (don't delete it below).
+        debug_filename = '{}{}.dxf'.format(geo['name'], '-2.5D' if multilayer else '')
+        session['debug_dxf_token'] = file_token_manager.register_file(path, debug_filename)
+        session['debug_dxf_filename'] = debug_filename
+        keep_dxf = True
+
+        metrics.log_event('onshape_import',
+                          team_number=session.get('team_number'),
+                          user_email=session.get('user_email'),
+                          metadata={'part_name': geo['name'], 'multilayer': multilayer})
+
+        detail = ' (2.5D, t={:.4f}")'.format(detected_thickness) if detected_thickness else ''
+        log(f"[EXPORT] ok name='{geo['name']}' {geo['width']}x{geo['height']}{detail}")
         return jsonify(geo)
+    except RuntimeError as e:
+        # Expected, user-facing failures from the 2.5D builder (bad face selection,
+        # expired auth, no parallel faces).
+        log(f"[EXPORT] multilayer failed: {e}")
+        return jsonify({'error': str(e)}), 502
     except Exception as e:
         log(traceback.format_exc())
         return jsonify({'error': f'Face export failed: {str(e)}'}), 500
     finally:
-        if path and os.path.exists(path):
+        # Remove the temp DXF unless it was registered for debug download, in which
+        # case the token manager owns its lifecycle.
+        if path and not keep_dxf and os.path.exists(path):
             os.remove(path)
 
 
@@ -1786,703 +1773,6 @@ def debug_onshape_faces():
             'success': False,
             'error': str(e),
             'traceback': traceback.format_exc()
-        }), 500
-
-@app.route('/onshape/import', methods=['GET', 'POST'])
-@limiter.limit("20 per minute")  # Moderate limit - authenticated via Onshape OAuth
-def onshape_import():
-    """
-    Import a DXF from Onshape
-    Accepts parameters from Onshape extension or direct URL
-    """
-    if not ONSHAPE_AVAILABLE:
-        return jsonify({'error': 'Onshape integration not available'}), 400
-
-    try:
-        log(f"\n{'='*70}")
-        log(f"ONSHAPE IMPORT REQUEST")
-        log(f"{'='*70}")
-        log(f"Request URL: {request.url}")
-
-        # Get parameters (either from query string or JSON body)
-        if request.method == 'POST':
-            raw_params = request.json or {}
-            log(f"Source: POST body (JSON)")
-        else:
-            raw_params = request.args.to_dict()
-            log(f"Source: Query string")
-
-        log(f"\n📝 RAW PARAMETERS RECEIVED:")
-        for key, value in sorted(raw_params.items()):
-            log(f"   {key}: {value!r}")
-
-        params = extract_onshape_params(raw_params)
-
-        log(f"\n🔧 EXTRACTED PARAMETERS:")
-        log(f"   document_id: {params['document_id']!r}")
-        log(f"   workspace_id: {params['workspace_id']!r}")
-        log(f"   element_id: {params['element_id']!r}")
-        log(f"   face_id: {params['face_id']!r}")
-        log(f"   body_id: {params['body_id']!r}")
-
-        document_id = params['document_id']
-        workspace_id = params['workspace_id']
-        element_id = params['element_id']
-        face_id = params['face_id']
-        body_id = params['body_id']  # Optional - for part selection
-
-        # Get Onshape server and user info that IS being sent
-        onshape_server = raw_params.get('server', 'https://cad.onshape.com')
-        onshape_userid = raw_params.get('userId')
-
-        log(f"\n🔍 PARAMETER ANALYSIS:")
-        if face_id:
-            log(f"   ✓ face_id provided: {face_id}")
-            if not face_id.startswith('J'):
-                log(f"   ⚠️  WARNING: face_id doesn't start with 'J' (unusual for Onshape IDs)")
-            if len(face_id) < 10:
-                log(f"   ⚠️  WARNING: face_id seems too short (Onshape IDs are usually longer)")
-        else:
-            log(f"   ℹ️  No face_id - will auto-select")
-
-        if body_id:
-            log(f"   ✓ body_id provided: {body_id}")
-        else:
-            log(f"   ℹ️  No body_id - will search all parts")
-
-        log(f"{'='*70}\n")
-        
-        # WORKAROUND: If params have placeholder strings, we can't proceed
-        if (document_id and ('${' in str(document_id) or document_id.startswith('$'))):
-            log("❌ Onshape variable substitution failed!")
-            log(f"Received literal: documentId={document_id}")
-
-            # Show helpful error page
-            return render_template('index.html',
-                                 error_message='Onshape integration error: Variable substitution not working. Please contact support or use manual DXF upload.',
-                                 debug_info={
-                                     'issue': 'Onshape extension not substituting variables',
-                                     'received_params': str(raw_params),
-                                     'workaround': 'Export DXF manually from Onshape and upload it here'
-                                 },
-                                 using_default_config=session.get('using_default_config', False),
-                                 detected_thickness=None), 400
-
-        if not all([document_id, workspace_id, element_id]):
-            return jsonify({
-                'error': 'Missing required parameters',
-                'required': ['documentId', 'workspaceId', 'elementId'],
-                'received': raw_params,
-                'help': 'Onshape variable substitution not working. Check extension configuration or use manual DXF upload.'
-            }), 400
-
-        # Get Onshape client for this user
-        user_id = get_current_user_id()
-        client = session_manager.get_client(user_id)
-
-        if not client:
-            # Store import parameters in session before redirecting to OAuth
-            session['pending_onshape_import'] = {
-                'documentId': document_id,
-                'workspaceId': workspace_id,
-                'elementId': element_id,
-                'faceId': face_id
-            }
-
-            # Redirect to Onshape OAuth
-            return redirect('/onshape/auth')
-
-        # Reload team config on every export (allows users to update config without re-authenticating)
-        log("\n" + "="*60)
-        log("🔄 Refreshing team config from Onshape...")
-        config_yaml = client.fetch_config_file(document_id=document_id)
-        if config_yaml:
-            log(f"🔍 DEBUG: Raw YAML length: {len(config_yaml)} bytes")
-            log(f"🔍 DEBUG: First 500 chars of YAML: {config_yaml[:500]}")
-            team_config = TeamConfig.from_yaml(config_yaml)
-            log(f"✅ Team config loaded: {team_config.team_name} (#{team_config.team_number})")
-            log(f"🔍 DEBUG: team_config._data keys: {list(team_config._data.keys())}")
-            log(f"🔍 DEBUG: team_config._data has 'team' key? {'team' in team_config._data}")
-            if 'team' in team_config._data:
-                log(f"🔍 DEBUG: team_config._data['team'] = {team_config._data['team']}")
-            session['team_config_data'] = team_config._data
-            session['team_config'] = team_config.to_dict()
-            session['team_number'] = team_config.team_number
-            session['team_config_url'] = getattr(client, 'last_config_url', None)
-            session['using_default_config'] = False
-        else:
-            log("⚠️  No team config found - using defaults")
-            team_config = TeamConfig()
-            session['team_config_data'] = {}
-            session['team_config'] = team_config.to_dict()
-            session['team_number'] = team_config.team_number
-            session.pop('team_config_url', None)
-            session['using_default_config'] = True
-        log("="*60 + "\n")
-
-        # Get document's owning company/classroom (Onshape Education context)
-        # This requires a document, so we fetch it here rather than during OAuth
-        doc_company = client.get_document_company(document_id)
-        if doc_company:
-            team_name = doc_company.get('name')
-            log(f"📚 Document company: {team_name}")
-            session['team_name'] = team_name
-
-        # If no face_id provided, auto-select the top face
-        part_name_from_body = None
-        auto_selected_body_id = None
-        face_normal = None  # Initialize face_normal for when face_id is provided
-        if not face_id:
-            log("No face ID provided, auto-selecting top face...")
-
-            try:
-                # First, try to list all faces for debugging
-                faces_data = client.list_faces(document_id, workspace_id, element_id)
-
-                if not faces_data:
-                    error_msg = "Failed to retrieve data from Onshape. Your authentication token may have expired. Please re-authenticate with Onshape."
-                    log(f"❌ {error_msg}")
-                    return render_template('index.html',
-                                         error_message=error_msg,
-                                         from_onshape=True,
-                                         using_default_config=session.get('using_default_config', False),
-                                         detected_thickness=None), 401
-
-                body_count = len(faces_data.get('bodies', []))
-                log(f"📊 Found {body_count} bodies/parts in document")
-
-                # If multiple parts and no bodyId specified, show part selection modal
-                if body_count > 1 and not body_id:
-                    log("🔍 Multiple parts detected, showing part selector...")
-
-                    # Get detailed info about each part (reuse cached faces_data)
-                    part_selection_data = []
-
-                    # Get body faces using cached data to avoid duplicate API call
-                    bodies_with_faces = client.get_body_faces(document_id, workspace_id, element_id, cached_faces_data=faces_data)
-
-                    if not bodies_with_faces:
-                        error_msg = "Failed to retrieve body/face data from Onshape. Your authentication may have expired."
-                        log(f"❌ {error_msg}")
-                        return render_template('index.html',
-                                             error_message=error_msg,
-                                             from_onshape=True,
-                                             using_default_config=session.get('using_default_config', False),
-                                             detected_thickness=None), 401
-
-                    # Find the largest part by top face area
-                    largest_body_id = None
-                    largest_area = 0
-
-                    for bid, body_data in bodies_with_faces.items():
-                        # Get all planar faces
-                        planar_faces = [f for f in body_data['faces'] if f['surfaceType'] == 'PLANE']
-
-                        if planar_faces:
-                            # Find largest planar face
-                            largest_face = max(planar_faces, key=lambda f: f.get('area', 0))
-                            face_area = largest_face.get('area', 0)
-
-                            if face_area > largest_area:
-                                largest_area = face_area
-                                largest_body_id = bid
-
-                        part_selection_data.append({
-                            'body_id': bid,
-                            'name': body_data['name'],
-                            'face_count': len(body_data['faces']),
-                            'is_largest': False  # Will set this after loop
-                        })
-
-                    # Mark the largest part
-                    for part in part_selection_data:
-                        if part['body_id'] == largest_body_id:
-                            part['is_largest'] = True
-                            break
-
-                    # Sort by size (largest first)
-                    part_selection_data.sort(key=lambda p: p['face_count'] * (1 if p['is_largest'] else 0), reverse=True)
-
-                    # Render template with part selection
-                    return render_template('index.html',
-                                         part_selection={
-                                             'parts': part_selection_data,
-                                             'document_id': document_id,
-                                             'workspace_id': workspace_id,
-                                             'element_id': element_id
-                                         },
-                                         from_onshape=True,
-                                         using_default_config=session.get('using_default_config', False),
-                                         detected_thickness=None)
-
-                # This now returns (face_id, body_id, part_name, normal)
-                # Pass body_id if user selected a specific part in Onshape, and cached data to avoid duplicate API call
-                face_id, auto_selected_body_id, part_name_from_body, face_normal = client.auto_select_top_face(document_id, workspace_id, element_id, body_id, faces_data)
-
-                if not face_id:
-                    # Provide helpful error with face list
-                    error_msg = 'No horizontal plane faces found. '
-                    if faces_data:
-                        face_count = len(faces_data.get('bodies', []))
-                        error_msg += f'Found {face_count} bodies total. '
-                    error_msg += 'Try selecting a face manually in Onshape.'
-
-                    # Render error page instead of JSON
-                    return render_template('index.html',
-                                         error_message=error_msg,
-                                         from_onshape=True,
-                                         debug_info={
-                                             'documentId': document_id,
-                                             'workspaceId': workspace_id,
-                                             'elementId': element_id,
-                                             'bodies_found': face_count if faces_data else 0
-                                         },
-                                         using_default_config=session.get('using_default_config', False),
-                                         detected_thickness=None), 400
-
-                log(f"Auto-selected face: {face_id} from part: {part_name_from_body}")
-
-            except Exception as e:
-                log(f"Error in face detection: {str(e)}")
-                return jsonify({
-                    'error': 'Face detection failed',
-                    'message': str(e)
-                }), 400
-        else:
-            # face_id was provided (e.g., from element panel), but we need to fetch the face normal
-            face_normal, auto_selected_body_id, part_name_from_body = fetch_face_normal_and_body(
-                client, document_id, workspace_id, element_id, face_id, body_id
-            )
-
-        # Check if multi-layer export is requested (default: true)
-        multilayer = raw_params.get('multilayer', 'true').lower() in ('true', '1', 'yes')
-
-        # Fetch DXF from Onshape
-        # Use body_id from URL parameter if provided, otherwise use the one from auto-selection
-        export_body_id = body_id if body_id else auto_selected_body_id
-        log(f"Exporting with body_id: {export_body_id} (from {'URL param' if body_id else 'auto-selection'})")
-
-        if multilayer:
-            log("🔷 Multi-layer export requested")
-
-            # For multi-layer export, we need the reference face normal and origin
-            if not face_normal:
-                log("⚠️  No face normal available, fetching...")
-                faces_data = client.list_faces(document_id, workspace_id, element_id)
-
-                if not faces_data:
-                    error_msg = "Failed to retrieve face data from Onshape. Your authentication token may have expired. Please re-authenticate with Onshape."
-                    log(f"❌ {error_msg}")
-                    return jsonify({'error': error_msg}), 401
-
-                # Find the reference face
-                reference_face = None
-
-                # If face_id is provided, find that specific face
-                if face_id:
-                    for body in faces_data.get('bodies', []):
-                        if export_body_id and body.get('id') != export_body_id:
-                            continue
-                        for face in body.get('faces', []):
-                            if face.get('id') == face_id:
-                                reference_face = face
-                                break
-                        if reference_face:
-                            break
-                else:
-                    # No face_id provided (one-click flow): auto-select largest upward-facing plane
-                    log("⚠️  No face_id provided, auto-selecting reference face...")
-                    largest_area = 0
-                    for body in faces_data.get('bodies', []):
-                        if export_body_id and body.get('id') != export_body_id:
-                            continue
-                        for face in body.get('faces', []):
-                            surface = face.get('surface', {})
-                            if surface.get('type') == 'PLANE':
-                                normal = surface.get('normal', {})
-                                # Check if pointing up (z > 0.9)
-                                if normal.get('z', 0) > 0.9:
-                                    area = face.get('area', 0)
-                                    if area > largest_area:
-                                        largest_area = area
-                                        reference_face = face
-                                        face_id = face.get('id')  # Update face_id for later use
-
-                    if reference_face:
-                        log(f"✅ Auto-selected reference face: {face_id} (area: {largest_area:.6f} m²)")
-
-                if reference_face:
-                    surface = reference_face.get('surface', {})
-                    face_normal = surface.get('normal', {'x': 0, 'y': 0, 'z': 1})
-                else:
-                    log("❌ Could not find reference face for multi-layer export")
-                    return jsonify({'error': 'Could not find reference face for multi-layer export. Please select a flat top face.'}), 500
-
-            # Get reference origin from face
-            faces_data = client.list_faces(document_id, workspace_id, element_id)
-
-            if not faces_data:
-                error_msg = "Failed to retrieve face data from Onshape. Your authentication token may have expired. Please re-authenticate with Onshape."
-                log(f"❌ {error_msg}")
-                return jsonify({'error': error_msg}), 401
-
-            reference_origin = None
-            for body in faces_data.get('bodies', []):
-                if export_body_id and body.get('id') != export_body_id:
-                    continue
-                for face in body.get('faces', []):
-                    if face.get('id') == face_id:
-                        surface = face.get('surface', {})
-                        reference_origin = surface.get('origin', {'x': 0, 'y': 0, 'z': 0})
-                        break
-                if reference_origin:
-                    break
-
-            if not reference_origin:
-                log("⚠️  Could not find reference origin, using default")
-                reference_origin = {'x': 0, 'y': 0, 'z': 0}
-
-            # Export multi-layer DXF
-            result = client.export_multilayer_dxf(
-                document_id, workspace_id, element_id,
-                face_id, export_body_id, face_normal, reference_origin,
-                body_id=export_body_id, cached_faces_data=faces_data
-            )
-            # Unpack tuple: (dxf_content, detected_thickness)
-            if isinstance(result, tuple):
-                dxf_content, detected_thickness = result
-            else:
-                # Backwards compatibility if export function doesn't return thickness
-                dxf_content = result
-                detected_thickness = None
-        else:
-            log("📄 Single-layer export")
-            dxf_content = client.export_face_to_dxf(
-                document_id, workspace_id, element_id, face_id, export_body_id, face_normal
-            )
-            detected_thickness = None  # Not applicable for single-layer
-
-        if not dxf_content:
-            error_msg = f"Failed to export DXF from Onshape. "
-            if export_body_id:
-                error_msg += f"Attempted to export body/part: {export_body_id}. "
-            else:
-                error_msg += "No body/part ID available for export. "
-            error_msg += "Check Onshape API logs above for details."
-
-            return jsonify({
-                'error': 'Failed to export DXF from Onshape',
-                'message': error_msg,
-                'details': {
-                    'face_id': face_id,
-                    'body_id': export_body_id,
-                    'document_id': document_id,
-                    'element_id': element_id
-                }
-            }), 500
-        
-        log(f"📄 DXF content received: {len(dxf_content)} bytes")
-
-        # Generate filename: try to combine document name + part name
-        doc_name = None
-
-        # Try to get document name (optional, may fail with 404)
-        try:
-            log("📝 Attempting to fetch document name...")
-            doc_info = client.get_document_info(document_id)
-            if doc_info:
-                doc_name = doc_info.get('name')
-                log(f"   ✅ Got document name: {doc_name}")
-            else:
-                log(f"   ⚠️  Document API returned None")
-        except Exception as e:
-            log(f"   ⚠️  Document API failed (will use part name only): {e}")
-
-        # Save potentially-refreshed tokens back to session
-        session_manager.update_session_tokens(client)
-
-        # Build filename from whatever we have
-        suggested_filename = generate_onshape_filename(doc_name, part_name_from_body)
-        log(f"✅ Generated filename: {suggested_filename}.nc")
-
-        # Save DXF to temp file in uploads folder
-        temp_dxf = tempfile.NamedTemporaryFile(
-            suffix='.dxf',
-            dir=UPLOAD_FOLDER,
-            delete=False
-        )
-        temp_dxf.write(dxf_content)
-        temp_dxf.close()
-
-        dxf_filename = os.path.basename(temp_dxf.name)
-        dxf_path = temp_dxf.name
-
-        log(f"✅ DXF imported from Onshape: {dxf_filename}")
-        log(f"📂 Saved to: {dxf_path}")
-        log(f"📏 File size on disk: {os.path.getsize(dxf_path)} bytes")
-
-        # Log metrics
-        team_number = session.get('team_number')
-        user_email = session.get('user_email')
-        metrics.log_event('onshape_import',
-                         team_number=team_number,
-                         user_email=user_email,
-                         metadata={
-                             'document_name': doc_name,
-                             'part_name': part_name_from_body
-                         })
-
-        # Register DXF file with token manager for secure access
-        dxf_token = file_token_manager.register_file(dxf_path, f"{suggested_filename}.dxf")
-        log(f"🔗 Will be served at: /uploads/{dxf_token[:16]}...")
-
-        # Store DXF token in session for debug downloads
-        session['debug_dxf_token'] = dxf_token
-        session['debug_dxf_filename'] = f"{suggested_filename}.dxf"
-        log(f"🐛 Debug DXF available at: /debug/download-dxf")
-
-        # Render main page with DXF auto-loaded
-        # The frontend will detect the dxf_file parameter and auto-upload it
-
-        # Reconstruct TeamConfig to get materials list
-        team_config_data = session.get('team_config_data', {})
-        team_config = TeamConfig(team_config_data)
-
-        # Get available machines
-        machines = team_config.get_available_machines()
-
-        # Get current machine (from session, or use default)
-        current_machine_id = session.get('machine_id', team_config.default_machine_id)
-
-        # Get machine-specific config dict
-        team_config_dict = team_config.to_dict(current_machine_id)
-        drive_enabled = team_config_dict.get('google_drive_enabled', False)
-        machine_x_max = team_config_dict.get('machine_x_max', 48.0)
-        machine_y_max = team_config_dict.get('machine_y_max', 96.0)
-        default_tool_diameter = team_config_dict.get('default_tool_diameter', 0.157)
-
-        # Get user/team info
-        user_name = session.get('user_name')
-        team_name = session.get('team_name')
-
-        # Get available materials for current machine
-        available_materials = team_config.get_available_materials(current_machine_id)
-
-        # Add 'aluminum_tube' as a special UI-only material (uses aluminum preset)
-        available_materials['aluminum_tube'] = {
-            **available_materials.get('aluminum', {}),
-            'name': 'Aluminum Tube'
-        }
-
-        # Check for incomplete materials
-        incomplete_materials = {
-            material_id for material_id in available_materials.keys()
-            if not team_config.is_material_complete(material_id, current_machine_id) and material_id != 'aluminum_tube'
-        }
-
-        return render_template('index.html',
-                             dxf_file=dxf_token,  # Pass token instead of filename
-                             from_onshape=True,
-                             document_id=document_id,
-                             face_id=face_id,
-                             suggested_filename=suggested_filename or '',
-                             detected_thickness=detected_thickness,  # Auto-detected part thickness (multilayer only)
-                             user_name=user_name,
-                             team_name=team_name,
-                             drive_enabled=drive_enabled,
-                             machine_x_max=machine_x_max,
-                             machine_y_max=machine_y_max,
-                             default_tool_diameter=default_tool_diameter,
-                             using_default_config=session.get('using_default_config', False),
-                             machines=machines,
-                             current_machine_id=current_machine_id,
-                             materials=available_materials,
-                             incomplete_materials=incomplete_materials)
-        
-    except Exception as e:
-        return jsonify({
-            'error': f'Import failed: {str(e)}'
-        }), 500
-
-@app.route('/onshape/save-dxf', methods=['GET', 'POST'])
-@limiter.limit("20 per minute")  # Moderate limit - authenticated via Onshape OAuth
-def onshape_save_dxf():
-    """
-    Save a DXF from Onshape directly to Google Drive without generating G-code.
-    Accepts parameters from Onshape extension or direct URL.
-    """
-    if not ONSHAPE_AVAILABLE:
-        return jsonify({'error': 'Onshape integration not available'}), 400
-
-    if not GOOGLE_DRIVE_AVAILABLE:
-        return jsonify({'error': 'Google Drive integration not available'}), 400
-
-    try:
-        log(f"\n💾 Onshape Save DXF request: {request.url}")
-        log(f"   Method: {request.method}")
-
-        # Get parameters (either from query string or JSON body)
-        if request.method == 'POST':
-            raw_params = request.json or {}
-        else:
-            raw_params = request.args.to_dict()
-
-        params = extract_onshape_params(raw_params)
-        document_id = params['document_id']
-        workspace_id = params['workspace_id']
-        element_id = params['element_id']
-        face_id = params['face_id']
-        body_id = params['body_id']
-
-        log(f"Onshape params: doc={document_id}, workspace={workspace_id}, element={element_id}, face={face_id}, body={body_id}")
-
-        if not all([document_id, workspace_id, element_id]):
-            return jsonify({
-                'error': 'Missing required parameters',
-                'required': ['documentId', 'workspaceId', 'elementId']
-            }), 400
-
-        # Get Onshape client
-        user_id = get_current_user_id()
-        client = session_manager.get_client(user_id)
-
-        if not client:
-            return jsonify({
-                'error': 'Not authenticated with Onshape',
-                'auth_url': '/onshape/auth'
-            }), 401
-
-        # Auto-select face if needed (use existing helper function)
-        part_name_from_body = None
-        auto_selected_body_id = None
-        face_normal = None
-
-        if not face_id:
-            log("No face ID, auto-selecting top face...")
-            try:
-                # Use existing auto_select_top_face helper
-                face_id, auto_selected_body_id, part_name_from_body, face_normal = client.auto_select_top_face(
-                    document_id, workspace_id, element_id, body_id
-                )
-
-                if not face_id:
-                    return jsonify({
-                        'error': 'Could not auto-select a face',
-                        'message': 'No top face found on any part'
-                    }), 400
-
-            except Exception as e:
-                log(f"Error in face detection: {str(e)}")
-                return jsonify({
-                    'error': 'Face detection failed',
-                    'message': str(e)
-                }), 400
-        else:
-            # face_id was provided (e.g., from element panel), but we need to fetch the face normal
-            face_normal, auto_selected_body_id, part_name_from_body = fetch_face_normal_and_body(
-                client, document_id, workspace_id, element_id, face_id, body_id
-            )
-
-        # Export DXF from Onshape
-        export_body_id = body_id if body_id else auto_selected_body_id
-        log(f"Exporting DXF with body_id: {export_body_id}")
-
-        dxf_content = client.export_face_to_dxf(
-            document_id, workspace_id, element_id, face_id, export_body_id, face_normal
-        )
-
-        if not dxf_content:
-            return jsonify({
-                'error': 'Failed to export DXF from Onshape',
-                'details': {
-                    'face_id': face_id,
-                    'body_id': export_body_id
-                }
-            }), 500
-
-        log(f"📄 DXF exported: {len(dxf_content)} bytes")
-
-        # Generate filename with timestamp
-        doc_name = None
-        try:
-            doc_info = client.get_document_info(document_id)
-            if doc_info:
-                doc_name = doc_info.get('name')
-                log(f"📝 Document name: {doc_name}")
-        except Exception as e:
-            log(f"⚠️  Could not get document name: {e}")
-
-        # Save potentially-refreshed tokens back to session
-        session_manager.update_session_tokens(client)
-
-        base_filename = generate_onshape_filename(doc_name, part_name_from_body)
-
-        # Add timestamp (server's local time)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        dxf_filename = f"{base_filename}_{timestamp}.dxf"
-
-        log(f"✅ Generated filename: {dxf_filename}")
-
-        # Save DXF to temp file
-        temp_dxf = tempfile.NamedTemporaryFile(
-            suffix='.dxf',
-            dir=OUTPUT_FOLDER,  # Use OUTPUT_FOLDER so it's accessible for upload
-            delete=False
-        )
-        temp_dxf.write(dxf_content)
-        temp_dxf.close()
-
-        dxf_path = temp_dxf.name
-        log(f"💾 Saved temp DXF: {dxf_path}")
-
-        # Upload to Google Drive
-        creds = None
-        if AUTH_AVAILABLE and auth.is_enabled():
-            creds = auth.get_credentials()
-            if not creds:
-                os.unlink(dxf_path)  # Clean up temp file
-                return jsonify({
-                    'error': 'Not authenticated with Google Drive'
-                }), 401
-
-        uploader = GoogleDriveUploader(credentials=creds)
-
-        if not uploader.authenticate():
-            os.unlink(dxf_path)  # Clean up temp file
-            return jsonify({
-                'error': 'Failed to authenticate with Google Drive'
-            }), 500
-
-        log("📤 Uploading to Google Drive...")
-        result = uploader.upload_file(dxf_path, dxf_filename)
-
-        # Clean up temp file
-        try:
-            os.unlink(dxf_path)
-        except:
-            pass
-
-        if result and result.get('success'):
-            log(f"✅ Upload successful: {result.get('web_link')}")
-            return jsonify({
-                'success': True,
-                'message': f'✅ DXF saved to Google Drive: {dxf_filename}',
-                'filename': dxf_filename,
-                'file_id': result.get('file_id'),
-                'web_view_link': result.get('web_link')
-            })
-        else:
-            return jsonify({
-                'success': False,
-                'error': 'Upload to Google Drive failed',
-                'message': result.get('message') if result else 'Unknown error'
-            }), 500
-
-    except Exception as e:
-        log(f"❌ Error in save-dxf: {str(e)}")
-        log(traceback.format_exc())
-        return jsonify({
-            'error': f'Save DXF failed: {str(e)}'
         }), 500
 
 @app.route('/onshape/element-panel')

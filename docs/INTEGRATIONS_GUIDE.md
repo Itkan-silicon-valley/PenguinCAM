@@ -116,7 +116,7 @@ In Onshape Developer Portal → OAuth app → **Extensions** tab:
 
 **Action URL:**
 ```
-https://penguincam.popcornpenguins.com/onshape/import
+https://penguincam.popcornpenguins.com/onshape/element-panel
 ```
 
 **Action Type:** `GET`

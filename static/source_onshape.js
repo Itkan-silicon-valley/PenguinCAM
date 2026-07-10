@@ -76,13 +76,17 @@
 
   function exportFace(faceId, partId) {
     if (P.onSelectionBusy) P.onSelectionBusy(true);
-    dbg('onshape:export', { faceId: faceId, partId: partId });
+    // In 2.5D mode the backend builds a depth-layered DXF of all parallel faces;
+    // otherwise it exports the single selected face flat. Read the mode live so a
+    // mid-session switch is honored.
+    var multilayer = (typeof P.getMode === 'function' && P.getMode() === '2.5d');
+    dbg('onshape:export', { faceId: faceId, partId: partId, multilayer: multilayer });
     fetch('/onshape/export-face', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         documentId: ctx.documentId, workspaceId: ctx.workspaceId, elementId: ctx.elementId,
-        faceId: faceId, partId: partId
+        faceId: faceId, partId: partId, multilayer: multilayer
       })
     })
       .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j }; }); })
