@@ -24,6 +24,7 @@ import time
 import threading
 from datetime import datetime
 import ezdxf
+from shapely.ops import unary_union
 import logging
 import metrics
 import feeds_speeds
@@ -402,6 +403,25 @@ def _compute_dxf_outline(path):
     outline = []
     if pp.perimeter:
         outline = [[round(x - minx, 4), round(y - miny, 4)] for (x, y) in pp.perimeter]
+    # For negative-space 2.5D (HATCH) parts the detected "perimeter" is often an
+    # interior feature (e.g. a central bore), because the true outer profile isn't a
+    # filled polygon in this representation. When the outline doesn't span the part,
+    # fall back to the convex hull of all layer geometry so the layout footprint and
+    # thumbnail match the real bounding box. Rendering only — G-code has its own path.
+    def _span(pts):
+        if not pts:
+            return 0.0, 0.0
+        xs = [p[0] for p in pts]; ys = [p[1] for p in pts]
+        return max(xs) - min(xs), max(ys) - min(ys)
+    ow, oh = _span(outline)
+    if pp.layer_data and (ow < 0.9 * width or oh < 0.9 * height):
+        all_polys = [poly for info in pp.layer_data.values()
+                     for poly in info.get('polygons', [])]
+        if all_polys:
+            hull = unary_union(all_polys).convex_hull
+            if hull.geom_type == 'Polygon':
+                outline = [[round(x - minx, 4), round(y - miny, 4)]
+                           for (x, y) in hull.exterior.coords]
     if len(outline) < 3:
         outline = [[0, 0], [round(width, 4), 0],
                    [round(width, 4), round(height, 4)], [0, round(height, 4)]]
@@ -421,13 +441,18 @@ def _compute_dxf_outline(path):
         for info in pp.layer_data.values():
             for poly in info.get('polygons', []):
                 for ring in [poly.exterior, *poly.interiors]:
+                    rminx, rminy, rmaxx, rmaxy = ring.bounds
+                    # Skip degenerate slivers (sub-0.02" in a dimension): they're
+                    # slicing artifacts that would litter the thumbnail with dashes.
+                    if (rmaxx - rminx) < 0.02 or (rmaxy - rminy) < 0.02:
+                        continue
                     key = tuple(round(v, 2) for v in ring.bounds)
                     if key in seen or key == perim_key:
                         continue
                     seen.add(key)
                     inner.append([[round(x - minx, 4), round(y - miny, 4)]
                                   for (x, y) in ring.coords])
-                    if len(inner) >= 50:  # guard against pathological part counts
+                    if len(inner) >= 400:  # guard against pathological part counts
                         break
     return {'width': round(width, 4), 'height': round(height, 4),
             'outline': outline, 'holes': holes, 'inner': inner}
