@@ -424,6 +424,40 @@ class FRCPostProcessor:
         
         print(f"Found {len(self.circles)} circles and {len(self.polylines)} closed paths")
 
+    def _path_as_circle(self, coords):
+        """If a closed boundary path is circular, return its circle dict, else None.
+
+        The Onshape 2.5D export represents everything as HATCH solid regions, so a
+        drilled hole arrives as a many-sided circular boundary path, not a CIRCLE
+        entity. Left as a polyline it gets machined as a pocket, which fails when the
+        hole is barely larger than the tool (no room to spiral-clear). Recognizing it
+        as a circle routes it through the hole classifier, which already picks the
+        right strategy by size: peck-drill (tiny), helical+spiral (medium), or
+        contour (large through-holes). Only the bottom-face/through path consumes
+        these circles; blind pockets at depth layers are machined from `polygons`,
+        which are built from circles+polylines identically, so this reclassification
+        does not change how depth-layer pockets are cut.
+
+        Returns a circle dict ({'center','radius','diameter'}) or None.
+        """
+        if len(coords) < 8:  # too few points to be a tessellated circle
+            return None
+        try:
+            poly = Polygon(coords)
+        except Exception:
+            return None
+        if not poly.is_valid or poly.is_empty or poly.length == 0:
+            return None
+        # Isoperimetric quotient: 1.0 for a circle, ~0.95 octagon, ~0.79 square.
+        # 0.97 admits tessellated circles (~0.998) while excluding octagons/rounded rects.
+        circularity = 4 * math.pi * poly.area / (poly.length ** 2)
+        if circularity < 0.97:
+            return None
+        diameter = 2 * math.sqrt(poly.area / math.pi)
+        centroid = poly.centroid
+        return {'center': (centroid.x, centroid.y),
+                'radius': diameter / 2, 'diameter': diameter}
+
     def _load_multilayer_dxf(self, doc, msp, layers_with_depths):
         """Load geometry from multi-layer DXF, organized by depth"""
         # Initialize geometry lists for transform_coordinates compatibility
@@ -455,7 +489,15 @@ class FRCPostProcessor:
                                 # Polyline path
                                 coords = [(v[0], v[1]) for v in path.vertices]
                                 if len(coords) >= 3:
-                                    layer_polylines.append(coords)
+                                    # Circular boundaries are holes, not pockets -
+                                    # recover them as circles so the hole classifier
+                                    # (peck/helical/contour by size) handles them
+                                    # (see _path_as_circle).
+                                    circle = self._path_as_circle(coords)
+                                    if circle:
+                                        layer_circles.append(circle)
+                                    else:
+                                        layer_polylines.append(coords)
                                     hatch_count += 1
                     except Exception as e:
                         print(f"      Warning: Could not parse HATCH entity: {e}")
@@ -2203,6 +2245,43 @@ class FRCPostProcessor:
 
         return new_circles, new_polylines
 
+    def _dissolve_thin_islands(self, polygon, min_wall, deeper_geom):
+        """Drop interior islands that leave a too-thin wall AND are removed by a deeper pass.
+
+        An island in a sliced layer is one of two things:
+        (a) a region carved out by subtracting a DEEPER layer - that material is
+            removed by the deeper pass regardless, so keeping the island is purely an
+            efficiency choice (avoid re-cutting what a deeper pass clears); or
+        (b) a native designed hole at THIS depth (e.g. a real ring groove) whose
+            interior is kept material.
+        Only (a) is safe to dissolve. When keeping an (a) island would leave a wall
+        too thin for the tool, dissolve it: the shallow pass mills across it and the
+        deeper pass still removes it, so the finished part is unchanged. A too-thin
+        (b) island is a genuine "groove too narrow" error and must be preserved.
+        `deeper_geom` is the deeper-cut region actually subtracted during slicing (or
+        None); an island counts as (a) only if it lies within that region.
+        """
+        if not polygon.interiors or deeper_geom is None:
+            return polygon
+        interiors = list(polygon.interiors)
+        kept = []
+        for i, ring in enumerate(interiors):
+            wall = polygon.exterior.distance(ring)
+            for j, other in enumerate(interiors):
+                if i != j:
+                    wall = min(wall, ring.distance(other))
+            island = Polygon(ring)
+            removed_deeper = (island.area > 0 and
+                              deeper_geom.intersection(island).area >= 0.99 * island.area)
+            if wall < min_wall and removed_deeper:
+                print(f"    Dissolving island (area={island.area:.3f} sq in): wall {wall:.4f}\" "
+                      f"< tool {min_wall:.4f}\" and removed by a deeper pass anyway")
+            else:
+                kept.append(ring)
+        if len(kept) == len(interiors):
+            return polygon
+        return Polygon(polygon.exterior.coords, [list(r.coords) for r in kept])
+
     def _generate_multilayer_gcode(self, suggested_filename: str = None, timestamp: str = None) -> PostProcessorResult:
         """Generate G-code for multi-layer DXF (2.5D machining)"""
         print("\n" + "="*70)
@@ -2318,6 +2397,21 @@ class FRCPostProcessor:
                     next_deeper_layer = bottom_layer_name
                     next_deeper_depth = bottom_layer[1]['depth']
 
+            # Region removed by ALL strictly-deeper passes, so a thin-wall island is
+            # dissolved only when that material is genuinely cut away later. The
+            # bottom/through face is stored as the KEEP plate (octagon-with-holes), so
+            # its removed material is its HOLES (interiors); deeper pocket layers store
+            # the removed pocket directly, so use those polygons as-is.
+            deeper_removed_geoms = []
+            for _lname, _linfo in self.layer_data.items():
+                if _linfo['depth'] < depth - 0.001:
+                    if has_true_bottom and _lname == bottom_layer_name:
+                        for _p in _linfo['polygons']:
+                            deeper_removed_geoms.extend(Polygon(r) for r in _p.interiors)
+                    else:
+                        deeper_removed_geoms.extend(_linfo['polygons'])
+            deeper_removed = unary_union(deeper_removed_geoms) if deeper_removed_geoms else None
+
             # Get geometry at next deeper layer and perform slicing
             if next_deeper_layer:
                 next_layer_info = self.layer_data[next_deeper_layer]
@@ -2377,6 +2471,10 @@ class FRCPostProcessor:
             for poly in sliced_polygons:
                 if not poly.is_valid or poly.is_empty:
                     continue
+
+                # Drop islands whose wall is too thin to machine IF a deeper pass
+                # removes that material anyway (see _dissolve_thin_islands).
+                poly = self._dissolve_thin_islands(poly, self.tool_diameter, deeper_removed)
 
                 # Check if polygon has interior holes (islands)
                 if len(poly.interiors) > 0:
