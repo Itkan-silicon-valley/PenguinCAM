@@ -1091,12 +1091,24 @@ class OnshapeClient:
                 if len(points) >= 3:
                     polylines.append(points)
 
-        # Stitch LINE and ARC entities into closed paths
-        # Onshape often exports faces as individual LINE segments (e.g., 4 lines for a rectangle)
+        # Stitch LINE and ARC entities into closed paths. Onshape exports faces as
+        # individual LINE/ARC segments; a corner shared by two entities is stored once
+        # per entity, and ARC endpoints (recomputed from center+radius+angle) land
+        # ~1e-6" off the adjoining segment's endpoint. shapely.linemerge requires EXACT
+        # endpoint coincidence to join, so those sub-micron gaps fragment a boundary
+        # loop and it never closes -> the outer profile is silently lost (curved plates,
+        # curved pockets). Snap every coordinate to a fine grid (0.001", far below both
+        # machining tolerance and the 0.1" closure check) so coincident-but-not-identical
+        # junctions unify and linemerge can stitch the loop.
+        SNAP = 0.001
+
+        def _snap(x, y):
+            return (round(x / SNAP) * SNAP, round(y / SNAP) * SNAP)
+
         line_segments = []
         for entity in source_msp.query('LINE'):
-            start = (entity.dxf.start.x, entity.dxf.start.y)
-            end = (entity.dxf.end.x, entity.dxf.end.y)
+            start = _snap(entity.dxf.start.x, entity.dxf.start.y)
+            end = _snap(entity.dxf.end.x, entity.dxf.end.y)
             line_segments.append(LineString([start, end]))
 
         for entity in source_msp.query('ARC'):
@@ -1110,16 +1122,15 @@ class OnshapeClient:
             arc_points = []
             for k in range(num_points + 1):
                 angle = start_angle + (end_angle - start_angle) * k / num_points
-                x = center[0] + radius * math.cos(angle)
-                y = center[1] + radius * math.sin(angle)
-                arc_points.append((x, y))
+                arc_points.append(_snap(center[0] + radius * math.cos(angle),
+                                        center[1] + radius * math.sin(angle)))
             if len(arc_points) >= 2:
                 line_segments.append(LineString(arc_points))
 
         # Also get unclosed polylines as segments
         for entity in source_msp.query('LWPOLYLINE'):
             if not entity.closed:
-                points = [(p[0], p[1]) for p in entity.get_points('xy')]
+                points = [_snap(p[0], p[1]) for p in entity.get_points('xy')]
                 if len(points) >= 2:
                     line_segments.append(LineString(points))
 
@@ -1136,7 +1147,16 @@ class OnshapeClient:
                         dist = ((start[0]-end[0])**2 + (start[1]-end[1])**2)**0.5
                         if dist < 0.1:  # Closed within tolerance
                             polylines.append(coords)
-                            log(f"    Stitched {len(line_segments)} line/arc segments into closed path ({len(coords)} points)")
+                            log(f"    Stitched line/arc segments into closed path ({len(coords)} points)")
+                        else:
+                            # Don't silently drop a large boundary loop that failed to
+                            # close - that's exactly how a missing outer profile hides.
+                            span_x = max(c[0] for c in coords) - min(c[0] for c in coords)
+                            span_y = max(c[1] for c in coords) - min(c[1] for c in coords)
+                            if max(span_x, span_y) > 1.0:
+                                log(f"    WARNING: dropped an UNCLOSED boundary loop "
+                                    f"({len(coords)} pts, {span_x:.2f}x{span_y:.2f}\", "
+                                    f"end-gap {dist:.4f}\") - geometry may be incomplete")
             except Exception as e:
                 log(f"    Warning: Could not stitch line segments: {e}")
 
