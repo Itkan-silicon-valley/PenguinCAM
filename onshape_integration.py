@@ -1497,6 +1497,11 @@ class OnshapeClient:
             log("No DXF content exported")
             return None
 
+        # Stash the raw per-depth DXFs (exactly as Onshape returned them, before
+        # _convert_geometry_to_solid_hatch reconstructs geometry) so the Flask layer
+        # can expose them for debugging the geometry pipeline.
+        self.last_raw_depth_dxfs = dict(dxf_contents)
+
         # No coordinate translation needed
         # Onshape exports each depth group with faces at their correct relative positions
         # The face 'origin' field is a plane equation reference point, not a geometric centroid

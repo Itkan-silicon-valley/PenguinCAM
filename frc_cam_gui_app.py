@@ -19,6 +19,8 @@ import json
 import base64
 import secrets
 import re
+import io
+import zipfile
 import atexit
 import time
 import threading
@@ -1123,6 +1125,40 @@ def debug_download_dxf():
         log(f"❌ Debug DXF download error: {e}")
         return jsonify({'error': str(e)}), 500
 
+
+@app.route('/debug/download-raw-dxf')
+@limiter.limit("30 per minute")
+def debug_download_raw_dxf():
+    """
+    Debug endpoint: Download a zip of the RAW per-depth DXFs from the most recent 2.5D
+    Onshape import — exactly as Onshape returned them, BEFORE our HATCH reconstruction.
+    Use this to inspect what the outer-profile boundary geometry looks like at the source.
+    """
+    try:
+        token = session.get('debug_raw_dxf_token')
+        if not token:
+            return jsonify({
+                'error': 'No raw debug DXF available',
+                'message': 'Import a 2.5D part from Onshape first.'
+            }), 404
+
+        file_info = file_token_manager.get_file(token)
+        if not file_info or not os.path.exists(file_info['filepath']):
+            return jsonify({
+                'error': 'Raw DXF zip not found or expired',
+                'message': 'It may have been cleaned up. Import the part again.'
+            }), 404
+
+        real_filename = session.get('debug_raw_dxf_filename', 'raw-layers.zip')
+        log(f"🐛 Debug RAW DXF zip download: {real_filename} "
+            f"({os.path.getsize(file_info['filepath'])} bytes)")
+        return send_file(file_info['filepath'], as_attachment=True,
+                         download_name=real_filename, mimetype='application/zip')
+    except Exception as e:
+        log(f"❌ Debug raw DXF download error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/uploads/<token>')
 @limiter.limit("30 per minute")
 def serve_upload(token):
@@ -1586,6 +1622,23 @@ def onshape_export_face():
         session['debug_dxf_token'] = file_token_manager.register_file(path, debug_filename)
         session['debug_dxf_filename'] = debug_filename
         keep_dxf = True
+
+        # Also retain the RAW per-depth DXFs (exactly as Onshape returned them, before
+        # _convert_geometry_to_solid_hatch reconstructs the geometry) as a zip, so we can
+        # inspect what the outer-profile boundary looks like pre-conversion. Debug only;
+        # served at /debug/download-raw-dxf. Token manager expires it after ~1 hour.
+        raw_layers = getattr(client, 'last_raw_depth_dxfs', None) if multilayer else None
+        if raw_layers:
+            zbuf = io.BytesIO()
+            with zipfile.ZipFile(zbuf, 'w', zipfile.ZIP_DEFLATED) as zf:
+                for depth, content in raw_layers.items():
+                    zf.writestr('raw_depth_{:+.4f}.dxf'.format(depth), content)
+            ztmp = tempfile.NamedTemporaryFile(suffix='.zip', delete=False, dir=UPLOAD_FOLDER)
+            ztmp.write(zbuf.getvalue())
+            ztmp.close()
+            raw_zip_name = '{}-raw-layers.zip'.format(geo['name'])
+            session['debug_raw_dxf_token'] = file_token_manager.register_file(ztmp.name, raw_zip_name)
+            session['debug_raw_dxf_filename'] = raw_zip_name
 
         metrics.log_event('onshape_import',
                           team_number=session.get('team_number'),
