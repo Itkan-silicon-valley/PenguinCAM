@@ -456,6 +456,14 @@ def _compute_dxf_outline(path):
                                   for (x, y) in ring.coords])
                     if len(inner) >= 400:  # guard against pathological part counts
                         break
+    else:
+        # Single-layer part: interior pockets are closed paths that are neither the
+        # perimeter nor circular holes, so surface them as inner outlines too —
+        # otherwise the thumbnail shows only the outline + holes and omits pockets.
+        for pocket in (pp.pockets or []):
+            if len(pocket) >= 3:
+                inner.append([[round(x - minx, 4), round(y - miny, 4)]
+                              for (x, y) in pocket])
     return {'width': round(width, 4), 'height': round(height, 4),
             'outline': outline, 'holes': holes, 'inner': inner}
 
