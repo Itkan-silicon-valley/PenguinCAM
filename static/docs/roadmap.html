@@ -35,6 +35,51 @@
             </div>
         </div>
 
+        <h2>New in 2.0</h2>
+
+        <p>
+            The latest release rebuilds PenguinCAM around a step-by-step wizard that runs entirely inside Onshape,
+            with support for cutting several parts in a single job:
+        </p>
+
+        <div class="feature-grid">
+            <div class="feature-card">
+                <div class="feature-icon">🆕</div>
+                <h3>Embedded Onshape Panel</h3>
+                <p>The whole workflow runs in a panel docked to your Onshape window. Click a face and it imports live — no export, no upload, no separate tab.</p>
+            </div>
+
+            <div class="feature-card">
+                <div class="feature-icon">🆕</div>
+                <h3>Multi-Part Jobs</h3>
+                <p>Nest several parts on one sheet and cut them in a single program. A visual layout canvas shows the stock, the origin, and every part in place.</p>
+            </div>
+
+            <div class="feature-card">
+                <div class="feature-icon">🆕</div>
+                <h3>Interactive Layout</h3>
+                <p>Drag to position, rotate with a handle (snapping to 45°), flip parts over, and multi-select with Shift. Live overlap and out-of-bounds checking.</p>
+            </div>
+
+            <div class="feature-card">
+                <div class="feature-icon">🆕</div>
+                <h3>Raised Bosses &amp; Islands</h3>
+                <p>2.5D machining now correctly preserves raised bosses and islands enclosed inside deeper pockets, and fully clears enclosed through-holes.</p>
+            </div>
+
+            <div class="feature-card">
+                <div class="feature-icon">🆕</div>
+                <h3>Asymmetric Tube Patterns</h3>
+                <p>Cut a distinct pattern on each face of a tube — for example, larger access holes on one side for bolt heads.</p>
+            </div>
+
+            <div class="feature-card">
+                <div class="feature-icon">🆕</div>
+                <h3>Light &amp; Dark Theme</h3>
+                <p>The panel matches Onshape's light or dark theme automatically for a seamless look.</p>
+            </div>
+        </div>
+
         <h2>Current Features</h2>
 
         <p>
@@ -44,38 +89,26 @@
         <div class="feature-grid">
             <div class="feature-card">
                 <div class="feature-icon">✅</div>
-                <h3>Onshape Integration</h3>
-                <p>One-click export from Onshape with OAuth authentication</p>
-            </div>
-
-            <div class="feature-card">
-                <div class="feature-icon">✅</div>
                 <h3>Automatic Detection</h3>
-                <p>Top face detection, hole identification, and smart feature recognition</p>
-            </div>
-
-            <div class="feature-card">
-                <div class="feature-icon">✅</div>
-                <h3>Part Orientation</h3>
-                <p>Rotate in 90° increments with fixed bottom-left origin</p>
+                <p>Hole identification, pocket detection, and smart feature recognition</p>
             </div>
 
             <div class="feature-card">
                 <div class="feature-icon">✅</div>
                 <h3>3D Visualization</h3>
-                <p>Interactive preview with toolpath scrubber and tool animation</p>
+                <p>Interactive preview with toolpath scrubber, tool animation, and adjustable playback speed</p>
             </div>
 
             <div class="feature-card">
                 <div class="feature-icon">✅</div>
                 <h3>Multi-Layer (2.5D) Support</h3>
-                <p>Automatic depth detection for parts with partial-depth pockets, grooves, and countersinks</p>
+                <p>Automatic depth detection for parts with partial-depth pockets, grooves, countersinks, and raised bosses</p>
             </div>
 
             <div class="feature-card">
                 <div class="feature-icon">✅</div>
                 <h3>Tube Machining</h3>
-                <p>Square ends and mirror-image patterns for aluminum tube</p>
+                <p>Square ends, cut-to-length, and mirrored or distinct patterns for aluminum tube</p>
             </div>
 
             <div class="feature-card">
@@ -106,6 +139,12 @@
                 <div class="feature-icon">✅</div>
                 <h3>Intelligent Pocket Contouring</h3>
                 <p>Area-based strategy to contour large through-cut features instead of full clearing</p>
+            </div>
+
+            <div class="feature-card">
+                <div class="feature-icon">✅</div>
+                <h3>Standalone Upload</h3>
+                <p>Full wizard available outside Onshape by uploading DXF files directly</p>
             </div>
         </div>
 
@@ -148,19 +187,46 @@
             <div class="step">
                 <div class="step-number">2</div>
                 <div class="step-content">
-                    <h3>Multiple Parts Per Job</h3>
-                    <p><strong>Priority:</strong> Medium | <strong>Effort:</strong> Medium-High</p>
+                    <h3>Automatic Nesting (Auto-Arrange)</h3>
+                    <p><strong>Priority:</strong> High | <strong>Effort:</strong> High</p>
                     <p>
-                        Layout multiple instances of the same part on a single piece of stock, or
-                        combine different parts in one cutting job. Would optimize material usage
-                        and reduce setup time. See "Interactive Part Layout Interface" for visual
-                        positioning controls.
+                        An "Auto-arrange" button on the Layout step that positions and rotates parts to waste as
+                        little material as possible, then lets you fine-tune by hand. Rather than simple bounding-box
+                        packing, it would use true-shape nesting so PenguinCAM's irregular FRC parts interlock,
+                        keeping every part at least one tool diameter apart so the postprocessor is unchanged.
+                        Planned to run in the browser so parts animate into place interactively.
                     </p>
                 </div>
             </div>
 
             <div class="step">
                 <div class="step-number">3</div>
+                <div class="step-content">
+                    <h3>Multi-Part 2.5D Jobs</h3>
+                    <p><strong>Priority:</strong> Low-Medium | <strong>Effort:</strong> Medium</p>
+                    <p>
+                        Today 2.5D mode is limited to one part per job. Lifting that would let multiple multi-layer
+                        parts be nested on one sheet, as long as they share a stock thickness. Niche for FRC (2.5D
+                        parts are uncommon), so it ranks below feeds/speeds and other functional work.
+                    </p>
+                </div>
+            </div>
+
+            <div class="step">
+                <div class="step-number">4</div>
+                <div class="step-content">
+                    <h3>Resume an In-Progress Job</h3>
+                    <p><strong>Priority:</strong> Medium | <strong>Effort:</strong> Low</p>
+                    <p>
+                        Persist the job (setup, parts, and placements) in the browser so an accidental reload — or
+                        Onshape reloading the panel when you toggle light/dark theme — resumes where you left off
+                        instead of resetting to the first step.
+                    </p>
+                </div>
+            </div>
+
+            <div class="step">
+                <div class="step-number">5</div>
                 <div class="step-content">
                     <h3>Team-Specific Tool Library</h3>
                     <p><strong>Priority:</strong> Medium | <strong>Effort:</strong> High</p>
@@ -176,7 +242,20 @@
             </div>
 
             <div class="step">
-                <div class="step-number">4</div>
+                <div class="step-number">6</div>
+                <div class="step-content">
+                    <h3>Custom Origin Point</h3>
+                    <p><strong>Priority:</strong> Low | <strong>Effort:</strong> Medium</p>
+                    <p>
+                        Today the G54 origin (0,0) is the lower-left corner of the layout's bounding box. This would
+                        let you pick a specific point on a part — for example a corner or a hole center — as the
+                        origin, to match how you set work zero on the machine.
+                    </p>
+                </div>
+            </div>
+
+            <div class="step">
+                <div class="step-number">7</div>
                 <div class="step-content">
                     <h3>Per-Team Branding</h3>
                     <p><strong>Priority:</strong> Low | <strong>Effort:</strong> Medium</p>
@@ -188,7 +267,7 @@
             </div>
 
             <div class="step">
-                <div class="step-number">5</div>
+                <div class="step-number">8</div>
                 <div class="step-content">
                     <h3>Additional Cloud Storage</h3>
                     <p><strong>Priority:</strong> Low | <strong>Effort:</strong> Medium</p>
@@ -200,7 +279,7 @@
             </div>
 
             <div class="step">
-                <div class="step-number">6</div>
+                <div class="step-number">9</div>
                 <div class="step-content">
                     <h3>G41/G42 Tool Compensation</h3>
                     <p><strong>Priority:</strong> Low | <strong>Effort:</strong> Medium</p>
@@ -213,40 +292,14 @@
             </div>
 
             <div class="step">
-                <div class="step-number">7</div>
+                <div class="step-number">10</div>
                 <div class="step-content">
-                    <h3>Asymmetric Tube Patterns</h3>
-                    <p><strong>Priority:</strong> Medium | <strong>Effort:</strong> High</p>
-                    <p>
-                        Support tubing where opposite faces aren't the same. Many teams do tube designs
-                        with larger holes on one side to support access to bolt heads.
-                    </p>
-                </div>
-            </div>
-
-            <div class="step">
-                <div class="step-number">8</div>
-                <div class="step-content">
-                    <h3>Interactive Part Layout Interface</h3>
-                    <p><strong>Priority:</strong> Medium | <strong>Effort:</strong> High</p>
-                    <p>
-                        Slicer-style interface for positioning parts on the machine bed. Show the full bed size
-                        in the preview, allow drag-and-drop positioning, arbitrary rotation and mirroring, and
-                        define exclusion zones for hold-downs. Would extend the multiple parts
-                        feature with intuitive visual controls familiar to students from 3D printing.
-                    </p>
-                </div>
-            </div>
-
-            <div class="step">
-                <div class="step-number">9</div>
-                <div class="step-content">
-                    <h3>Show More Gcode Text During Toolpath Preview</h3>
+                    <h3>Step Through G-code Text in Preview</h3>
                     <p><strong>Priority:</strong> Low | <strong>Effort:</strong> Low</p>
                     <p>
-                        Many gcode preview tools allow you to step through the gcode text line by line while
-                        showing several lines of context. It would be good to replicate that. Useful for
-                        debugging, maybe less important for students.
+                        Many gcode preview tools let you step through the gcode text line by line while
+                        showing several lines of context alongside the 3D toolpath. It would be good to replicate
+                        that. Useful for debugging, maybe less important for students.
                     </p>
                 </div>
             </div>
@@ -259,13 +312,13 @@
         </p>
 
         <ul>
-            <li>Batch processing multiple DXFs in one job</li>
+            <li>Auto-flip during nesting to pack parts even tighter</li>
             <li>G-code optimization for shorter tool paths</li>
             <li>Export simulation as video or animated GIF</li>
             <li>Integration with other CAD platforms (Fusion 360, Inventor)</li>
             <li>Library of CNC machines with pre-configured settings</li>
             <li>Custom tab placement (manual positioning)</li>
-            <li>Estimated cycle time improvements</li>
+            <li>Exclusion zones on the layout for hold-downs and clamps</li>
             <li>Adaptive toolpath strategies</li>
         </ul>
 
@@ -297,7 +350,7 @@
         </p>
 
         <footer>
-            <p>Last Updated: February 2026</p>
+            <p>Last Updated: July 2026</p>
             <p>Maintained by FRC Team 6238 Popcorn Penguins</p>
         </footer>
     </main>

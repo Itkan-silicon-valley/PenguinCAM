@@ -31,8 +31,14 @@
         <div class="feature-grid">
             <div class="feature-card">
                 <div class="feature-icon">🔗</div>
-                <h3>One-Click Integration</h3>
-                <p>Export parts directly from Onshape with a single click. No manual file export/import handling required.</p>
+                <h3>Runs Inside Onshape</h3>
+                <p>The entire workflow lives in a panel docked to your Onshape window. Click a face in your model and it imports instantly — no exporting, uploading, or switching tabs.</p>
+            </div>
+
+            <div class="feature-card">
+                <div class="feature-icon">🧩</div>
+                <h3>Multi-Part Jobs</h3>
+                <p>Nest several parts on one sheet of stock and cut them in a single program. Drag to position, rotate, and flip each part on a visual layout canvas.</p>
             </div>
 
             <div class="feature-card">
@@ -44,25 +50,25 @@
             <div class="feature-card">
                 <div class="feature-icon">📐</div>
                 <h3>Interactive Preview</h3>
-                <p>Visualize your toolpaths in 3D before cutting. Rotate, scrub through moves, and verify setup.</p>
-            </div>
-
-            <div class="feature-card">
-                <div class="feature-icon">⚙️</div>
-                <h3>Team Customization</h3>
-                <p>Configure machine dimensions, materials, and cutting parameters for your specific CNC setup.</p>
+                <p>Visualize your toolpaths in 3D before cutting. Orbit the view, scrub through moves, and animate the tool at adjustable speed.</p>
             </div>
 
             <div class="feature-card">
                 <div class="feature-icon">🔧</div>
-                <h3>Multi-Layer Support</h3>
-                <p>Create 2.5D parts with grooves, pockets, and countersinks at multiple depths.</p>
+                <h3>Multi-Layer (2.5D)</h3>
+                <p>Cut parts with grooves, pockets, countersinks, and raised bosses at multiple depths. Thickness is read straight from your CAD model.</p>
             </div>
 
             <div class="feature-card">
                 <div class="feature-icon">📦</div>
                 <h3>Tube Machining</h3>
-                <p>Special mode for cutting patterns on aluminum tubing, with automatic end squaring and mirroring.</p>
+                <p>Cut patterns on aluminum tubing, with automatic end squaring, cut-to-length, and mirrored or distinct patterns per face.</p>
+            </div>
+
+            <div class="feature-card">
+                <div class="feature-icon">⚙️</div>
+                <h3>Team Customization</h3>
+                <p>Configure machine dimensions, materials, and cutting parameters for your specific CNC setup with a simple config file.</p>
             </div>
         </div>
 
@@ -72,10 +78,11 @@
             <div class="step">
                 <div class="step-number">1</div>
                 <div class="step-content">
-                    <h3>Install Onshape App</h3>
+                    <h3>Install the Onshape App</h3>
                     <p>
                         Add PenguinCAM to your Onshape account from the
-                        <a href="https://cad.onshape.com/appstore/apps/CAM/6939eaf505d3df4aeac54600" target="_blank">Onshape App Store</a>
+                        <a href="https://cad.onshape.com/appstore/apps/CAM/6939eaf505d3df4aeac54600" target="_blank">Onshape App Store</a>.
+                        This docks a PenguinCAM panel to the side of your Onshape window.
                     </p>
                 </div>
             </div>
@@ -83,16 +90,24 @@
             <div class="step">
                 <div class="step-number">2</div>
                 <div class="step-content">
-                    <h3>Select a Face</h3>
-                    <p>In Onshape, open the PenguinCAM panel, then select the top face of your part and click "Send to PenguinCAM"</p>
+                    <h3>Set Up the Job</h3>
+                    <p>Open the panel and choose your machine, cutting mode (2D, 2.5D, or tubing), tool, and material.</p>
                 </div>
             </div>
 
             <div class="step">
                 <div class="step-number">3</div>
                 <div class="step-content">
-                    <h3>Generate G-code</h3>
-                    <p>Review parameters, preview the toolpath, and download your G-code program</p>
+                    <h3>Add Parts</h3>
+                    <p>Click a face in your Onshape model — it imports automatically. Add more faces to build a multi-part job, then arrange them on the stock.</p>
+                </div>
+            </div>
+
+            <div class="step">
+                <div class="step-number">4</div>
+                <div class="step-content">
+                    <h3>Preview &amp; Download</h3>
+                    <p>Review the 3D toolpath preview, then download your G-code program or save it straight to Google Drive.</p>
                 </div>
             </div>
         </div>
@@ -113,6 +128,16 @@
             </div>
         </div>
 
+        <div class="info-box">
+            <div class="info-icon">💡</div>
+            <div>
+                <strong>No Onshape? No problem.</strong> If you don't use Onshape, you can still run the full
+                workflow by uploading DXF files directly at
+                <a href="https://penguincam.popcornpenguins.com/app">penguincam.popcornpenguins.com/app</a>.
+                See <a href="usage.html">How to Use</a>.
+            </div>
+        </div>
+
         <h2>Support & Contact</h2>
 
         <p>
@@ -126,7 +151,7 @@
 
         <footer>
             <p>PenguinCAM is maintained by FRC Team 6238 Popcorn Penguins</p>
-            <p>Last Updated: January 2026</p>
+            <p>Last Updated: July 2026</p>
         </footer>
     </main>
 </body>
