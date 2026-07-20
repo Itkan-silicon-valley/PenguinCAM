@@ -15,6 +15,7 @@
         <a href="index.html">Introduction</a>
         <a href="usage.html" class="active">How to Use</a>
         <a href="configuration.html">Configuration</a>
+        <a href="feeds-speeds.html">Feeds &amp; Speeds</a>
         <a href="roadmap.html">Roadmap</a>
         <div class="nav-divider"></div>
         <a href="/" class="nav-external">← Back to App</a>
@@ -378,7 +379,16 @@
         </p>
 
         <h3>Multi-layer part has incorrect depths</h3>
-        <p>In 2.5D mode, thickness is read from your CAD part. If cut depths look wrong:</p>
+        <p>In 2.5D mode, depths are measured down from the top of the stock, so they only come out right if
+            the stock and the machine zero match your CAD. The two most common causes of wrong depths are:</p>
+        <ul>
+            <li><strong>Stock thickness doesn't match the CAD.</strong> Your physical stock must be the same
+            thickness as the part in Onshape. If it's thicker or thinner, every layer is off by that difference.</li>
+            <li><strong>Z=0 isn't set at the bottom of the stock.</strong> PenguinCAM cuts to Z=0 at the sacrifice
+            board, so set your machine's work zero at the <em>bottom</em> of the stock (top of the sacrifice board),
+            not the top surface.</li>
+        </ul>
+        <p>If the stock and machine zero are both correct but depths still look wrong:</p>
         <ul>
             <li>Check for unexpected faces at odd depths in your CAD</li>
             <li>Make sure you selected a face on the top-most layer of the part</li>
