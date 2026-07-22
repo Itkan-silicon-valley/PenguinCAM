@@ -306,8 +306,11 @@
     if (name === 'layout') {
       updateLayoutInfo();
       // Tubing shares one orientation across both faces; select them together so the
-      // rotation handle drives the whole tube at once.
-      if (state.mode === 'tubing') state.selectedIds = state.parts.map(function (p) { return p.id; });
+      // rotation handle drives the whole tube at once, and keep them packed tidily.
+      if (state.mode === 'tubing') {
+        restackTubeParts();
+        state.selectedIds = state.parts.map(function (p) { return p.id; });
+      }
       updateLayoutHint();
       resetHandleDir();
       refitView();
@@ -529,6 +532,20 @@
 
   /* -------------------------------------------------------------- layout */
   var canvasState = { scale: 1, wcx: 0, wcy: 0, ccx: 0, ccy: 0, action: null, handleDir: [0, 1] };
+
+  // Tube faces aren't positioned by the user (the backend ignores placement for tubes),
+  // so keep them tidy: left-to-right, bottom-aligned at Y=0, one kerf apart, using each
+  // face's current (rotated) footprint. Called after a tube rotation so the faces don't
+  // drift apart when they change orientation. Same stacking as addPartFromOutline.
+  function restackTubeParts() {
+    var x = 0;
+    state.parts.forEach(function (p) {
+      var s = placedShape(p);
+      p.cx = x + s.w / 2;
+      p.cy = s.h / 2;
+      x += s.w + state.tool_diameter;
+    });
+  }
 
   // Fit the parts' combined bounding box to ~80% of the canvas (times zoom), centered.
   // Called only on explicit events (entering Layout, zoom) — NOT every frame, so the
@@ -767,7 +784,16 @@
       drawLayout();
       e.preventDefault();
     }
-    function up() { canvasState.action = null; }
+    function up() {
+      // After rotating a tube, re-pack the faces adjacently so a horizontal→vertical
+      // flip doesn't leave them spread apart, then refit the view to the tidy bbox.
+      if (canvasState.action && canvasState.action.type === 'rotate' && state.mode === 'tubing') {
+        restackTubeParts();
+        refitView();
+        drawLayout();
+      }
+      canvasState.action = null;
+    }
     canvas.addEventListener('mousedown', down);
     window.addEventListener('mousemove', move);
     window.addEventListener('mouseup', up);
