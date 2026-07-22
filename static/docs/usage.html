@@ -68,7 +68,7 @@
                 </tr>
                 <tr>
                     <td><strong>3. Layout</strong></td>
-                    <td>Position, rotate, and flip parts on the stock sheet. (2D mode only.)</td>
+                    <td>Position, rotate, and flip parts on the stock sheet. In tubing mode, used to square the face(s) to the jig axis. (Skipped in 2.5D.)</td>
                 </tr>
                 <tr>
                     <td><strong>4. Preview &amp; Save</strong></td>
@@ -80,9 +80,9 @@
         <div class="info-box">
             <div class="info-icon">ℹ️</div>
             <div>
-                The Layout step only appears in <strong>2D mode</strong>. In <strong>2.5D</strong> and
-                <strong>Tubing</strong> modes the job is a single part, so the wizard goes straight from Parts
-                to Preview.
+                The Layout step is skipped in <strong>2.5D mode</strong> (a single part sits at the origin). It
+                appears in <strong>2D mode</strong> to nest parts on a sheet, and in <strong>Tubing mode</strong>
+                to orient the face(s) to the tube-jig axis.
             </div>
         </div>
 
@@ -309,6 +309,18 @@
             <li><strong>Two faces:</strong> Each side gets its own distinct pattern — useful when one side needs
             larger access holes for bolt heads.</li>
         </ul>
+
+        <div class="warning-box info-box">
+            <div class="info-icon">⚠️</div>
+            <div>
+                <strong>Align the face to the jig on the Layout step.</strong> Tubing has its own Layout step where
+                you rotate the face(s) so the tube runs <strong>vertically (the Y axis)</strong> — this must match
+                the axis of the tube jig on your CNC. Drag the round handle to rotate in 90° steps; both faces
+                rotate together, since they're opposite walls of the same tube. If the tube isn't aligned with the
+                jig axis, the pattern will be machined in the wrong orientation.
+            </div>
+        </div>
+
         <p>The program will:</p>
         <ul>
             <li>Face the first half of the tube,</li>

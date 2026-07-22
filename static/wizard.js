@@ -10,10 +10,11 @@
   var DEBUG = /(?:^|[?&])debug=1(?:&|$)/.test(location.search);
 
   var ALL_STEPS = ['setup', 'parts', 'layout', 'preview'];
-  // The step sequence is mode-dependent: tubing has no Layout step (a tube's two faces
-  // aren't laid out on a sheet).
+  // Every mode uses the Layout step. In 2D it nests parts on a sheet; in tubing it's
+  // used only to orient the face(s) to the tube-jig axis (see the tube handling in the
+  // rotate + validate paths below). 2.5D is a single part positioned at the origin.
   function steps() {
-    return state.mode === 'tubing' ? ['setup', 'parts', 'preview'] : ALL_STEPS;
+    return ALL_STEPS;
   }
 
   var state = {
@@ -199,6 +200,10 @@
   // and no two parts may overlap or sit closer than one kerf. Real-geometry overlap so
   // a part nesting into another's concave region isn't a false positive.
   function validateLayout() {
+    // Tubing isn't nested on a sheet: the two faces are opposite walls of one tube, so
+    // the machine-bounds and part-overlap checks don't apply. The Layout step exists
+    // only to orient the tube to the jig axis.
+    if (state.mode === 'tubing') return { bad: {}, msgs: [], tooBig: false, bbox: combinedBBox() };
     var msgs = [];
     var bad = {};
     var gap = state.tool_diameter;
@@ -298,7 +303,16 @@
     var isPreview = name === 'preview';
     nextBtn.hidden = isPreview;
     $('#final-action').hidden = !isPreview;
-    if (name === 'layout') { updateLayoutInfo(); resetHandleDir(); refitView(); drawLayout(); }
+    if (name === 'layout') {
+      updateLayoutInfo();
+      // Tubing shares one orientation across both faces; select them together so the
+      // rotation handle drives the whole tube at once.
+      if (state.mode === 'tubing') state.selectedIds = state.parts.map(function (p) { return p.id; });
+      updateLayoutHint();
+      resetHandleDir();
+      refitView();
+      drawLayout();
+    }
     if (isPreview) {
       state.saveAction = preferredAction();
       $('#btn-do').disabled = true;   // enabled once generation finishes
@@ -576,10 +590,11 @@
 
     var v = validateLayout();
     $('#layout-errors').textContent = v.msgs.join('\n');
-    // Flip is hidden in 2.5D: a mirror there isn't recoverable (features live at
-    // specific depths on one face), so flipping would cut a genuinely wrong part.
+    // Flip is hidden in 2.5D (a mirror isn't recoverable when features live at specific
+    // depths on one face) and in tubing (the opposite wall is handled server-side by
+    // mirroring the pattern, not by a user flip).
     var flipBtn = $('#btn-flip');
-    if (flipBtn) { flipBtn.hidden = state.mode === '2.5d'; flipBtn.disabled = state.selectedIds.length === 0; }
+    if (flipBtn) { flipBtn.hidden = (state.mode === '2.5d' || state.mode === 'tubing'); flipBtn.disabled = state.selectedIds.length === 0; }
 
     // Theme-aware colors (read the CSS variables so the canvas matches light/dark).
     var col = {
@@ -685,10 +700,13 @@
         var hg = selectionHandle(selBox);
         if (Math.hypot(c[0] - hg.hx, c[1] - hg.hy) <= 12) {
           var pivot = [(selBox.minX + selBox.maxX) / 2, (selBox.minY + selBox.maxY) / 2];
+          // Tubing rotates all faces together (they share one orientation on the jig),
+          // so snapshot every part, not just the selection.
+          var rotParts = state.mode === 'tubing' ? state.parts : selectedParts();
           canvasState.action = {
             type: 'rotate', pivot: pivot,
             refAngle: Math.atan2(w[1] - pivot[1], w[0] - pivot[0]),
-            snap: selectedParts().map(function (p) { return { p: p, cx: p.cx, cy: p.cy, rot: p.rotation }; })
+            snap: rotParts.map(function (p) { return { p: p, cx: p.cx, cy: p.cy, rot: p.rotation }; })
           };
           e.preventDefault();
           return;
@@ -727,14 +745,24 @@
         var hl = Math.hypot(w[0] - act.pivot[0], w[1] - act.pivot[1]) || 1;
         canvasState.handleDir = [(w[0] - act.pivot[0]) / hl, (w[1] - act.pivot[1]) / hl];
         var cwDeg = -(cur - act.refAngle) * 180 / Math.PI;  // clockwise-positive delta
-        var snapped = Math.round(cwDeg / 45) * 45;
-        if (Math.abs(snapped - cwDeg) <= 5) cwDeg = snapped;
-        act.snap.forEach(function (s) {
-          var vv = rotatePoint(s.cx - act.pivot[0], s.cy - act.pivot[1], cwDeg);
-          s.p.cx = act.pivot[0] + vv[0];
-          s.p.cy = act.pivot[1] + vv[1];
-          s.p.rotation = (((s.rot + cwDeg) % 360) + 360) % 360;
-        });
+        if (state.mode === 'tubing') {
+          // A tube must stay square to its jig: hard-snap to 90 deg (no free angle) and
+          // rotate every face in place about its own center so both walls keep the same
+          // orientation. Position is irrelevant for a tube, so there's no orbit.
+          cwDeg = Math.round(cwDeg / 90) * 90;
+          act.snap.forEach(function (s) {
+            s.p.rotation = (((s.rot + cwDeg) % 360) + 360) % 360;
+          });
+        } else {
+          var snapped = Math.round(cwDeg / 45) * 45;
+          if (Math.abs(snapped - cwDeg) <= 5) cwDeg = snapped;
+          act.snap.forEach(function (s) {
+            var vv = rotatePoint(s.cx - act.pivot[0], s.cy - act.pivot[1], cwDeg);
+            s.p.cx = act.pivot[0] + vv[0];
+            s.p.cy = act.pivot[1] + vv[1];
+            s.p.rotation = (((s.rot + cwDeg) % 360) + 360) % 360;
+          });
+        }
       }
       drawLayout();
       e.preventDefault();
@@ -748,7 +776,7 @@
     canvas.addEventListener('touchend', up);
 
     $('#btn-flip').addEventListener('click', function () {
-      if (state.mode === '2.5d') return;  // flip not allowed in 2.5D
+      if (state.mode === '2.5d' || state.mode === 'tubing') return;  // flip not allowed in 2.5D/tubing
       selectedParts().forEach(function (p) { p.flipped = !p.flipped; });
       drawLayout();
     });
@@ -760,6 +788,22 @@
     var el = $('#info-machine-name'); if (el) el.textContent = state.machine.name;
     el = $('#info-machine-size'); if (el) el.textContent = state.machine.width + '" x ' + state.machine.height + '"';
     el = $('#info-tool'); if (el) el.textContent = (+state.tool_diameter).toFixed(3) + '"';
+  }
+
+  // The Layout hint reads differently for tubing: there's no sheet to nest on — the
+  // step exists only to square the face(s) to the tube-jig axis (the machine's Y axis).
+  function updateLayoutHint() {
+    var el = $('#layout-hint');
+    if (!el) return;
+    if (state.mode === 'tubing') {
+      el.textContent = 'Drag the round handle to rotate the tube in 90 deg steps. ' +
+        'Orient each face so the tube runs vertically (the Y axis) — that is the axis of the ' +
+        'tube jig on the machine. Both faces rotate together.';
+    } else {
+      el.textContent = '↔ Widen the panel for easier layout. Click to select (Shift-click for multiple), ' +
+        'drag to move, drag the round handle to rotate (snaps to 45°). The dotted box is the stock; ' +
+        'its lower-left is the G54 origin.';
+    }
   }
 
   /* ------------------------------------------------------------- preview */
@@ -803,7 +847,9 @@
     fd.append('material', 'aluminum_tube');
     fd.append('tool_diameter', state.tool_diameter);
     fd.append('thickness', state.thickness);       // tube wall thickness
-    fd.append('rotation', 0);                       // no layout step in tubing mode
+    // Both faces share one orientation on the jig; the backend applies this single
+    // rotation to every face. Tube rotation is hard-snapped to 90 deg in the Layout step.
+    fd.append('rotation', ((Math.round((p.rotation || 0) / 90) * 90) % 360 + 360) % 360);
     fd.append('tube_height', state.tubeHeight);
     fd.append('square_end', state.squareEnd ? '1' : '0');
     fd.append('cut_to_length', state.cutToLength ? '1' : '0');
@@ -902,10 +948,12 @@
     }
     var W, D, stockH;
     if (state.mode === 'tubing') {
-      // A tube face, not a sheet: use the first face's dimensions and the tube height.
+      // A tube face, not a sheet: use the first face's placed (rotated) extents so the
+      // stock box matches the rotated G-code, plus the tube height for depth.
       var p0 = state.parts[0];
-      W = p0 ? p0.width : state.machine.width;
-      D = p0 ? p0.height : state.machine.height;
+      var s0 = p0 ? placedShape(p0) : null;
+      W = s0 ? s0.w : state.machine.width;
+      D = s0 ? s0.h : state.machine.height;
       stockH = state.tubeHeight;
     } else {
       var bb = combinedBBox();
