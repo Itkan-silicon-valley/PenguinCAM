@@ -3197,8 +3197,21 @@ class FRCPostProcessor:
         # Calculate stepover for pocket clearing
         stepover = self.tool_diameter * self.stepover_percentage
 
+        # A genuinely round pocket clears best with an Archimedean spiral (continuous
+        # engagement, no ring-closure reversals or radial link cuts). Only take this path
+        # when the pocket really is circular; everything else falls through to the
+        # general contour-parallel strategy, which handles arbitrary (e.g. slot-shaped)
+        # pockets that a circular spiral would leave uncleared in the corners.
+        circle = self._detect_solid_circle(pocket_poly)
+        if circle is not None:
+            final_radius = math.sqrt(offset_poly.area / math.pi)  # tool-center travel radius
+            if final_radius > 0.001:
+                gcode.extend(self._generate_circular_pocket_spiral(entry_x, entry_y, final_radius))
+                gcode.append(f"G0 Z{self.retract_height:.4f}  ; Retract")
+                return gcode
+
         # Always use contour-parallel clearing for reliable material removal
-        # (Previous circular spiral optimization left material in slot-shaped pockets)
+        # (a circular spiral would leave material in slot-shaped pockets)
         gcode.append(f"(Pocket clearing - using contour-parallel stepover passes)")
 
         # Generate inward offsets from perimeter to center
@@ -3253,8 +3266,10 @@ class FRCPostProcessor:
                 # Close the contour
                 gcode.append(f"G1 X{contour_points[0][0]:.4f} Y{contour_points[0][1]:.4f} F{self.feed_rate}")
 
-                # Return to center between passes for safety
-                gcode.append(f"G1 X{entry_x:.4f} Y{entry_y:.4f} F{self.feed_rate}")
+                # Step directly to the next (larger) ring's start instead of returning to
+                # center. Passes run center-outward with aligned start points, so the next
+                # pass's move-to-start is a clean one-stepover radial link through uncut
+                # material — no wasted in-and-out across the already-cleared interior.
 
         # Final pass - cut actual perimeter at exact size
         gcode.append(f"(Final pass: cut exact perimeter)")
@@ -3274,6 +3289,30 @@ class FRCPostProcessor:
         gcode.append(f"G0 Z{self.retract_height:.4f}  ; Retract")
 
         return gcode
+
+    def _detect_solid_circle(self, polygon: Polygon) -> Optional[Tuple[float, float, float]]:
+        """Return (cx, cy, radius) if the polygon is a solid circle, else None.
+
+        A solid circle has no interior holes and a circular exterior. Uses the same
+        isoperimetric quotient (4*pi*area/perimeter^2) and 0.95 threshold as
+        _detect_circular_ring, so the spiral clearing path is taken only when the
+        pocket is genuinely round.
+        """
+        if not isinstance(polygon, Polygon) or len(polygon.interiors) != 0:
+            return None
+
+        area = polygon.area
+        perimeter = polygon.exterior.length
+        if perimeter <= 0 or area <= 0:
+            return None
+
+        circularity = (4 * math.pi * area) / (perimeter ** 2)
+        if circularity < 0.95:
+            return None
+
+        centroid = polygon.centroid
+        radius = math.sqrt(area / math.pi)
+        return (centroid.x, centroid.y, radius)
 
     def _detect_circular_ring(self, polygon: Polygon) -> Optional[Tuple[float, float, float, float]]:
         """Check if a polygon with interiors is approximately a circular ring.
@@ -3364,7 +3403,7 @@ class FRCPostProcessor:
         num_helical_passes, depth_per_pass = self._calculate_helical_passes(
             entry_radius, ramp_start_height=ramp_start_height)
 
-        gcode.append(f"(Circular ring spiral clearing: center ({cx:.4f}, {cy:.4f}), "
+        gcode.append(f"(Circular ring spiral clearing: center {cx:.4f}, {cy:.4f}, "
                      f"outer r={outer_radius:.4f}, inner r={inner_radius:.4f})")
 
         # Position at entry point on ring circumference
@@ -3451,6 +3490,46 @@ class FRCPostProcessor:
 
         # Retract
         gcode.append(f"G0 Z{self.retract_height:.4f}  ; Retract")
+
+        return gcode
+
+    def _generate_circular_pocket_spiral(self, cx: float, cy: float,
+                                         final_radius: float) -> List[str]:
+        """Clear a solid circular pocket with an Archimedean spiral from the center out.
+
+        Assumes the helical entry at the center has already reached full depth (the tool
+        is at the pocket center). Spirals outward at one stepover per revolution to
+        final_radius (the tool-center travel radius), then a finish circle plus spring
+        pass at the wall. Continuous engagement, so no ring-closure reversals or radial
+        link cuts. CCW throughout = climb milling for an interior pocket.
+        """
+        gcode = []
+        stepover = self.tool_diameter * self.stepover_percentage
+
+        gcode.append("(Circular pocket - Archimedean spiral clearing)")
+
+        # Archimedean spiral r = spiral_constant * theta, growing one stepover per turn.
+        spiral_constant = stepover / (2 * math.pi)
+        if spiral_constant > 0:
+            total_angle = final_radius / spiral_constant
+            angle_increment = math.radians(10)
+            num_points = int(math.ceil(total_angle / angle_increment))
+            gcode.append(f"(Spiral outward: {num_points} points from center to r={final_radius:.4f})")
+            for i in range(num_points + 1):
+                current_angle = i * angle_increment
+                current_radius = min(spiral_constant * current_angle, final_radius)
+                x = cx + current_radius * math.cos(current_angle)
+                y = cy + current_radius * math.sin(current_angle)
+                gcode.append(f"G1 X{x:.4f} Y{y:.4f} F{self.feed_rate}")
+
+        # Finish circle at the wall (exact size), then a zero-stepover spring pass to
+        # relieve tool deflection. G3/CCW = climb on the interior wall.
+        wall_x = cx + final_radius
+        wall_y = cy
+        gcode.append(f"G1 X{wall_x:.4f} Y{wall_y:.4f} F{self.feed_rate}  ; Move to wall radius")
+        gcode.append(f"G3 X{wall_x:.4f} Y{wall_y:.4f} I{-final_radius:.4f} J0 F{self.feed_rate}  ; Finish circle, CCW climb")
+        gcode.append(f"(Spring pass - compensate for tool deflection)")
+        gcode.append(f"G3 X{wall_x:.4f} Y{wall_y:.4f} I{-final_radius:.4f} J0 F{self.feed_rate}  ; Spring pass")
 
         return gcode
 
