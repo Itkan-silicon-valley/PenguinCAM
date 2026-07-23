@@ -22,6 +22,7 @@ from typing import List, Tuple, Optional, Dict, Any
 import ezdxf
 from shapely import affinity
 from shapely.geometry import Point, Polygon, LineString, LinearRing, MultiPolygon
+from shapely.geometry.polygon import orient
 from shapely.ops import unary_union, linemerge
 
 # Local modules
@@ -3153,8 +3154,12 @@ class FRCPostProcessor:
             self._add_error(error_msg)
             return gcode
 
-        # Get the boundary of the offset polygon
+        # Get the boundary of the offset polygon. GEOS buffer() does NOT reliably orient
+        # its output (it returns CW exteriors here), so normalize to canonical orientation
+        # (exterior CCW) explicitly: cutting an interior pocket CCW is climb milling, matching
+        # the CCW helical entry and hole toolpaths.
         if hasattr(offset_poly, 'exterior'):
+            offset_poly = orient(offset_poly, 1.0)
             offset_points = list(offset_poly.exterior.coords)[:-1]  # Remove duplicate last point
         else:
             center_x, center_y = self._get_polygon_center(pocket_poly)
@@ -3229,6 +3234,8 @@ class FRCPostProcessor:
                 if not hasattr(poly, 'exterior'):
                     continue
 
+                # Canonical orientation (exterior CCW) = climb milling for interior pockets.
+                poly = orient(poly, 1.0)
                 contour_points = list(poly.exterior.coords)[:-1]
                 if len(contour_points) < 3:
                     continue
@@ -3593,6 +3600,8 @@ class FRCPostProcessor:
                 if not hasattr(poly_to_cut, 'exterior'):
                     continue
 
+                # Canonical orientation (exterior CCW) = climb milling for interior pockets.
+                poly_to_cut = orient(poly_to_cut, 1.0)
                 contour_coords = list(poly_to_cut.exterior.coords)
                 if len(contour_coords) < 3:
                     continue
@@ -3604,7 +3613,11 @@ class FRCPostProcessor:
                 for point in contour_coords[1:]:
                     gcode.append(f"G1 X{point[0]:.4f} Y{point[1]:.4f} F{self.feed_rate}")
 
-        # Final pass - trace tool-compensated boundary (exterior + interiors)
+        # Final pass - trace tool-compensated boundary (exterior + interiors). Canonical
+        # orientation makes the exterior CCW (climb around the pocket wall) and interiors CW
+        # (climb around any island), matching the CCW hole/helical toolpaths.
+        if isinstance(offset_poly, Polygon):
+            offset_poly = orient(offset_poly, 1.0)
         exterior_coords = list(offset_poly.exterior.coords)[:-1]
         if len(exterior_coords) >= 3:
             pass_number += 1
@@ -3694,9 +3707,11 @@ class FRCPostProcessor:
 
         # Get the boundary of the offset polygon
         if hasattr(offset_poly, 'exterior'):
+            # GEOS buffer() does NOT reliably orient its output, so normalize to canonical
+            # orientation (exterior CCW) explicitly. CCW = climb for an interior pocket;
+            # reverse to CW for climb on an outside feature (perimeter).
+            offset_poly = orient(offset_poly, 1.0)
             offset_points = list(offset_poly.exterior.coords)[:-1]  # Remove duplicate last point
-            # Set direction based on clockwise parameter
-            # Default order from Shapely is CCW, so reverse for CW
             if clockwise:
                 offset_points = offset_points[::-1]
         else:
