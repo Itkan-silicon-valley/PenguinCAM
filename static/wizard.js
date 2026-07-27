@@ -884,6 +884,24 @@
     return submitToProcess(fd, 'tube');
   }
 
+  // Filename base for a multi-part job: the distinct part names joined with "_", capped
+  // in length so a big nest doesn't produce an absurd filename (extra names collapse to
+  // "+N"). One part -> just its name; no parts -> "job". The timestamp is appended server
+  // side, matching the single-part (2.5D/tube) paths that send suggested_filename=p.name.
+  function jobFilename() {
+    var names = [];
+    state.parts.forEach(function (p) { if (names.indexOf(p.name) < 0) names.push(p.name); });
+    if (!names.length) return 'job';
+    var CAP = 64, kept = [], used = 0;
+    for (var i = 0; i < names.length; i++) {
+      var addLen = (kept.length ? 1 : 0) + names[i].length;
+      if (kept.length && used + addLen > CAP) break;
+      kept.push(names[i]); used += addLen;
+    }
+    var remaining = names.length - kept.length;
+    return kept.join('_') + (remaining > 0 ? '+' + remaining : '');
+  }
+
   function generateJob() {
     var fd = new FormData();
     // The parts' combined bounding box is the stock; its lower-left is the G54 origin,
@@ -893,7 +911,7 @@
       material: state.material, tool_diameter: state.tool_diameter,
       thickness: state.thickness, tab_spacing: state.tab_spacing,
       stock: { width: bb.w, height: bb.h },
-      name: 'job', parts: [],
+      name: jobFilename(), parts: [],
     };
     state.parts.forEach(function (p, i) {
       var pl = placement(p);
