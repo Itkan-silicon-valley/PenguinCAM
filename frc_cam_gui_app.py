@@ -84,7 +84,7 @@ from frc_cam_postprocessor import (
 )
 
 # Import team config management
-from team_config import TeamConfig
+from team_config import TeamConfig, DEFAULT_TOOL_DIAMETER_IN
 
 # ============================================================================
 # File Token Manager - Secure file access with random tokens
@@ -343,7 +343,8 @@ def _app_template_context():
     drive_enabled = team_config_dict.get('google_drive_enabled', False)
     # Use `or` (not .get default) so an explicit None in the config doesn't render as
     # the string "None" into a numeric <input value="...">.
-    default_tool_diameter = team_config_dict.get('default_tool_diameter') or 0.157
+    default_tool_diameter = team_config_dict.get('default_tool_diameter') or DEFAULT_TOOL_DIAMETER_IN
+    default_tool_diameter_text = team_config_dict.get('default_tool_diameter_text') or '4mm'
     machine_x_max = team_config_dict.get('machine_x_max') or 48.0
     machine_y_max = team_config_dict.get('machine_y_max') or 96.0
 
@@ -363,6 +364,7 @@ def _app_template_context():
         'team_name': team_name,
         'drive_enabled': drive_enabled,
         'default_tool_diameter': default_tool_diameter,
+        'default_tool_diameter_text': default_tool_diameter_text,
         'machine_x_max': machine_x_max,
         'machine_y_max': machine_y_max,
         'using_default_config': session.get('using_default_config', False),
@@ -604,7 +606,7 @@ def process_file():
         elif material.lower() == 'polycarb':
             material = 'polycarbonate'
 
-        tool_diameter = float(request.form.get('tool_diameter', 0.157))
+        tool_diameter = float(request.form.get('tool_diameter', DEFAULT_TOOL_DIAMETER_IN))
         origin_corner = request.form.get('origin_corner', 'bottom-left')
         rotation = int(request.form.get('rotation', 0))
         mirror = request.form.get('mirror', '0') == '1'  # "flip over" (horizontal mirror)
@@ -866,7 +868,7 @@ def process_job():
             material = 'polycarbonate'
         elif str(material).lower() == 'aluminum_tube':
             material = 'aluminum'
-        tool_diameter = float(job.get('tool_diameter', 0.157))
+        tool_diameter = float(job.get('tool_diameter', DEFAULT_TOOL_DIAMETER_IN))
         thickness = float(job.get('thickness', 0.25))
         tab_spacing = float(job.get('tab_spacing', 6.0))
         machine_id = job.get('machine_id')

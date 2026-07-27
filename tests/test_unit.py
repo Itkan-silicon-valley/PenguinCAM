@@ -14,7 +14,49 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from frc_cam_postprocessor import (
     FRCPostProcessor, MATERIAL_PRESETS, assemble_job_gcode, validate_job_layout,
 )
-from team_config import TeamConfig
+from team_config import TeamConfig, parse_length, DEFAULT_TOOL_DIAMETER_IN
+
+
+class TestLengthParsing(unittest.TestCase):
+    """Config/UI length values may carry a unit (metric or SAE); parse to inches."""
+
+    def test_units_and_forms(self):
+        self.assertAlmostEqual(parse_length('4mm'), 4 / 25.4)
+        self.assertAlmostEqual(parse_length('0.25"'), 0.25)
+        self.assertAlmostEqual(parse_length('1/8'), 0.125)      # SAE fraction
+        self.assertAlmostEqual(parse_length('1/4"'), 0.25)
+        self.assertAlmostEqual(parse_length('3 cm'), 3 / 2.54)
+        self.assertAlmostEqual(parse_length('1ft'), 12.0)
+        self.assertEqual(parse_length(0.157), 0.157)            # number -> inches
+        self.assertAlmostEqual(parse_length('-3mm'), -3 / 25.4)  # negatives allowed (config offsets)
+
+    def test_rejects_non_lengths(self):
+        for bad in ('Aluminum', 'G54', '', 'abc', '4mmm', '1/0', None, True):
+            self.assertIsNone(parse_length(bad))
+
+    def test_config_normalizes_dimension_strings(self):
+        cfg = {'version': 2, 'default_machine': 'm1', 'machines': {'m1': {
+            'name': 'M1',
+            'default_tool': {'diameter': '1/8"'},
+            'machine': {'dimensions': {'x_max': '600mm', 'y_max': 24.0},
+                        'park_position': {'z': '-3mm'}},
+            'machining': {'tabs': {'width': '6mm'}},
+            'materials': {'aluminum': {'name': '6061', 'feed_rate': 55.0, 'tab_width': '5mm'}},
+        }}}
+        t = TeamConfig(cfg)
+        d = t.to_dict('m1')
+        self.assertAlmostEqual(d['machine_x_max'], 600 / 25.4)          # mm -> in
+        self.assertAlmostEqual(d['default_tool_diameter'], 0.125)        # 1/8"
+        self.assertEqual(d['default_tool_diameter_text'], '1/8"')        # display text preserved
+        self.assertAlmostEqual(t.machine_park_z, -3 / 25.4)             # negative offset
+        self.assertAlmostEqual(t.tab_width, 6 / 25.4)
+        self.assertEqual(t.get_material_preset('aluminum', 'm1')['name'], '6061')  # name NOT parsed
+        self.assertEqual(cfg['machines']['m1']['machine']['dimensions']['x_max'], '600mm')  # input unmutated
+
+    def test_default_tool_is_4mm(self):
+        d = TeamConfig().to_dict()
+        self.assertAlmostEqual(d['default_tool_diameter'], DEFAULT_TOOL_DIAMETER_IN)
+        self.assertEqual(d['default_tool_diameter_text'], '4mm')
 
 
 class TestLowLevelUtilities(unittest.TestCase):

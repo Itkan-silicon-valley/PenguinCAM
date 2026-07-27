@@ -109,7 +109,7 @@ html, body {
 .field.inline { display: flex; align-items: center; gap: 8px; }
 .field.inline > span { margin: 0; }
 
-input[type="number"], select {
+input[type="number"], input[type="text"], select {
   width: 100%;
   padding: 8px;
   background: var(--panel-2);
@@ -118,7 +118,8 @@ input[type="number"], select {
   color: var(--ink);
   font: inherit;
 }
-.field.inline input[type="number"] { width: 90px; }
+input.invalid { border-color: var(--danger); }
+.field.inline input[type="number"], .field.inline input[type="text"] { width: 90px; }
 
 fieldset.field { border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; }
 .radio { display: block; color: var(--ink); margin: 4px 0; font-size: 13px; }

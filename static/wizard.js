@@ -6,7 +6,7 @@
 (function () {
   'use strict';
 
-  var CFG = window.PenguinCAM || { source: 'upload', bed: { width: 24, height: 24 }, defaultTool: 0.157 };
+  var CFG = window.PenguinCAM || { source: 'upload', bed: { width: 24, height: 24 }, defaultTool: 0.157, defaultToolText: '4mm' };
   var DEBUG = /(?:^|[?&])debug=1(?:&|$)/.test(location.search);
 
   var ALL_STEPS = ['setup', 'parts', 'layout', 'preview'];
@@ -24,10 +24,13 @@
     machine_id: null,
     material: 'plywood',
     tool_diameter: parseFloat(CFG.defaultTool) || 0.157,
+    tool_diameter_text: CFG.defaultToolText || '4mm',  // user's raw input, shown verbatim (e.g. "4mm")
     thickness: 0.25,
+    thickness_text: '0.25"',
     tab_spacing: 6.0,
     // Tubing-only settings.
     tubeHeight: 1.0,
+    tubeHeight_text: '1"',
     squareEnd: false,
     cutToLength: false,
     // The machine envelope is a read-only constraint; the parts' combined bounding box
@@ -47,6 +50,63 @@
   function $(sel, root) { return (root || document).querySelector(sel); }
   function $all(sel, root) { return Array.prototype.slice.call((root || document).querySelectorAll(sel)); }
   function cssVar(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
+
+  // Parse an Onshape-style length: a number with an optional unit; no unit means inches
+  // (this app is inch-native). Returns the value in inches, or null if unparseable.
+  // Inspired by frcdesign/FRCDesignApp's input-parser (github.com/frcdesign/FRCDesignApp).
+  var LENGTH_TO_INCH = {
+    '': 1, 'in': 1, 'inch': 1, 'inches': 1, '"': 1,
+    'mm': 1 / 25.4, 'millimeter': 1 / 25.4, 'millimeters': 1 / 25.4,
+    'cm': 1 / 2.54, 'centimeter': 1 / 2.54, 'centimeters': 1 / 2.54,
+    'm': 1 / 0.0254, 'meter': 1 / 0.0254, 'meters': 1 / 0.0254,
+    'ft': 12, 'foot': 12, 'feet': 12, "'": 12,
+    'yd': 36, 'yard': 36, 'yards': 36,
+  };
+  function parseLength(text) {
+    if (text == null) return null;
+    var s = String(text).trim().toLowerCase();
+    var value, rest;
+    var frac = s.match(/^([+-]?\d+)\s*\/\s*(\d+)\s*(.*)$/);   // fractions (e.g. 1/8", common for SAE tools)
+    if (frac) {
+      var den = parseFloat(frac[2]);
+      if (!den) return null;
+      value = parseFloat(frac[1]) / den; rest = frac[3];
+    } else {
+      var dec = s.match(/^([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*(.*)$/);
+      if (!dec) return null;
+      value = parseFloat(dec[1]); rest = dec[2];
+    }
+    var factor = LENGTH_TO_INCH[rest.trim()];
+    if (!isFinite(value) || factor == null) return null;
+    var inches = value * factor;
+    return inches > 0 ? inches : null;
+  }
+
+  // Wire a text input as an Onshape-style length field. Parses units live; on commit a
+  // bare number/fraction gets the implied inch mark (never converts between unit systems,
+  // so "4mm" stays "4mm"); invalid input is flagged and reverted on blur. onValid(inches,
+  // text) is called with each accepted value; getText() returns the last valid text (for
+  // revert). Shared by the tool-diameter and thickness fields.
+  function bindLengthField(input, getText, onValid) {
+    if (!input) return;
+    function commit(raw) {
+      raw = raw.trim();
+      if (/^[+-]?[0-9.\/\s]+$/.test(raw)) raw += '"';   // bare number/fraction -> implied inch mark
+      onValid(parseLength(raw), raw);
+      input.value = raw;
+    }
+    if (parseLength(input.value)) commit(input.value);   // adopt the rendered default/config value
+    input.addEventListener('input', function () {
+      var inches = parseLength(this.value);
+      if (inches) { onValid(inches, this.value.trim()); this.classList.remove('invalid'); }
+      else { this.classList.add('invalid'); }            // keep last valid value; flag bad text
+    });
+    input.addEventListener('change', function () {
+      this.classList.remove('invalid');
+      if (parseLength(this.value)) commit(this.value);
+      else { this.value = getText(); }                   // revert unparseable input on blur
+    });
+  }
 
   // Apply light/dark theme (tied to Onshape's theme). The server sets it on <html> at
   // render; this handles live changes if Onshape posts a theme update while open.
@@ -244,14 +304,14 @@
     var chips = [];
     if (state.mode === 'tubing') {
       chips.push('Aluminum Tube');
-      chips.push(state.thickness + '" wall');
-      chips.push('tube ' + (+state.tubeHeight).toFixed(3) + '" tall');
+      chips.push(state.thickness_text + ' wall');
+      chips.push('tube ' + state.tubeHeight_text + ' tall');
     } else {
       var msel = $('#f-material');
       chips.push(msel && msel.options[msel.selectedIndex] ? msel.options[msel.selectedIndex].text : state.material);
-      chips.push(state.mode === '2.5d' ? '2.5D · thickness from CAD' : (state.thickness + '" thick'));
+      chips.push(state.mode === '2.5d' ? '2.5D · thickness from CAD' : (state.thickness_text + ' thick'));
     }
-    chips.push('⌀ ' + (+state.tool_diameter).toFixed(3) + '" tool');
+    chips.push('⌀ ' + state.tool_diameter_text + ' tool');
     if (state.mode === 'tubing') {
       chips.push(state.parts.length + ' face' + (state.parts.length === 1 ? '' : 's'));
     } else {
@@ -376,10 +436,16 @@
       });
     });
 
-    $('#f-tool').addEventListener('input', function () { state.tool_diameter = parseFloat(this.value) || state.tool_diameter; });
+    bindLengthField($('#f-tool'),
+      function () { return state.tool_diameter_text; },
+      function (inches, text) { state.tool_diameter = inches; state.tool_diameter_text = text; });
+    bindLengthField($('#f-thickness'),
+      function () { return state.thickness_text; },
+      function (inches, text) { state.thickness = inches; state.thickness_text = text; });
     $('#f-material').addEventListener('change', function () { if (state.mode !== 'tubing') state.material = this.value; });
-    $('#f-thickness').addEventListener('input', function () { state.thickness = parseFloat(this.value) || state.thickness; });
-    $('#f-tube-height').addEventListener('input', function () { state.tubeHeight = parseFloat(this.value) || state.tubeHeight; });
+    bindLengthField($('#f-tube-height'),
+      function () { return state.tubeHeight_text; },
+      function (inches, text) { state.tubeHeight = inches; state.tubeHeight_text = text; });
     $('#f-square-end').addEventListener('change', function () { state.squareEnd = this.checked; });
     $('#f-cut-to-length').addEventListener('change', function () { state.cutToLength = this.checked; });
     applyModeUI();
@@ -393,7 +459,7 @@
     var isTube = state.mode === 'tubing';
     $('#thickness-field').style.display = is25 ? 'none' : '';
     $('#thickness-derived').style.display = is25 ? '' : 'none';
-    var tl = $('#thickness-label'); if (tl) tl.textContent = isTube ? 'Tube wall thickness (in)' : 'Material thickness (in)';
+    var tl = $('#thickness-label'); if (tl) tl.textContent = isTube ? 'Tube wall thickness (in or mm)' : 'Material thickness (in or mm)';
     var mf = $('#material-field'); if (mf) mf.style.display = isTube ? 'none' : '';
     if (isTube) {
       state.material = 'aluminum_tube';
@@ -458,7 +524,10 @@
     // In 2.5D the thickness is derived from the CAD layers server-side (the field
     // is hidden in the UI). Adopt it so the summary/preview show the real value;
     // the G-code path re-derives it from the DXF regardless.
-    if (state.mode === '2.5d' && data.thickness) state.thickness = data.thickness;
+    if (state.mode === '2.5d' && data.thickness) {
+      state.thickness = data.thickness;
+      state.thickness_text = (Math.round(data.thickness * 10000) / 10000) + '"';   // derived from CAD, shown in inches
+    }
     var p = {
       id: ++partSeq,
       name: data.name || ('part ' + (partSeq)),
@@ -837,7 +906,7 @@
   function updateLayoutInfo() {
     var el = $('#info-machine-name'); if (el) el.textContent = state.machine.name;
     el = $('#info-machine-size'); if (el) el.textContent = state.machine.width + '" x ' + state.machine.height + '"';
-    el = $('#info-tool'); if (el) el.textContent = (+state.tool_diameter).toFixed(3) + '"';
+    el = $('#info-tool'); if (el) el.textContent = state.tool_diameter_text;
   }
 
   // The Layout hint reads differently for tubing: there's no sheet to nest on — the

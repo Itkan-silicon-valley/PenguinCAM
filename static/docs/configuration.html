@@ -86,6 +86,19 @@
 
         <h2>Configuration Structure</h2>
 
+        <div class="info-box">
+            <div class="info-icon">📏</div>
+            <div>
+                <strong>Units:</strong> Dimension values default to <strong>inches</strong>, but you can add a
+                unit to any dimension &mdash; quote it so YAML reads it as text:
+                <code>diameter: "4mm"</code>, <code>x_max: "1200mm"</code>, <code>width: "0.25in"</code>, or a
+                fraction like <code>"1/8"</code>. Supported units: <code>in</code>/<code>"</code>,
+                <code>mm</code>, <code>cm</code>, <code>m</code>, <code>ft</code>/<code>'</code>, <code>yd</code>.
+                A plain number (no unit) is inches. Non-dimension values (feed rates, RPM, angles, ratios) are
+                always plain numbers.
+            </div>
+        </div>
+
         <h3>Team Information</h3>
         <p>
             Identify your team. This appears in logs and helps us provide support:
@@ -159,10 +172,12 @@
 
         <h3>Default Tool</h3>
         <p>
-            Set the default tool diameter that appears when loading a new part:
+            Set the default tool diameter that appears when loading a new part. You can specify it in metric or
+            inches (see the Units note above); it's shown in the UI exactly as written. If omitted, the
+            default is <code>4mm</code>.
         </p>
         <pre><code>default_tool:
-  diameter: 0.157    # 4mm end mill</code></pre>
+  diameter: "4mm"    # or "1/8", or a plain number in inches (0.157)</code></pre>
 
         <h3>Z-Axis Reference System</h3>
         <p>

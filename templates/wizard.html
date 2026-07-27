@@ -61,8 +61,9 @@
                 </fieldset>
 
                 <label class="field">
-                    <span>Tool diameter (in)</span>
-                    <input type="number" id="f-tool" step="0.001" min="0.01" value="{{ default_tool_diameter }}">
+                    <span>Tool diameter (in or mm)</span>
+                    <input type="text" id="f-tool" inputmode="text" autocomplete="off" spellcheck="false"
+                           placeholder='e.g. 0.157" or 4mm' value="{{ default_tool_diameter_text }}">
                 </label>
 
                 <label class="field" id="material-field">
@@ -75,8 +76,9 @@
                 </label>
 
                 <label class="field" id="thickness-field">
-                    <span id="thickness-label">Material thickness (in)</span>
-                    <input type="number" id="f-thickness" step="0.001" min="0.01" value="0.25">
+                    <span id="thickness-label">Material thickness (in or mm)</span>
+                    <input type="text" id="f-thickness" inputmode="text" autocomplete="off" spellcheck="false"
+                           placeholder='e.g. 0.25" or 6mm' value="0.25">
                 </label>
                 <p class="hint" id="thickness-derived" style="display:none">
                     Thickness is derived from the CAD part in 2.5D mode.
@@ -85,8 +87,9 @@
                 <!-- Tubing-only settings (shown when mode = tubing). -->
                 <div id="tube-fields" hidden>
                     <label class="field">
-                        <span>Tube height (in)</span>
-                        <input type="number" id="f-tube-height" step="0.001" min="0.01" value="1.0">
+                        <span>Tube height (in or mm)</span>
+                        <input type="text" id="f-tube-height" inputmode="text" autocomplete="off" spellcheck="false"
+                               placeholder='e.g. 1" or 25mm' value="1.0">
                     </label>
                     <label class="field inline">
                         <input type="checkbox" id="f-square-end">
@@ -212,6 +215,7 @@
         bed: { width: {{ machine_x_max|tojson }}, height: {{ machine_y_max|tojson }} },
         machineName: {{ ((machines.get(current_machine_id) or {}).get('name') or 'Machine')|tojson }},
         defaultTool: {{ default_tool_diameter|tojson }},
+        defaultToolText: {{ (default_tool_diameter_text if default_tool_diameter_text is defined else '4mm')|tojson }},
         driveEnabled: {{ (drive_enabled if drive_enabled is defined else False)|tojson }},
       };
     </script>

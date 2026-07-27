@@ -6,8 +6,97 @@ stored in Onshape documents. Falls back to Team 6238 defaults if config
 is missing or incomplete.
 """
 
+import copy
+import re
 import yaml
 from typing import Optional, Dict, Any
+
+
+# =============================================================================
+# LENGTH PARSING (units in config values)
+# =============================================================================
+# PenguinCAM is inch-native, but config values may carry a unit so metric and SAE
+# tooling can be expressed naturally (e.g. "4mm", '0.25"', "1/8", "3 cm"). Numbers are
+# treated as inches. Mirrors the client-side parser in static/wizard.js.
+
+_LENGTH_TO_INCH = {
+    '': 1.0, 'in': 1.0, 'inch': 1.0, 'inches': 1.0, '"': 1.0,
+    'mm': 1 / 25.4, 'millimeter': 1 / 25.4, 'millimeters': 1 / 25.4,
+    'cm': 1 / 2.54, 'centimeter': 1 / 2.54, 'centimeters': 1 / 2.54,
+    'm': 1 / 0.0254, 'meter': 1 / 0.0254, 'meters': 1 / 0.0254,
+    'ft': 12.0, 'foot': 12.0, 'feet': 12.0, "'": 12.0,
+    'yd': 36.0, 'yard': 36.0, 'yards': 36.0,
+}
+_FRACTION_RE = re.compile(r'^([+-]?\d+)\s*/\s*(\d+)\s*(.*)$')
+_DECIMAL_RE = re.compile(r'^([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*(.*)$')
+
+# Default tool when a config doesn't specify one: 4mm end mill (in inches).
+DEFAULT_TOOL_DIAMETER_IN = 4.0 / 25.4
+
+# Leaf keys whose values are lengths and may therefore be given as unit strings. Only
+# these are converted during config normalization, so material names, work offsets, feed
+# rates, angles, and ratios are never misinterpreted. 'diameter' is intentionally absent:
+# the default_tool_diameter properties parse it directly so the raw text stays available
+# for display.
+LENGTH_KEYS = frozenset({
+    'x_max', 'y_max', 'z_max',                                   # machine.dimensions
+    'x', 'y', 'z',                                               # machine.park_position
+    'sacrifice_board_depth', 'clearance_height', 'safe_height',  # machining.z_reference
+    'width', 'height', 'spacing',                               # machining.tabs
+    'depth_margin', 'max_roughing_depth', 'max_finishing_depth',  # tube_facing
+    'roughing_tool_edge', 'finishing_tool_edge', 'arc_advance', 'arc_radius',
+    'ramp_start_clearance', 'max_slotting_depth', 'peck_drill_depth',  # materials
+    'tab_width', 'tab_height',
+})
+
+
+def parse_length(value):
+    """Parse a possibly-unit-bearing length into inches, or None if unparseable.
+
+    Numbers pass through as inches. Strings may use mm/cm/m/in/"/ft/'/yd, plain numbers,
+    or fractions (e.g. "1/8"); no unit means inches. Negative values are allowed because
+    some config offsets (park Z, tube-facing edges) are legitimately negative.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    s = str(value).strip().lower()
+    if not s:
+        return None
+    m = _FRACTION_RE.match(s)
+    if m:
+        denom = float(m.group(2))
+        if denom == 0:
+            return None
+        number = float(m.group(1)) / denom
+        unit = m.group(3).strip()
+    else:
+        m = _DECIMAL_RE.match(s)
+        if not m:
+            return None
+        number = float(m.group(1))
+        unit = m.group(2).strip()
+    factor = _LENGTH_TO_INCH.get(unit)
+    if factor is None:
+        return None
+    return number * factor
+
+
+def _normalize_lengths(node):
+    """Recursively convert unit-string length values (on LENGTH_KEYS) to inch floats,
+    in place. Numbers and non-length strings are left untouched."""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if isinstance(value, (dict, list)):
+                _normalize_lengths(value)
+            elif isinstance(value, str) and key in LENGTH_KEYS:
+                parsed = parse_length(value)
+                if parsed is not None:
+                    node[key] = parsed
+    elif isinstance(node, list):
+        for item in node:
+            _normalize_lengths(item)
 
 
 # =============================================================================
@@ -60,7 +149,7 @@ TEAM_6238_DEFAULTS = {
             'contour_threshold': 510
         },
         'default_tool': {
-            'diameter': 0.157  # 4mm end mill
+            'diameter': '4mm'  # default when unspecified; parsed to inches for machining
         }
     },
     'tube_facing': {
@@ -159,8 +248,12 @@ class TeamConfig:
         if config_data is None:
             config_data = {}
 
-        # Normalize to v2 structure internally for consistent API
-        self._data = self._normalize_to_v2(config_data)
+        # Normalize to v2 structure internally for consistent API. Deep-copy first so we
+        # never mutate the caller's dict (e.g. the session config), then convert any
+        # unit-string length values (e.g. "4mm") to inch floats so all downstream readers
+        # see plain numbers.
+        self._data = copy.deepcopy(self._normalize_to_v2(config_data))
+        _normalize_lengths(self._data)
 
     def _normalize_to_v2(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -423,10 +516,34 @@ class TeamConfig:
         """Minimum hole diameter as multiple of tool diameter"""
         return self._get('machining', 'holes', 'min_millable_multiplier')
 
+    def _raw_default_tool_diameter(self, machine_id: Optional[str] = None):
+        """Raw default-tool diameter (may be a unit string). Checked at the machine top
+        level (where the config docs/template put `default_tool`) and then nested under
+        `machining` (the defaults location), falling back to the 6238 default."""
+        machine_config = self.get_machine_config(machine_id)
+        for path in (('default_tool', 'diameter'), ('machining', 'default_tool', 'diameter')):
+            value = machine_config
+            for key in path:
+                value = value.get(key) if isinstance(value, dict) else None
+                if value is None:
+                    break
+            if value is not None:
+                return value
+        return TEAM_6238_DEFAULTS['machining']['default_tool']['diameter']
+
     @property
     def default_tool_diameter(self) -> float:
-        """Default tool diameter (inches) - used as UI default"""
-        return self._get('machining', 'default_tool', 'diameter')
+        """Default tool diameter in inches - used as UI default. Accepts a unit string
+        (e.g. "4mm") or a number; falls back to 4mm if missing or unparseable."""
+        parsed = parse_length(self._raw_default_tool_diameter())
+        return parsed if parsed and parsed > 0 else DEFAULT_TOOL_DIAMETER_IN
+
+    @property
+    def default_tool_diameter_text(self) -> str:
+        """Default tool diameter as the raw display text (e.g. "4mm"), so the UI can show
+        it verbatim instead of a translated inch value. Bare numbers get an inch mark."""
+        raw = self._raw_default_tool_diameter()
+        return raw if isinstance(raw, str) else f'{raw}"'
 
     # ========================================================================
     # Tube Facing Parameters
@@ -604,6 +721,10 @@ class TeamConfig:
                 value = fallback if fallback is not None else default
             return value
 
+        # Tool diameter for this machine: parse to inches, and keep the raw text for the
+        # UI to show verbatim (e.g. "4mm"). Falls back to 4mm via TEAM_6238_DEFAULTS.
+        raw_tool = self._raw_default_tool_diameter(machine_id)
+        tool_in = parse_length(raw_tool)
         return {
             'team_number': self.team_number,
             'team_name': self.team_name,
@@ -614,7 +735,8 @@ class TeamConfig:
             'machine_z_max': get_machine_setting('machine', 'dimensions', 'z_max'),
             'google_drive_enabled': get_machine_setting('integrations', 'google_drive', 'enabled'),
             'google_drive_folder_id': get_machine_setting('integrations', 'google_drive', 'folder_id'),
-            'default_tool_diameter': get_machine_setting('default_tool', 'diameter'),
+            'default_tool_diameter': tool_in if (tool_in and tool_in > 0) else DEFAULT_TOOL_DIAMETER_IN,
+            'default_tool_diameter_text': raw_tool if isinstance(raw_tool, str) else f'{raw_tool}"',
         }
 
     @classmethod
@@ -662,6 +784,12 @@ CONFIG_TEMPLATE = """# PenguinCAM Team Configuration
 #
 # All values are optional - any missing values will use Team 6238 defaults.
 # You only need to specify values you want to override.
+#
+# UNITS: Dimensions default to inches, but you may add a unit to any dimension
+# value (quote it so YAML reads it as text): e.g. diameter: "4mm", x_max: "600mm",
+# width: "0.25in", or a fraction like "1/8". Supported units: in/", mm, cm, m, ft/', yd.
+# A plain number (no quotes/unit) is inches. Non-dimension values (feed rates, RPM,
+# angles, ratios) are always plain numbers.
 
 # =============================================================================
 # TEAM INFORMATION
@@ -678,7 +806,8 @@ machine:
   manufacturer: "Avid CNC"
   controller: "Mach4"                 # Mach3, Mach4, LinuxCNC, etc.
 
-  # Machine work envelope (inches)
+  # Machine work envelope. Plain numbers are inches; add a unit to use metric,
+  # e.g. x_max: "1200mm" (quote unit values). See the UNITS note at the top.
   dimensions:
     x_max: 48.0
     y_max: 96.0
@@ -720,7 +849,7 @@ machining:
 
   # Tool parameters (defaults - can be overridden per job)
   default_tool:
-    diameter: 0.157                 # 4mm end mill (inches)
+    diameter: "4mm"                 # e.g. "4mm", "1/8", or a plain number in inches (0.157)
     # Note: This sets the default in the UI, but user can override for each job
 
 # =============================================================================
