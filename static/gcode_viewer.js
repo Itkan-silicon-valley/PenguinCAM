@@ -189,7 +189,7 @@
     var grid = new THREE.GridHelper(gridSize, Math.ceil(gridSize), tc.grid1, tc.grid2);
     grid.position.set(gridSize / 3, 0, -gridSize / 3);
     this.scene.add(grid);
-    this.scene.add(new THREE.AxesHelper(Math.max(maxDim, 5) * 1.2));
+    this._addAxes(Math.max(maxDim, 5) * 0.6);
     var ms = Math.max(0.15, maxDim * 0.02);
     this.scene.add(new THREE.Mesh(new THREE.SphereGeometry(ms, 16, 16), new THREE.MeshBasicMaterial({ color: 0xffffff })));
 
@@ -323,6 +323,45 @@
     this.camera.position.set(this.optimalCam.x, this.optimalCam.y, this.optimalCam.z);
     this.controls.target.set(this.optimalLook.x, this.optimalLook.y, this.optimalLook.z);
     this.controls.update();
+  };
+
+  /* ------------------------------------------------------------- axes */
+  // A billboard text label (canvas sprite) for an axis tip.
+  GcodeViewer.prototype._axisSprite = function (text, hex) {
+    var canvas = document.createElement('canvas');
+    canvas.width = canvas.height = 64;
+    var ctx = canvas.getContext('2d');
+    ctx.fillStyle = hex;
+    ctx.font = 'bold 48px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(text, 32, 34);
+    var tex = new THREE.CanvasTexture(canvas);
+    tex.needsUpdate = true;
+    return new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, transparent: true, depthTest: false, depthWrite: false }));
+  };
+
+  // Draw labeled machine axes at the origin. The gcode->THREE remap is (x, z, -y), so
+  // machine +X -> THREE (1,0,0), +Y -> THREE (0,0,-1), +Z -> THREE (0,1,0). Colors match
+  // the 2D layout view: X red, Y green, Z blue. Y therefore points toward the part (into
+  // the scene), not toward the camera as the old generic AxesHelper's blue Z did.
+  GcodeViewer.prototype._addAxes = function (len) {
+    var self = this;
+    var lblScale = Math.max(len * 0.18, 0.5);
+    [
+      { dir: [1, 0, 0], color: 0xff0000, hex: '#ff0000', label: 'X' },
+      { dir: [0, 0, -1], color: 0x2ea043, hex: '#2ea043', label: 'Y' },
+      { dir: [0, 1, 0], color: 0x2f81f7, hex: '#2f81f7', label: 'Z' },
+    ].forEach(function (ax) {
+      var end = new THREE.Vector3(ax.dir[0] * len, ax.dir[1] * len, ax.dir[2] * len);
+      self.scene.add(new THREE.Line(
+        new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0, 0, 0), end]),
+        new THREE.LineBasicMaterial({ color: ax.color })));
+      var spr = self._axisSprite(ax.label, ax.hex);
+      spr.scale.set(lblScale, lblScale, lblScale);
+      spr.position.copy(end.clone().multiplyScalar(1.12));
+      self.scene.add(spr);
+    });
   };
 
   window.GcodeViewer = GcodeViewer;

@@ -632,7 +632,6 @@
       ctx.strokeStyle = v.tooBig ? col.danger : col.muted; ctx.lineWidth = 1;
       ctx.strokeRect(Math.min(a[0], c[0]), Math.min(a[1], c[1]), Math.abs(c[0] - a[0]), Math.abs(c[1] - a[1]));
       ctx.setLineDash([]);
-      ctx.fillStyle = col.ok; ctx.beginPath(); ctx.arc(a[0], a[1], 4, 0, 7); ctx.fill();
       ctx.restore();
     }
 
@@ -681,6 +680,31 @@
       ctx.beginPath(); ctx.moveTo(hg.ex, hg.ey); ctx.lineTo(hg.hx, hg.hy);
       ctx.strokeStyle = col.accent; ctx.lineWidth = 1.5; ctx.stroke();
       ctx.beginPath(); ctx.arc(hg.hx, hg.hy, 6, 0, 7); ctx.fillStyle = col.accent; ctx.fill();
+      ctx.restore();
+    }
+
+    // Origin marker + labeled axes, drawn last so they sit on top of the parts. The
+    // origin (green dot) is the G54 lower-left; X (red) points +X to the right, Y (green)
+    // points +Y up. Colors match the 3D preview so both views read the same.
+    if (bb) {
+      var o = worldToCanvas(bb.minX, bb.minY);
+      ctx.save();
+      ctx.fillStyle = col.ok;
+      ctx.beginPath(); ctx.arc(o[0], o[1], 4, 0, 7); ctx.fill();
+      var L = 42, head = 6;
+      [['#ff0000', 1, 0, 'X'], ['#2ea043', 0, -1, 'Y']].forEach(function (ax) {
+        var color = ax[0], dx = ax[1], dy = ax[2], label = ax[3];
+        var ex = o[0] + dx * L, ey = o[1] + dy * L;
+        ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = 2;
+        ctx.beginPath(); ctx.moveTo(o[0], o[1]); ctx.lineTo(ex, ey); ctx.stroke();
+        var ang = Math.atan2(ey - o[1], ex - o[0]);
+        ctx.beginPath(); ctx.moveTo(ex, ey);
+        ctx.lineTo(ex - head * Math.cos(ang - 0.4), ey - head * Math.sin(ang - 0.4));
+        ctx.lineTo(ex - head * Math.cos(ang + 0.4), ey - head * Math.sin(ang + 0.4));
+        ctx.closePath(); ctx.fill();
+        ctx.font = 'bold 12px sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+        ctx.fillText(label, o[0] + dx * (L + 11), o[1] + dy * (L + 11));
+      });
       ctx.restore();
     }
 
