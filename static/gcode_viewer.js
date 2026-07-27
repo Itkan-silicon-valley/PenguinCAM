@@ -293,6 +293,13 @@
   };
 
   GcodeViewer.prototype._start = function () {
+    // If playback is parked at the end (it auto-pauses there), pressing play should
+    // replay from the beginning rather than sit stuck at the last move.
+    var cur = this.els.scrubber ? parseInt(this.els.scrubber.value, 10) : 0;
+    if (cur >= this.moves.length - 1) {
+      if (this.els.scrubber) this.els.scrubber.value = 0;
+      this._update(0);
+    }
     this.isPlaying = true;
     if (this.els.playButton) this.els.playButton.classList.add('playing');
     var self = this;
