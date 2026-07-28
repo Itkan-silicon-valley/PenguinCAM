@@ -214,6 +214,7 @@
         onshape: {{ (onshape_ctx if onshape_ctx is defined else {})|tojson }},
         bed: { width: {{ machine_x_max|tojson }}, height: {{ machine_y_max|tojson }} },
         machineName: {{ ((machines.get(current_machine_id) or {}).get('name') or 'Machine')|tojson }},
+        machines: {{ (machines_info if machines_info is defined else {})|tojson }},
         defaultTool: {{ default_tool_diameter|tojson }},
         defaultToolText: {{ (default_tool_diameter_text if default_tool_diameter_text is defined else '4mm')|tojson }},
         driveEnabled: {{ (drive_enabled if drive_enabled is defined else False)|tojson }},

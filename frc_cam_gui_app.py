@@ -359,6 +359,24 @@ def _app_template_context():
         if not team_config.is_material_complete(material_id, current_machine_id) and material_id != 'aluminum_tube'
     }
 
+    # Per-machine data so the client can update bed size, tool default, and the material
+    # list when the user picks a different machine (without a page reload). Keyed by id.
+    machines_info = {}
+    for mid in machines.keys():
+        md = team_config.to_dict(mid)
+        mats = team_config.get_available_materials(mid)
+        machines_info[mid] = {
+            'name': md.get('machine_name') or mid,
+            'x_max': md.get('machine_x_max'),
+            'y_max': md.get('machine_y_max'),
+            'tool': md.get('default_tool_diameter'),
+            'tool_text': md.get('default_tool_diameter_text'),
+            'materials': [
+                {'id': matid, 'name': m.get('name') or matid}
+                for matid, m in mats.items() if matid != 'aluminum_tube'
+            ],
+        }
+
     return {
         'user_name': user_name,
         'team_name': team_name,
@@ -369,6 +387,7 @@ def _app_template_context():
         'machine_y_max': machine_y_max,
         'using_default_config': session.get('using_default_config', False),
         'machines': machines,
+        'machines_info': machines_info,
         'current_machine_id': current_machine_id,
         'materials': available_materials,
         'incomplete_materials': incomplete_materials,

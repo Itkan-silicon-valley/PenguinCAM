@@ -6,7 +6,7 @@
 (function () {
   'use strict';
 
-  var CFG = window.PenguinCAM || { source: 'upload', bed: { width: 24, height: 24 }, defaultTool: 0.157, defaultToolText: '4mm' };
+  var CFG = window.PenguinCAM || { source: 'upload', bed: { width: 24, height: 24 }, defaultTool: 0.157, defaultToolText: '4mm', machines: {} };
   var DEBUG = /(?:^|[?&])debug=1(?:&|$)/.test(location.search);
 
   var ALL_STEPS = ['setup', 'parts', 'layout', 'preview'];
@@ -426,7 +426,10 @@
   /* --------------------------------------------------------------- setup */
   function bindSetup() {
     var machineSel = $('#f-machine');
-    if (machineSel) { state.machine_id = machineSel.value; machineSel.addEventListener('change', function () { state.machine_id = this.value; }); }
+    if (machineSel) {
+      state.machine_id = machineSel.value;
+      machineSel.addEventListener('change', function () { selectMachine(this.value); });
+    }
 
     $all('input[name="mode"]').forEach(function (r) {
       r.addEventListener('change', function () {
@@ -449,6 +452,55 @@
     $('#f-square-end').addEventListener('change', function () { state.squareEnd = this.checked; });
     $('#f-cut-to-length').addEventListener('change', function () { state.cutToLength = this.checked; });
     applyModeUI();
+  }
+
+  // Switch the active machine: pull its bed size, name, tool default, and material list
+  // from the per-machine data the server embedded (CFG.machines) so the Layout bounds,
+  // tool default, and Material dropdown reflect the SELECTED machine, not the default.
+  // Also persists the choice to the session so a reload keeps it.
+  function selectMachine(mid) {
+    var oldInfo = (CFG.machines || {})[state.machine_id];
+    state.machine_id = mid;
+    var info = (CFG.machines || {})[mid];
+    if (info) {
+      state.machine = { width: info.x_max || state.machine.width, height: info.y_max || state.machine.height, name: info.name || mid };
+      rebuildMaterialOptions(info.materials);
+      // Follow the new machine's default tool ONLY if the field still holds the previous
+      // machine's default (i.e. the user hasn't typed a custom value) — never clobber input.
+      var toolInput = $('#f-tool');
+      if (toolInput && info.tool_text && oldInfo && state.tool_diameter_text === oldInfo.tool_text) {
+        toolInput.value = info.tool_text;
+        state.tool_diameter_text = info.tool_text;
+        state.tool_diameter = info.tool || parseLength(info.tool_text) || state.tool_diameter;
+      }
+      if (state.step === 'layout') { updateLayoutInfo(); refitView(); drawLayout(); }
+      updateSummary();
+    }
+    // Persist to the session (fire-and-forget) so a page/iframe reload keeps this machine.
+    fetch('/set-machine', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ machine_id: mid }),
+    }).catch(function () {});
+    dbg('machine', mid);
+  }
+
+  // Rebuild the Material <select> for the selected machine, keeping the current material
+  // if it still exists (else preferring plywood, then the first available).
+  function rebuildMaterialOptions(materials) {
+    var sel = $('#f-material');
+    if (!sel || !materials || !materials.length) return;
+    var prev = state.material;
+    sel.innerHTML = '';
+    var ids = [];
+    materials.forEach(function (m) {
+      var opt = document.createElement('option');
+      opt.value = m.id; opt.textContent = m.name;
+      sel.appendChild(opt);
+      ids.push(m.id);
+    });
+    var pick = ids.indexOf(prev) >= 0 ? prev : (ids.indexOf('plywood') >= 0 ? 'plywood' : ids[0]);
+    sel.value = pick;
+    if (state.mode !== 'tubing') state.material = pick;
   }
 
   // Reshape the Setup form for the selected mode. Tubing forces the aluminum-tube
@@ -964,6 +1016,7 @@
     // only one face, the server mirrors it onto the other side.
     if (state.parts[1]) fd.append('file_face2', state.parts[1].file, state.parts[1].name + '.dxf');
     fd.append('material', 'aluminum_tube');
+    if (state.machine_id) fd.append('machine_id', state.machine_id);
     fd.append('tool_diameter', state.tool_diameter);
     fd.append('thickness', state.thickness);       // tube wall thickness
     // Both faces share one orientation on the jig; the backend applies this single
@@ -1001,7 +1054,7 @@
     // so placements are normalized relative to it.
     var bb = combinedBBox() || { minX: 0, minY: 0, w: 0, h: 0 };
     var job = {
-      material: state.material, tool_diameter: state.tool_diameter,
+      material: state.material, tool_diameter: state.tool_diameter, machine_id: state.machine_id,
       thickness: state.thickness, tab_spacing: state.tab_spacing,
       stock: { width: bb.w, height: bb.h },
       name: jobFilename(), parts: [],
@@ -1035,6 +1088,7 @@
     var fd = new FormData();
     fd.append('file', p.file, p.name + '.dxf');
     fd.append('material', state.material);
+    if (state.machine_id) fd.append('machine_id', state.machine_id);
     fd.append('tool_diameter', state.tool_diameter);
     fd.append('thickness', state.thickness);
     fd.append('origin_corner', 'bottom-left');
