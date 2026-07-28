@@ -7,6 +7,9 @@ import unittest
 import math
 import sys
 import os
+import tempfile
+
+import ezdxf
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -15,6 +18,46 @@ from frc_cam_postprocessor import (
     FRCPostProcessor, MATERIAL_PRESETS, assemble_job_gcode, validate_job_layout,
 )
 from team_config import TeamConfig, parse_length, DEFAULT_TOOL_DIAMETER_IN
+
+
+class TestEllipsePerimeterStitching(unittest.TestCase):
+    """Onshape exports curved perimeter transitions as ELLIPSE arcs; the path stitcher
+    must include them, or the perimeter can't close (real bug: Part 2, 2026-07-28)."""
+
+    def _load(self, doc):
+        path = tempfile.mktemp(suffix='.dxf')
+        doc.saveas(path)
+        try:
+            pp = FRCPostProcessor(0.25, 0.157)
+            pp.apply_material_preset('aluminum')
+            pp.load_dxf(path)
+            pp.identify_perimeter_and_pockets()
+            return pp
+        finally:
+            os.remove(path)
+
+    def test_ellipse_arc_closes_perimeter(self):
+        # A closed loop of 3 lines + 1 ELLIPSE arc (the top edge bulges out).
+        doc = ezdxf.new(); msp = doc.modelspace()
+        msp.add_line((0, 0), (10, 0))
+        msp.add_line((10, 0), (10, 5))
+        msp.add_line((0, 5), (0, 0))
+        msp.add_ellipse(center=(5, 5), major_axis=(5, 0), ratio=0.4,
+                        start_param=0, end_param=math.pi)
+        pp = self._load(doc)
+        self.assertIsNotNone(pp.perimeter)
+        self.assertGreater(len(pp.perimeter), 3)
+
+    def test_full_ellipse_is_standalone_pocket(self):
+        # A perimeter plus a full ELLIPSE inside it -> the ellipse is its own closed loop.
+        doc = ezdxf.new(); msp = doc.modelspace()
+        for a, b in [((0, 0), (20, 0)), ((20, 0), (20, 20)), ((20, 20), (0, 20)), ((0, 20), (0, 0))]:
+            msp.add_line(a, b)
+        msp.add_ellipse(center=(10, 10), major_axis=(3, 0), ratio=0.5,
+                        start_param=0, end_param=2 * math.pi)
+        pp = self._load(doc)
+        self.assertIsNotNone(pp.perimeter)
+        self.assertEqual(len(pp.pockets), 1)   # the full ellipse became a pocket
 
 
 class TestLengthParsing(unittest.TestCase):

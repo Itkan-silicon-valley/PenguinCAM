@@ -412,15 +412,29 @@ class FRCPostProcessor:
         arcs = list(msp.query('ARC'))
         splines = list(msp.query('SPLINE'))
 
+        # Ellipses: a full ellipse is a standalone closed loop (elliptical hole/pocket);
+        # an elliptical arc is part of a perimeter/pocket and must be chained like an arc.
+        # Onshape uses these for curved perimeter transitions - skipping them breaks the
+        # perimeter into open chains that can't close.
+        ellipse_arcs = []
+        for entity in msp.query('ELLIPSE'):
+            pts = self._sample_ellipse(entity)
+            if len(pts) < 2:
+                continue
+            if self._distance_2d(pts[0], pts[-1]) < 0.01:
+                self.polylines.append(pts)      # closed ellipse -> standalone path
+            else:
+                ellipse_arcs.append(entity)      # arc -> chain into perimeter/pockets
+
         # Also collect unclosed LWPOLYLINEs - they may be part of a perimeter that needs stitching
         unclosed_lwpolylines = []
         for entity in msp.query('LWPOLYLINE'):
             if not entity.closed and len(list(entity.get_points('xy'))) > 1:
                 unclosed_lwpolylines.append(entity)
 
-        if lines or arcs or splines or unclosed_lwpolylines:
-            print(f"Found {len(lines)} lines, {len(arcs)} arcs, {len(splines)} splines, {len(unclosed_lwpolylines)} unclosed polylines - attempting to form closed paths...")
-            closed_paths = self._chain_entities_to_paths(lines, arcs, splines, unclosed_lwpolylines)
+        if lines or arcs or splines or unclosed_lwpolylines or ellipse_arcs:
+            print(f"Found {len(lines)} lines, {len(arcs)} arcs, {len(splines)} splines, {len(ellipse_arcs)} ellipse arcs, {len(unclosed_lwpolylines)} unclosed polylines - attempting to form closed paths...")
+            closed_paths = self._chain_entities_to_paths(lines, arcs, splines, unclosed_lwpolylines, ellipse_arcs)
             self.polylines.extend(closed_paths)
         
         print(f"Found {len(self.circles)} circles and {len(self.polylines)} closed paths")
@@ -537,8 +551,21 @@ class FRCPostProcessor:
                                    if e.dxf.layer == layer_name and not e.closed
                                    and len(list(e.get_points('xy'))) > 1]
 
-            if lines or arcs or splines or unclosed_lwpolylines:
-                closed_paths = self._chain_entities_to_paths(lines, arcs, splines, unclosed_lwpolylines)
+            # Ellipses on this layer: full ellipse -> standalone loop; arc -> chained.
+            ellipse_arcs = []
+            for entity in msp.query('ELLIPSE'):
+                if entity.dxf.layer != layer_name:
+                    continue
+                pts = self._sample_ellipse(entity)
+                if len(pts) < 2:
+                    continue
+                if self._distance_2d(pts[0], pts[-1]) < 0.01:
+                    layer_polylines.append(pts)
+                else:
+                    ellipse_arcs.append(entity)
+
+            if lines or arcs or splines or unclosed_lwpolylines or ellipse_arcs:
+                closed_paths = self._chain_entities_to_paths(lines, arcs, splines, unclosed_lwpolylines, ellipse_arcs)
                 layer_polylines.extend(closed_paths)
 
             # Convert geometry to Shapely Polygons for unified representation
@@ -575,17 +602,20 @@ class FRCPostProcessor:
                 self.retract_height = max_depth + self.clearance_height
                 print(f"  Derived stock thickness from CAD layers: {max_depth:.4f}\"")
 
-    def _chain_entities_to_paths(self, lines, arcs, splines, unclosed_polylines=None):
+    def _chain_entities_to_paths(self, lines, arcs, splines, unclosed_polylines=None, ellipses=None):
         """
-        Chain individual LINE, ARC, SPLINE, and unclosed LWPOLYLINE entities into closed paths.
-        This handles DXF exports from Onshape and other CAD programs that don't use polylines.
+        Chain individual LINE, ARC, SPLINE, ELLIPSE, and unclosed LWPOLYLINE entities into
+        closed paths. This handles DXF exports from Onshape and other CAD programs that
+        don't use polylines.
         """
         if unclosed_polylines is None:
             unclosed_polylines = []
+        if ellipses is None:
+            ellipses = []
 
         # First, try the graph-based approach for exact geometry
         print("  Attempting to connect segments into exact paths...")
-        exact_paths = self._connect_segments_graph_based(lines, arcs, splines, unclosed_polylines)
+        exact_paths = self._connect_segments_graph_based(lines, arcs, splines, unclosed_polylines, ellipses)
         if exact_paths:
             return exact_paths
 
@@ -616,7 +646,13 @@ class FRCPostProcessor:
             points = self._sample_spline(spline, num_points=30)
             if len(points) >= 2:
                 all_linestrings.append(LineString(points))
-        
+
+        # Add ELLIPSE entities (sample them into line segments)
+        for ellipse in ellipses:
+            points = self._sample_ellipse(ellipse)
+            if len(points) >= 2:
+                all_linestrings.append(LineString(points))
+
         if not all_linestrings:
             return []
         
@@ -677,13 +713,15 @@ class FRCPostProcessor:
             print(f"Warning: Could not automatically chain entities into paths: {e}")
             return []
     
-    def _connect_segments_graph_based(self, lines, arcs, splines, unclosed_polylines=None):
+    def _connect_segments_graph_based(self, lines, arcs, splines, unclosed_polylines=None, ellipses=None):
         """
         Build a connectivity graph and find closed cycles.
         This preserves exact geometry including curves.
         """
         if unclosed_polylines is None:
             unclosed_polylines = []
+        if ellipses is None:
+            ellipses = []
 
         # Build list of all segments with their endpoints
         segments = []
@@ -712,7 +750,13 @@ class FRCPostProcessor:
             points = self._sample_spline(spline, num_points=30)
             if len(points) >= 2:
                 segments.append({'type': 'spline', 'points': points, 'start': points[0], 'end': points[-1]})
-        
+
+        # Add ellipse arcs (sampled) - Onshape uses these for perimeter fillets/transitions
+        for ellipse in ellipses:
+            points = self._sample_ellipse(ellipse)
+            if len(points) >= 2:
+                segments.append({'type': 'ellipse', 'points': points, 'start': points[0], 'end': points[-1]})
+
         if not segments:
             return []
         
@@ -822,6 +866,17 @@ class FRCPostProcessor:
         
         return points
     
+    def _sample_ellipse(self, ellipse, distance=0.01):
+        """Sample an ELLIPSE entity (full or arc) into a series of (x, y) points.
+
+        Onshape exports elliptical fillets/transitions on a perimeter as ELLIPSE arcs;
+        without sampling them the perimeter chain breaks at those arcs and can't close.
+        """
+        try:
+            return [(p.x, p.y) for p in ellipse.flattening(distance)]
+        except Exception:
+            return []
+
     def _sample_spline(self, spline, num_points=30):
         """Sample a SPLINE entity into a series of points"""
         try:
@@ -1559,7 +1614,7 @@ class FRCPostProcessor:
                     ))
 
                 gcode.append("")
-                gcode.append("(--- Contoured holes (manual removal required) ---)")
+                gcode.append("(--- Contoured holes - manual removal required ---)")
                 for i, hole, area in contoured_holes:
                     center = hole['center']
                     diameter = hole['diameter']
@@ -1633,7 +1688,7 @@ class FRCPostProcessor:
                     ))
 
                 gcode.append("")
-                gcode.append("(--- Contoured pockets (manual removal required) ---)")
+                gcode.append("(--- Contoured pockets - manual removal required ---)")
                 for i, pocket, area in contoured_pockets:
                     gcode.append(f"(Pocket {i} - {area:.3f} sq in - CONTOUR ONLY)")
                     gcode.extend(self._generate_pocket_contour_gcode(pocket))
