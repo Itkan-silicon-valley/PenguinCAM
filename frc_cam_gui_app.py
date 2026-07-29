@@ -1601,17 +1601,31 @@ def onshape_export_face():
         face_normal = None
         name = data.get('name')
         faces = None
+        resolved_bid = None
         try:
             faces = client.list_faces(did, wid, eid)
             for body in (faces or {}).get('bodies', []):
                 for fc in body.get('faces', []):
                     if fc.get('id') == fid:
                         face_normal = (fc.get('surface') or {}).get('normal')
+                        resolved_bid = body.get('id')
                         if not name:
                             name = (body.get('properties') or {}).get('name')
                         break
+                if resolved_bid:
+                    break
         except Exception:
             pass
+
+        # Scope the export to the selected part's body. Onshape's face-selection message
+        # doesn't reliably include a part/body id, and without one the 2.5D depth search
+        # spans EVERY body in the Part Studio and pulls in other parts (e.g. an Origin
+        # Cube). The body that actually OWNS the selected face is the authoritative scope
+        # (it comes from the same bodydetails response the depth search filters on), so
+        # prefer it over whatever id the client sent, which may be a different id form.
+        if resolved_bid and resolved_bid != bid:
+            log(f"[EXPORT] scoping to body {resolved_bid} that owns the selected face (client sent bid={bid})")
+            bid = resolved_bid
 
         detected_thickness = None
         if multilayer:
