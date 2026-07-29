@@ -59,6 +59,29 @@ class TestEllipsePerimeterStitching(unittest.TestCase):
         self.assertIsNotNone(pp.perimeter)
         self.assertEqual(len(pp.pockets), 1)   # the full ellipse became a pocket
 
+    def test_multilayer_hatch_reconstruction_includes_ellipse(self):
+        # The 2.5D path rebuilds its own DXF (solid HATCH) from Onshape geometry with a
+        # separate stitcher; it must also handle ELLIPSE arcs or curved corners break.
+        from onshape_integration import OnshapeClient
+        doc = ezdxf.new(); msp = doc.modelspace()
+        msp.add_line((0, 0), (10, 0))
+        msp.add_line((10, 0), (10, 5))
+        msp.add_line((0, 5), (0, 0))
+        msp.add_ellipse(center=(5, 5), major_axis=(5, 0), ratio=0.4,
+                        start_param=0, end_param=math.pi)
+        target = ezdxf.new().modelspace()
+        OnshapeClient()._convert_geometry_to_solid_hatch(msp, target, 'layer0')
+        # The solid region must span the full closed boundary (~10 x 7 incl. the arc bulge),
+        # which is only possible if the ellipse arc was stitched into the perimeter.
+        spans = []
+        for h in target.query('HATCH'):
+            for path in h.paths:
+                pts = [(v[0], v[1]) for v in getattr(path, 'vertices', [])]
+                if len(pts) >= 3:
+                    xs = [p[0] for p in pts]; ys = [p[1] for p in pts]
+                    spans.append((max(xs) - min(xs)) * (max(ys) - min(ys)))
+        self.assertTrue(spans and max(spans) > 50)   # ~10 x 7 = 70; a broken loop would be tiny
+
 
 class TestLengthParsing(unittest.TestCase):
     """Config/UI length values may carry a unit (metric or SAE); parse to inches."""

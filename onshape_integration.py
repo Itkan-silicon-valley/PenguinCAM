@@ -1127,6 +1127,24 @@ class OnshapeClient:
             if len(arc_points) >= 2:
                 line_segments.append(LineString(arc_points))
 
+        # Onshape represents curved perimeter transitions/fillets as ELLIPSE entities.
+        # Like ARCs, they must be sampled and stitched or the boundary loop breaks at
+        # those corners (curved plates come out with wrong corners). A full ellipse is a
+        # standalone closed loop; an elliptical arc is a boundary segment.
+        for entity in source_msp.query('ELLIPSE'):
+            try:
+                pts = [_snap(p.x, p.y) for p in entity.flattening(SNAP)]
+            except Exception:
+                continue
+            if len(pts) < 2:
+                continue
+            end_gap = ((pts[0][0] - pts[-1][0]) ** 2 + (pts[0][1] - pts[-1][1]) ** 2) ** 0.5
+            if end_gap < SNAP * 2:
+                if len(pts) >= 3:
+                    polylines.append(pts)      # full ellipse -> closed loop
+            else:
+                line_segments.append(LineString(pts))  # arc -> stitch into boundary
+
         # Also get unclosed polylines as segments
         for entity in source_msp.query('LWPOLYLINE'):
             if not entity.closed:
