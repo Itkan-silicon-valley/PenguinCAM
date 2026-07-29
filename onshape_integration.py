@@ -20,8 +20,10 @@ from datetime import datetime, timedelta
 from urllib.parse import urlencode, parse_qs
 
 from flask import session
-from shapely.geometry import Point, Polygon, LineString
-from shapely.ops import unary_union, linemerge
+from shapely.geometry import Point, Polygon
+from shapely.ops import unary_union
+
+from dxf_geometry import entities_to_closed_paths
 
 # Configure logging for Vercel
 logging.basicConfig(
@@ -1091,92 +1093,31 @@ class OnshapeClient:
                 if len(points) >= 3:
                     polylines.append(points)
 
-        # Stitch LINE and ARC entities into closed paths. Onshape exports faces as
-        # individual LINE/ARC segments; a corner shared by two entities is stored once
-        # per entity, and ARC endpoints (recomputed from center+radius+angle) land
-        # ~1e-6" off the adjoining segment's endpoint. shapely.linemerge requires EXACT
-        # endpoint coincidence to join, so those sub-micron gaps fragment a boundary
-        # loop and it never closes -> the outer profile is silently lost (curved plates,
-        # curved pockets). Snap every coordinate to a fine grid (0.001", far below both
-        # machining tolerance and the 0.1" closure check) so coincident-but-not-identical
-        # junctions unify and linemerge can stitch the loop.
-        SNAP = 0.001
+        # Stitch open LINE/ARC/ELLIPSE/SPLINE + unclosed-LWPOLYLINE entities into closed
+        # boundary loops via the shared dxf_geometry stitcher (same code the 2D importer
+        # uses). It snaps sub-micron-apart CAD endpoints together so linemerge can close
+        # a boundary; full ellipses come back as their own closed loop.
+        def _warn_open_loop(coords, gap):
+            # A large loop that failed to close is exactly how a missing outer profile
+            # hides - surface it rather than silently dropping the boundary.
+            span_x = max(c[0] for c in coords) - min(c[0] for c in coords)
+            span_y = max(c[1] for c in coords) - min(c[1] for c in coords)
+            if max(span_x, span_y) > 1.0:
+                log(f"    WARNING: dropped an UNCLOSED boundary loop "
+                    f"({len(coords)} pts, {span_x:.2f}x{span_y:.2f}\", "
+                    f"end-gap {gap:.4f}\") - geometry may be incomplete")
 
-        def _snap(x, y):
-            return (round(x / SNAP) * SNAP, round(y / SNAP) * SNAP)
-
-        line_segments = []
-        for entity in source_msp.query('LINE'):
-            start = _snap(entity.dxf.start.x, entity.dxf.start.y)
-            end = _snap(entity.dxf.end.x, entity.dxf.end.y)
-            line_segments.append(LineString([start, end]))
-
-        for entity in source_msp.query('ARC'):
-            center = (entity.dxf.center.x, entity.dxf.center.y)
-            radius = entity.dxf.radius
-            start_angle = math.radians(entity.dxf.start_angle)
-            end_angle = math.radians(entity.dxf.end_angle)
-            if end_angle <= start_angle:
-                end_angle += 2 * math.pi
-            num_points = max(8, int((end_angle - start_angle) / (2 * math.pi) * 64))
-            arc_points = []
-            for k in range(num_points + 1):
-                angle = start_angle + (end_angle - start_angle) * k / num_points
-                arc_points.append(_snap(center[0] + radius * math.cos(angle),
-                                        center[1] + radius * math.sin(angle)))
-            if len(arc_points) >= 2:
-                line_segments.append(LineString(arc_points))
-
-        # Onshape represents curved perimeter transitions/fillets as ELLIPSE entities.
-        # Like ARCs, they must be sampled and stitched or the boundary loop breaks at
-        # those corners (curved plates come out with wrong corners). A full ellipse is a
-        # standalone closed loop; an elliptical arc is a boundary segment.
-        for entity in source_msp.query('ELLIPSE'):
-            try:
-                pts = [_snap(p.x, p.y) for p in entity.flattening(SNAP)]
-            except Exception:
-                continue
-            if len(pts) < 2:
-                continue
-            end_gap = ((pts[0][0] - pts[-1][0]) ** 2 + (pts[0][1] - pts[-1][1]) ** 2) ** 0.5
-            if end_gap < SNAP * 2:
-                if len(pts) >= 3:
-                    polylines.append(pts)      # full ellipse -> closed loop
-            else:
-                line_segments.append(LineString(pts))  # arc -> stitch into boundary
-
-        # Also get unclosed polylines as segments
-        for entity in source_msp.query('LWPOLYLINE'):
-            if not entity.closed:
-                points = [_snap(p[0], p[1]) for p in entity.get_points('xy')]
-                if len(points) >= 2:
-                    line_segments.append(LineString(points))
-
-        if line_segments:
-            try:
-                merged = linemerge(line_segments)
-                # Check each merged geometry for closed paths
-                geoms_to_check = list(merged.geoms) if hasattr(merged, 'geoms') else [merged]
-                for geom in geoms_to_check:
-                    coords = list(geom.coords)
-                    if len(coords) >= 3:
-                        start = coords[0]
-                        end = coords[-1]
-                        dist = ((start[0]-end[0])**2 + (start[1]-end[1])**2)**0.5
-                        if dist < 0.1:  # Closed within tolerance
-                            polylines.append(coords)
-                            log(f"    Stitched line/arc segments into closed path ({len(coords)} points)")
-                        else:
-                            # Don't silently drop a large boundary loop that failed to
-                            # close - that's exactly how a missing outer profile hides.
-                            span_x = max(c[0] for c in coords) - min(c[0] for c in coords)
-                            span_y = max(c[1] for c in coords) - min(c[1] for c in coords)
-                            if max(span_x, span_y) > 1.0:
-                                log(f"    WARNING: dropped an UNCLOSED boundary loop "
-                                    f"({len(coords)} pts, {span_x:.2f}x{span_y:.2f}\", "
-                                    f"end-gap {dist:.4f}\") - geometry may be incomplete")
-            except Exception as e:
-                log(f"    Warning: Could not stitch line segments: {e}")
+        stitched = entities_to_closed_paths(
+            lines=list(source_msp.query('LINE')),
+            arcs=list(source_msp.query('ARC')),
+            ellipses=list(source_msp.query('ELLIPSE')),
+            splines=list(source_msp.query('SPLINE')),
+            polylines=[e for e in source_msp.query('LWPOLYLINE') if not e.closed],
+            on_open_loop=_warn_open_loop,
+        )
+        for coords in stitched:
+            polylines.append(coords)
+            log(f"    Stitched segments into closed path ({len(coords)} points)")
 
         log(f"    Converting to solid regions: {len(circles)} circles, {len(polylines)} polylines")
 

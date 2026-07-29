@@ -20,6 +20,44 @@ from frc_cam_postprocessor import (
 from team_config import TeamConfig, parse_length, DEFAULT_TOOL_DIAMETER_IN
 
 
+class TestSharedDxfStitcher(unittest.TestCase):
+    """dxf_geometry.entities_to_closed_paths is the single stitcher used by both the 2D
+    import and the 2.5D reconstruction; lock its contract directly."""
+
+    def _msp(self):
+        return ezdxf.new().modelspace()
+
+    def test_lines_and_ellipse_arc_close(self):
+        from dxf_geometry import entities_to_closed_paths
+        msp = self._msp()
+        msp.add_line((0, 0), (10, 0)); msp.add_line((10, 0), (10, 5)); msp.add_line((0, 5), (0, 0))
+        msp.add_ellipse(center=(5, 5), major_axis=(5, 0), ratio=0.4, start_param=0, end_param=math.pi)
+        paths = entities_to_closed_paths(
+            lines=list(msp.query('LINE')), arcs=list(msp.query('ARC')),
+            ellipses=list(msp.query('ELLIPSE')))
+        self.assertEqual(len(paths), 1)
+        self.assertGreater(len(paths[0]), 4)
+
+    def test_full_ellipse_is_a_closed_path(self):
+        from dxf_geometry import entities_to_closed_paths
+        msp = self._msp()
+        msp.add_ellipse(center=(0, 0), major_axis=(4, 0), ratio=0.5, start_param=0, end_param=2 * math.pi)
+        paths = entities_to_closed_paths(ellipses=list(msp.query('ELLIPSE')))
+        self.assertEqual(len(paths), 1)
+
+    def test_open_loop_reported_not_dropped_silently(self):
+        from dxf_geometry import entities_to_closed_paths
+        msp = self._msp()
+        # 3 sides of a square (missing the 4th) -> an open chain, not a closed path.
+        msp.add_line((0, 0), (10, 0)); msp.add_line((10, 0), (10, 10)); msp.add_line((10, 10), (0, 10))
+        seen = []
+        paths = entities_to_closed_paths(lines=list(msp.query('LINE')),
+                                         on_open_loop=lambda coords, gap: seen.append(gap))
+        self.assertEqual(paths, [])
+        self.assertEqual(len(seen), 1)
+        self.assertAlmostEqual(seen[0], 10.0, places=3)   # end-to-end gap of the open chain
+
+
 class TestEllipsePerimeterStitching(unittest.TestCase):
     """Onshape exports curved perimeter transitions as ELLIPSE arcs; the path stitcher
     must include them, or the perimeter can't close (real bug: Part 2, 2026-07-28)."""

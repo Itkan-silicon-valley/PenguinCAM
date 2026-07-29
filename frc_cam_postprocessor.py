@@ -14,18 +14,18 @@ import json
 import math
 import os
 import re
-from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import List, Tuple, Optional, Dict, Any
 
 # Third-party
 import ezdxf
 from shapely import affinity
-from shapely.geometry import Point, Polygon, LineString, LinearRing, MultiPolygon
+from shapely.geometry import Point, Polygon, LinearRing, MultiPolygon
 from shapely.geometry.polygon import orient
-from shapely.ops import unary_union, linemerge
+from shapely.ops import unary_union
 
 # Local modules
+from dxf_geometry import entities_to_closed_paths, sample_spline
 from team_config import TeamConfig
 
 
@@ -411,20 +411,10 @@ class FRCPostProcessor:
         lines = list(msp.query('LINE'))
         arcs = list(msp.query('ARC'))
         splines = list(msp.query('SPLINE'))
-
-        # Ellipses: a full ellipse is a standalone closed loop (elliptical hole/pocket);
-        # an elliptical arc is part of a perimeter/pocket and must be chained like an arc.
-        # Onshape uses these for curved perimeter transitions - skipping them breaks the
-        # perimeter into open chains that can't close.
-        ellipse_arcs = []
-        for entity in msp.query('ELLIPSE'):
-            pts = self._sample_ellipse(entity)
-            if len(pts) < 2:
-                continue
-            if self._distance_2d(pts[0], pts[-1]) < 0.01:
-                self.polylines.append(pts)      # closed ellipse -> standalone path
-            else:
-                ellipse_arcs.append(entity)      # arc -> chain into perimeter/pockets
+        # Onshape uses ELLIPSE entities for curved perimeter transitions/fillets. The
+        # shared stitcher handles both arcs (chained into a boundary) and full ellipses
+        # (standalone closed loops), so pass them all through.
+        ellipses = list(msp.query('ELLIPSE'))
 
         # Also collect unclosed LWPOLYLINEs - they may be part of a perimeter that needs stitching
         unclosed_lwpolylines = []
@@ -432,9 +422,9 @@ class FRCPostProcessor:
             if not entity.closed and len(list(entity.get_points('xy'))) > 1:
                 unclosed_lwpolylines.append(entity)
 
-        if lines or arcs or splines or unclosed_lwpolylines or ellipse_arcs:
-            print(f"Found {len(lines)} lines, {len(arcs)} arcs, {len(splines)} splines, {len(ellipse_arcs)} ellipse arcs, {len(unclosed_lwpolylines)} unclosed polylines - attempting to form closed paths...")
-            closed_paths = self._chain_entities_to_paths(lines, arcs, splines, unclosed_lwpolylines, ellipse_arcs)
+        if lines or arcs or splines or unclosed_lwpolylines or ellipses:
+            print(f"Found {len(lines)} lines, {len(arcs)} arcs, {len(splines)} splines, {len(ellipses)} ellipses, {len(unclosed_lwpolylines)} unclosed polylines - attempting to form closed paths...")
+            closed_paths = self._chain_entities_to_paths(lines, arcs, splines, unclosed_lwpolylines, ellipses)
             self.polylines.extend(closed_paths)
         
         print(f"Found {len(self.circles)} circles and {len(self.polylines)} closed paths")
@@ -550,22 +540,10 @@ class FRCPostProcessor:
             unclosed_lwpolylines = [e for e in msp.query('LWPOLYLINE')
                                    if e.dxf.layer == layer_name and not e.closed
                                    and len(list(e.get_points('xy'))) > 1]
+            ellipses = [e for e in msp.query('ELLIPSE') if e.dxf.layer == layer_name]
 
-            # Ellipses on this layer: full ellipse -> standalone loop; arc -> chained.
-            ellipse_arcs = []
-            for entity in msp.query('ELLIPSE'):
-                if entity.dxf.layer != layer_name:
-                    continue
-                pts = self._sample_ellipse(entity)
-                if len(pts) < 2:
-                    continue
-                if self._distance_2d(pts[0], pts[-1]) < 0.01:
-                    layer_polylines.append(pts)
-                else:
-                    ellipse_arcs.append(entity)
-
-            if lines or arcs or splines or unclosed_lwpolylines or ellipse_arcs:
-                closed_paths = self._chain_entities_to_paths(lines, arcs, splines, unclosed_lwpolylines, ellipse_arcs)
+            if lines or arcs or splines or unclosed_lwpolylines or ellipses:
+                closed_paths = self._chain_entities_to_paths(lines, arcs, splines, unclosed_lwpolylines, ellipses)
                 layer_polylines.extend(closed_paths)
 
             # Convert geometry to Shapely Polygons for unified representation
@@ -603,296 +581,13 @@ class FRCPostProcessor:
                 print(f"  Derived stock thickness from CAD layers: {max_depth:.4f}\"")
 
     def _chain_entities_to_paths(self, lines, arcs, splines, unclosed_polylines=None, ellipses=None):
-        """
-        Chain individual LINE, ARC, SPLINE, ELLIPSE, and unclosed LWPOLYLINE entities into
-        closed paths. This handles DXF exports from Onshape and other CAD programs that
-        don't use polylines.
-        """
-        if unclosed_polylines is None:
-            unclosed_polylines = []
-        if ellipses is None:
-            ellipses = []
+        """Stitch individual LINE/ARC/ELLIPSE/SPLINE and unclosed LWPOLYLINE entities into
+        closed boundary paths. Delegates to the shared dxf_geometry stitcher (also used by
+        the 2.5D DXF reconstruction) so sampling + stitching live in exactly one place."""
+        return entities_to_closed_paths(
+            lines=lines, arcs=arcs, ellipses=ellipses or [],
+            splines=splines, polylines=unclosed_polylines or [])
 
-        # First, try the graph-based approach for exact geometry
-        print("  Attempting to connect segments into exact paths...")
-        exact_paths = self._connect_segments_graph_based(lines, arcs, splines, unclosed_polylines, ellipses)
-        if exact_paths:
-            return exact_paths
-
-        # Fallback: Convert all entities to linestrings and try merge
-        print("  Falling back to linestring merge...")
-        all_linestrings = []
-
-        # Add unclosed LWPOLYLINE entities
-        for lwpoly in unclosed_polylines:
-            points = [(p[0], p[1]) for p in lwpoly.get_points('xy')]
-            if len(points) >= 2:
-                all_linestrings.append(LineString(points))
-
-        # Add LINE entities
-        for line in lines:
-            start = (line.dxf.start.x, line.dxf.start.y)
-            end = (line.dxf.end.x, line.dxf.end.y)
-            all_linestrings.append(LineString([start, end]))
-        
-        # Add ARC entities (sample them into line segments)
-        for arc in arcs:
-            points = self._sample_arc(arc, num_points=20)
-            if len(points) >= 2:
-                all_linestrings.append(LineString(points))
-        
-        # Add SPLINE entities (sample them into line segments)
-        for spline in splines:
-            points = self._sample_spline(spline, num_points=30)
-            if len(points) >= 2:
-                all_linestrings.append(LineString(points))
-
-        # Add ELLIPSE entities (sample them into line segments)
-        for ellipse in ellipses:
-            points = self._sample_ellipse(ellipse)
-            if len(points) >= 2:
-                all_linestrings.append(LineString(points))
-
-        if not all_linestrings:
-            return []
-        
-        try:
-            # Merge connected line segments
-            merged = linemerge(all_linestrings)
-            
-            # Extract closed paths
-            closed_paths = []
-            tolerance = 0.1  # 0.1" tolerance for "almost closed"
-            
-            # Check if we got a single geometry or multiple
-            geoms_to_check = []
-            if hasattr(merged, 'geoms'):
-                geoms_to_check = list(merged.geoms)
-            else:
-                geoms_to_check = [merged]
-            
-            for geom in geoms_to_check:
-                coords = list(geom.coords)
-                if len(coords) < 3:
-                    continue
-                
-                # Check if path is closed or nearly closed
-                start = Point(coords[0])
-                end = Point(coords[-1])
-                distance = start.distance(end)
-                
-                is_closed = (coords[0] == coords[-1]) or distance < tolerance
-                
-                if is_closed:
-                    # Remove duplicate closing point if present
-                    if coords[0] == coords[-1]:
-                        coords = coords[:-1]
-                    
-                    if len(coords) > 2:
-                        closed_paths.append(coords)
-                        print(f"  Found closed path with {len(coords)} points (gap: {distance:.4f}\")")
-            
-            # If we still didn't find closed paths, try creating convex hull (last resort)
-            if not closed_paths and all_linestrings:
-                print("  Attempting to form polygon from all segments (APPROXIMATE)...")
-                try:
-                    union = unary_union(all_linestrings)
-                    if hasattr(union, 'convex_hull'):
-                        hull = union.convex_hull
-                        if isinstance(hull, Polygon) and len(hull.exterior.coords) > 3:
-                            coords = list(hull.exterior.coords)[:-1]
-                            closed_paths.append(coords)
-                            print(f"  ⚠️  Created convex hull with {len(coords)} points (LOSES DETAIL!)")
-                            print(f"  ⚠️  This is approximate - concave features will be lost!")
-                except Exception as e:
-                    print(f"  Could not create polygon: {e}")
-            
-            return closed_paths
-            
-        except Exception as e:
-            print(f"Warning: Could not automatically chain entities into paths: {e}")
-            return []
-    
-    def _connect_segments_graph_based(self, lines, arcs, splines, unclosed_polylines=None, ellipses=None):
-        """
-        Build a connectivity graph and find closed cycles.
-        This preserves exact geometry including curves.
-        """
-        if unclosed_polylines is None:
-            unclosed_polylines = []
-        if ellipses is None:
-            ellipses = []
-
-        # Build list of all segments with their endpoints
-        segments = []
-
-        # Add unclosed LWPOLYLINE entities (treat as multi-point path segment)
-        for lwpoly in unclosed_polylines:
-            points = [(p[0], p[1]) for p in lwpoly.get_points('xy')]
-            if len(points) >= 2:
-                segments.append({'type': 'polyline', 'points': points, 'start': points[0], 'end': points[-1]})
-
-        # Add lines
-        for line in lines:
-            start = (line.dxf.start.x, line.dxf.start.y)
-            end = (line.dxf.end.x, line.dxf.end.y)
-            points = [start, end]
-            segments.append({'type': 'line', 'points': points, 'start': start, 'end': end})
-
-        # Add arcs (sampled)
-        for arc in arcs:
-            points = self._sample_arc(arc, num_points=20)
-            if len(points) >= 2:
-                segments.append({'type': 'arc', 'points': points, 'start': points[0], 'end': points[-1]})
-
-        # Add splines (sampled)
-        for spline in splines:
-            points = self._sample_spline(spline, num_points=30)
-            if len(points) >= 2:
-                segments.append({'type': 'spline', 'points': points, 'start': points[0], 'end': points[-1]})
-
-        # Add ellipse arcs (sampled) - Onshape uses these for perimeter fillets/transitions
-        for ellipse in ellipses:
-            points = self._sample_ellipse(ellipse)
-            if len(points) >= 2:
-                segments.append({'type': 'ellipse', 'points': points, 'start': points[0], 'end': points[-1]})
-
-        if not segments:
-            return []
-        
-        # Build adjacency graph
-        tolerance = 0.01  # 0.01" tolerance for matching endpoints
-
-        def points_match(p1, p2, tol=tolerance):
-            return self._distance_2d(p1, p2) < tol
-        
-        # Find which segments connect to which
-        graph = defaultdict(list)  # endpoint -> list of (segment_idx, is_start)
-
-        for idx, seg in enumerate(segments):
-            # Add connections for start point
-            start_key = self._round_point(seg['start'], 2)
-            graph[start_key].append((idx, True))
-
-            # Add connections for end point
-            end_key = self._round_point(seg['end'], 2)
-            graph[end_key].append((idx, False))
-        
-        # Find closed cycles
-        visited = set()
-        closed_paths = []
-        
-        for start_idx in range(len(segments)):
-            if start_idx in visited:
-                continue
-            
-            # Try to build a path starting from this segment
-            path_segments = []
-            path_points = []
-            current_idx = start_idx
-            current_end = segments[start_idx]['end']
-            
-            # Add first segment
-            path_segments.append(current_idx)
-            path_points.extend(segments[current_idx]['points'][:-1])  # Don't duplicate endpoints
-            visited.add(current_idx)
-            
-            # Try to find next segments
-            max_iterations = len(segments)
-            for _ in range(max_iterations):
-                # Look for a segment that starts where we ended
-                end_key = self._round_point(current_end, 2)
-                
-                next_found = False
-                for next_idx, is_start in graph[end_key]:
-                    if next_idx == current_idx or next_idx in path_segments:
-                        continue
-                    
-                    # Found a connection!
-                    seg = segments[next_idx]
-                    
-                    if is_start:
-                        # Segment starts where we ended - add it forward
-                        path_segments.append(next_idx)
-                        path_points.extend(seg['points'][:-1])
-                        current_end = seg['end']
-                    else:
-                        # Segment ends where we ended - add it reversed
-                        path_segments.append(next_idx)
-                        reversed_points = list(reversed(seg['points']))
-                        path_points.extend(reversed_points[:-1])
-                        current_end = seg['start']
-                    
-                    visited.add(next_idx)
-                    next_found = True
-                    break
-                
-                if not next_found:
-                    break
-                
-                # Check if we've closed the loop
-                start_point = segments[start_idx]['start']
-                if points_match(current_end, start_point):
-                    # Closed path found!
-                    if len(path_points) > 3:
-                        closed_paths.append(path_points)
-                        print(f"  Found exact closed path with {len(path_points)} points using {len(path_segments)} segments")
-                    break
-        
-        return closed_paths
-    
-    def _round_point(self, point, decimals=3):
-        """Round a point to create a hashable key for graph"""
-        return (round(point[0], decimals), round(point[1], decimals))
-    
-    def _sample_arc(self, arc, num_points=20):
-        """Sample an ARC entity into a series of points"""
-        center = (arc.dxf.center.x, arc.dxf.center.y)
-        radius = arc.dxf.radius
-        start_angle = math.radians(arc.dxf.start_angle)
-        end_angle = math.radians(arc.dxf.end_angle)
-        
-        # Handle angle wrapping
-        if end_angle < start_angle:
-            end_angle += 2 * math.pi
-        
-        points = []
-        for i in range(num_points + 1):
-            t = i / num_points
-            angle = start_angle + t * (end_angle - start_angle)
-            x = center[0] + radius * math.cos(angle)
-            y = center[1] + radius * math.sin(angle)
-            points.append((x, y))
-        
-        return points
-    
-    def _sample_ellipse(self, ellipse, distance=0.01):
-        """Sample an ELLIPSE entity (full or arc) into a series of (x, y) points.
-
-        Onshape exports elliptical fillets/transitions on a perimeter as ELLIPSE arcs;
-        without sampling them the perimeter chain breaks at those arcs and can't close.
-        """
-        try:
-            return [(p.x, p.y) for p in ellipse.flattening(distance)]
-        except Exception:
-            return []
-
-    def _sample_spline(self, spline, num_points=30):
-        """Sample a SPLINE entity into a series of points"""
-        try:
-            # Use ezdxf's built-in spline sampling
-            points = []
-            for point in spline.flattening(distance=0.01):
-                points.append((point[0], point[1]))
-            return points if points else []
-        except:
-            # Fallback: use control points
-            try:
-                control_points = [(p[0], p[1]) for p in spline.control_points]
-                return control_points if len(control_points) > 1 else []
-            except:
-                return []
-        
     def _mirror_geometry_x(self):
         """Mirror all loaded geometry across the X axis (x -> -x), for a part 'flipped
         over' to machine its reverse side. Applied before rotate/normalize so toolpaths
@@ -965,7 +660,7 @@ class FRCPostProcessor:
             all_y.extend([arc['center'][1] - radius, arc['center'][1] + radius])
         
         for spline in self.splines:
-            points = self._sample_spline(spline)
+            points = sample_spline(spline)
             for x, y in points:
                 all_x.append(x)
                 all_y.append(y)
