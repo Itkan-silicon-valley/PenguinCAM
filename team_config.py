@@ -114,10 +114,12 @@ TEAM_6238_DEFAULTS = {
         'manufacturer': 'Generic',
         'controller': 'Generic',
         'dimensions': {'x_max': 24.0, 'y_max': 24.0, 'z_max': 8.0},
-        'park_position': {'x': 0.5, 'y': 0.5, 'z': -0.5},
+        # park_position and coolant are intentionally NOT defaulted: they are opt-in.
+        # A config with no park_position emits portable G54-only output (no G53); a config
+        # with no coolant emits no M7/M8/M9. Machines that want them (e.g. Mach4 routers)
+        # add them to their config. Keeps output compatible with GRBL/Easel/WinCNC.
         'standard_work_offset': 'G54',
         'tube_jig_work_offset': 'G55',
-        'coolant': 'Air'
     },
     'machining': {
         'z_reference': {
@@ -443,8 +445,31 @@ class TeamConfig:
         return self._get('machine', 'park_position', 'z')
 
     @property
+    def park_position(self):
+        """Optional machine-coordinate park as (x, y, z), or None if not configured.
+
+        Only when this is set does the post-processor emit the G53 machine-coordinate
+        park (raise Z, move gantry to a fixed spot). Absent -> no G53 anywhere, so the
+        output stays portable across controllers (GRBL/Easel/WinCNC)."""
+        x = self._get('machine', 'park_position', 'x')
+        y = self._get('machine', 'park_position', 'y')
+        z = self._get('machine', 'park_position', 'z')
+        if x is None or y is None or z is None:
+            return None
+        return (x, y, z)
+
+    @property
+    def safe_clearance_height(self):
+        """Configured "clear everything" height over Z=0 (sacrifice board) for the G54
+        bed-crossing moves (first-cut approach, end retract, multi-part rapids, tube-flip
+        pause). Set above the tallest fixture. None -> fall back to material_thickness +
+        clearance (just above the stock). From z_reference.safe_height."""
+        return self._get('machining', 'z_reference', 'safe_height', default=None)
+
+    @property
     def machine_coolant(self) -> str:
-        """Machine coolant type (Air, Flood, Mist, None)"""
+        """Machine coolant type (Air, Flood, Mist) or None. Opt-in: no value -> no coolant
+        M-codes are emitted (portable across controllers)."""
         return self._get('machine', 'coolant')
 
     @property
@@ -813,17 +838,22 @@ machine:
     y_max: 96.0
     z_max: 8.0
 
-  # Park position (machine coordinates for safe part access)
+  # OPTIONAL end-of-program park in MACHINE coordinates (moves the gantry out of the way
+  # for part access). This is the ONLY thing that puts G53 in the output, so OMIT this
+  # whole block on controllers that don't support G53 (e.g. GRBL/Easel). Machine-specific.
   park_position:
     x: 0.5      # X position when parking (machine coords)
     y: 23.5     # Y position when parking (machine coords)
-    # NOTE: This is machine-specific! Adjust for your CNC's safe position.
+    z: -0.5     # safe machine Z (machine coords) to raise to before parking
 
   # Coordinate systems
   standard_work_offset: "G54"       # Work offset for standard operations
   tube_jig_work_offset: "G55"       # Work offset for tube jig operations
 
-  coolant: "Air"                    # Air, Flood, Mist, None
+  # OPTIONAL coolant. If set (Air/Mist -> M7, Flood -> M8, with M9 off), coolant M-codes
+  # are emitted. OMIT this line (or use None) on controllers without coolant M-codes
+  # (stock GRBL rejects M7 unless compiled in). Air keeps an air-blast on/off.
+  coolant: "Air"
 
 # =============================================================================
 # GENERAL MACHINING PREFERENCES
@@ -833,6 +863,15 @@ machining:
   z_reference:
     sacrifice_board_depth: 0.008    # How far to cut into sacrifice board (inches)
     clearance_height: 0.5           # Clearance above material for rapid moves (inches)
+    # OPTIONAL: "clear everything" height above Z=0 (sacrifice board), in work
+    # coordinates (G54). Used only for the moves that cross the machine bed: the
+    # rapid to the first cut, the end retract, multi-part rapids, and the tube-flip
+    # pause. Set this ABOVE YOUR TALLEST CLAMP/FIXTURE so those moves clear it.
+    # If omitted, those moves fall back to material_thickness + clearance_height
+    # (just above the stock) -- fine for edge clamps, but it will NOT clear tall
+    # fixturing. Mid-part retracts always use material_thickness + clearance_height
+    # regardless, since they stay over the stock.
+    # safe_height: 2.0
 
   # Tab parameters (for perimeter operations)
   tabs:

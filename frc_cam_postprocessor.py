@@ -170,10 +170,11 @@ class FRCPostProcessor:
         # Tube facing operation constants from config
         self.tube_facing_params = config.get_tube_facing_params()
 
-        # Machine-specific constants from config
-        self.machine_park_x = config.machine_park_x  # X position for machine park (machine coordinates)
-        self.machine_park_y = config.machine_park_y  # Y position for machine park (machine coordinates)
-        self.machine_park_z = config.machine_park_z  # Z position for safe clearance (machine coordinates)
+        # Machine-specific constants from config. park_position is optional (a machine
+        # coordinate tuple or None); when None, no G53 is emitted and the output is
+        # portable across controllers.
+        self.park_position = config.park_position  # (x, y, z) machine coords, or None
+        self.safe_clearance_height = config.safe_clearance_height  # configured G54 ceiling, or None
 
         # Team information from config
         self.team_number = config.team_number  # FRC team number
@@ -292,7 +293,8 @@ class FRCPostProcessor:
         print(f"  ❌ ERROR: {error_msg}")
         self.errors.append(error_msg)
 
-    def _generate_pause_and_park_gcode(self, title: str, instructions: List[str]) -> List[str]:
+    def _generate_pause_and_park_gcode(self, title: str, instructions: List[str],
+                                       safe_z: float = None) -> List[str]:
         """
         Generate G-code for a safe pause-and-restart sequence with operator instructions.
 
@@ -315,9 +317,14 @@ class FRCPostProcessor:
         gcode = []
         gcode.append('')
         gcode.append(f'( === {title} === )')
-        gcode.append(f'G53 G0 Z{self.machine_park_z:.4f}  ; Move to safe machine Z clearance')
-        gcode.append(f'G53 G0 X{self.machine_park_x} Y{self.machine_park_y}  ; Park at back of machine')
-        gcode.append('M9  ; Air blast off')
+        # Callers with a taller safe height (e.g. tube facing must clear the full tube)
+        # pass safe_z; otherwise the material-based work clearance is used.
+        z = safe_z if safe_z is not None else self._safe_z()
+        gcode.append(f'G0 Z{z:.4f}  ; Safe Z clearance')
+        gcode.extend(self._park_gcode('Park'))  # G53 park only if configured
+        coolant_off = self._coolant_off_gcode()
+        if coolant_off:
+            gcode.append(coolant_off)
         gcode.append('M5  ; Spindle off')
         gcode.append('G4 P5.0  ; 5 second dwell')
         gcode.append('')
@@ -330,7 +337,9 @@ class FRCPostProcessor:
         gcode.append('( === RESTART AFTER PAUSE === )')
         gcode.append('G90  ; Ensure absolute positioning mode')
         gcode.append(f'S{self.spindle_speed} M3  ; Spindle on')
-        gcode.append('M7  ; Air blast on')
+        coolant_on = self._coolant_on_gcode()
+        if coolant_on:
+            gcode.append(coolant_on)
         gcode.append('G4 P3.0  ; 3 second spindle spin-up')
         gcode.append('')
         return gcode
@@ -1552,6 +1561,43 @@ class FRCPostProcessor:
         return {'interior': interior, 'perimeter': perimeter,
                 'tab_removal': tab_removal, 'errors': list(self.errors)}
 
+    # ---- Portability helpers: work-coordinate safe moves + optional coolant/park -------
+    # Everything below emits G54 work-coordinate G-code by default. Machine-coordinate
+    # (G53) motion appears ONLY when a park_position is configured, and coolant M-codes
+    # ONLY when a coolant type is configured - so the default output runs on GRBL, Easel,
+    # WinCNC, Mach, etc.
+
+    def _safe_z(self) -> float:
+        """Work-coordinate (G54) safe retract height above Z=0 (sacrifice board). Uses the
+        configured machine ceiling when set, but never below the material + clearance so a
+        thick part can't collide on the retract."""
+        floor = self.retract_height  # material_thickness + clearance (or max_depth + clearance in 2.5D)
+        return max(floor, self.safe_clearance_height or 0.0)
+
+    def _coolant_on_gcode(self):
+        """Coolant-start line for the configured coolant type, or None if no coolant is set.
+        Air/Mist -> M7 (mist output, e.g. air blast), Flood -> M8."""
+        coolant = (self.machine_coolant or '').strip().lower()
+        code = 'M7' if coolant in ('air', 'mist') else ('M8' if coolant == 'flood' else None)
+        return f'{code}  ; Coolant on ({self.machine_coolant})' if code else None
+
+    def _coolant_off_gcode(self):
+        """Coolant-stop line (M9), or None if no coolant is configured."""
+        coolant = (self.machine_coolant or '').strip().lower()
+        return 'M9  ; Coolant off' if coolant in ('air', 'mist', 'flood') else None
+
+    def _park_gcode(self, comment: str = 'Park'):
+        """G53 machine-coordinate park (raise Z, then move the gantry to the fixed park
+        spot) - ONLY when park_position is configured. Returns [] otherwise, keeping the
+        program G54-only and portable. Callers should already be at a safe work Z."""
+        if not self.park_position:
+            return []
+        px, py, pz = self.park_position
+        return [
+            f'G53 G0 Z{pz:.4f}  ; {comment}: raise to safe machine Z',
+            f'G53 G0 X{px} Y{py}  ; {comment}: move gantry to park position',
+        ]
+
     def _generate_gcode_header(self, timestamp: str = None, is_multilayer: bool = False,
                                is_job: bool = False, job_part_count: int = None) -> List[str]:
         """Generate common G-code header (comments + initialization).
@@ -1677,7 +1723,9 @@ class FRCPostProcessor:
 
         # Spindle on
         gcode.append(f"S{self.spindle_speed} M3  ; Spindle on" + ("" if is_multilayer else f" at {self.spindle_speed} RPM"))
-        gcode.append("M7  ; Air blast on")
+        coolant_on = self._coolant_on_gcode()
+        if coolant_on:
+            gcode.append(coolant_on)
         gcode.append("G4 P2  ; Wait" + (" for spindle" if is_multilayer else " 2 seconds for spindle to reach speed"))
         gcode.append("")
 
@@ -1685,8 +1733,10 @@ class FRCPostProcessor:
         gcode.append("G54  ; " + ("Work coordinate system" if is_multilayer else "Use work coordinate system 1"))
         gcode.append("")
 
-        # Initial positioning (stay high to avoid fixture collisions during XY moves)
-        gcode.append(f"G53 G0 Z{self.machine_park_z:.4f}  ; " + ("Safe Z clearance" if is_multilayer else "Move to safe machine Z clearance"))
+        # Initial positioning: retract to a safe height in WORK coordinates (G54) so this
+        # is portable across controllers - no G53 machine move (which assumes machine Z=0
+        # is a safe high position, an assumption that breaks on GRBL/Easel/WinCNC).
+        gcode.append(f"G0 Z{self._safe_z():.4f}  ; Safe Z clearance")
         gcode.append("G0 X0 Y0  ; " + ("Origin" if is_multilayer else "Rapid to work origin"))
         gcode.append("")
 
@@ -1696,10 +1746,12 @@ class FRCPostProcessor:
         """Generate common G-code footer (safe moves + shutdown)"""
         gcode = []
         gcode.append("(===== FINISH =====)")
-        gcode.append(f"G53 G0 Z{self.machine_park_z:.4f}  ; Move to safe machine Z clearance")
-        gcode.append("M9  ; Air blast off")
+        gcode.append(f"G0 Z{self._safe_z():.4f}  ; Safe Z clearance")
+        coolant_off = self._coolant_off_gcode()
+        if coolant_off:
+            gcode.append(coolant_off)
         gcode.append("M5  ; Spindle off")
-        gcode.append(f"G53 G0 X{self.machine_park_x} Y{self.machine_park_y}  ; Move gantry to back of machine for easy access")
+        gcode.extend(self._park_gcode('Park for part access'))  # G53 park only if configured
         gcode.append("M30  ; Program end")
         gcode.append("")
         return gcode
@@ -4378,20 +4430,24 @@ class FRCPostProcessor:
         gcode.append('G20')
         gcode.append('G90  ; Absolute positioning mode')
         gcode.append('')
-        gcode.append('( Tool and spindle )')
-        gcode.append('T1 M6')
+        gcode.append('( Spindle )')
         gcode.append(f'S{self.spindle_speed} M3')
-        gcode.append('M7  ; Air blast on')
+        tube_coolant_on = self._coolant_on_gcode()
+        if tube_coolant_on:
+            gcode.append(tube_coolant_on)
         gcode.append('G4 P3.0')
         gcode.append('')
         gcode.append('G55  ; Use jig work coordinate system')
         gcode.append('')
 
+        # Safe height above the tube, in work coordinates (portable - no G53).
+        tube_safe_z = tube_height + 0.25
+
         # === PHASE 1: FACE FIRST HALF ===
         gcode.append('( === PHASE 1: FACE FIRST HALF === )')
         gcode.append('( Face from Y=-0.125 to Y=+0.125 )')
         gcode.append('')
-        gcode.append(f'G53 G0 Z{self.machine_park_z:.4f}  ; Move to safe machine Z clearance')
+        gcode.append(f'G0 Z{tube_safe_z:.4f}  ; Safe Z clearance')
         gcode.append('G0 X0 Y0  ; Rapid to work origin')
         gcode.append('')
 
@@ -4408,14 +4464,15 @@ class FRCPostProcessor:
             [
                 'Flip tube 180 degrees end-for-end',
                 'Re-clamp tube in jig'
-            ]
+            ],
+            safe_z=tube_safe_z  # must clear the full tube, not just the wall
         ))
 
         # === PHASE 2: FACE SECOND HALF ===
         gcode.append('( === PHASE 2: FACE SECOND HALF === )')
         gcode.append('( Face from Y=-0.250 to Y=-0.125 )')
         gcode.append('')
-        gcode.append(f'G53 G0 Z{self.machine_park_z:.4f}  ; Move to safe machine Z clearance')
+        gcode.append(f'G0 Z{tube_safe_z:.4f}  ; Safe Z clearance')
         gcode.append('G0 X0 Y0  ; Rapid to work origin')
         gcode.append('')
 
@@ -4429,11 +4486,13 @@ class FRCPostProcessor:
         # === END ===
         gcode.append('')
         gcode.append('( === PROGRAM END === )')
-        gcode.append(f'G53 G0 Z{self.machine_park_z:.4f}  ; Move to safe machine Z clearance')
-        gcode.append(f'G53 G0 X{self.machine_park_x} Y{self.machine_park_y}  ; Park at back of machine')
-        gcode.append('M9  ; Air blast off')
+        gcode.append(f'G0 Z{tube_safe_z:.4f}  ; Safe Z clearance')
+        tube_coolant_off = self._coolant_off_gcode()
+        if tube_coolant_off:
+            gcode.append(tube_coolant_off)
         gcode.append('M5')
         gcode.append('G54  ; Reset to standard work coordinate system')
+        gcode.extend(self._park_gcode('Park for part access'))  # G53 park only if configured
         gcode.append('M30')
 
         # Estimate cycle time
@@ -4569,14 +4628,18 @@ class FRCPostProcessor:
         gcode.append('G20')
         gcode.append('G90  ; Absolute positioning mode')
         gcode.append('')
-        gcode.append('( Tool and spindle )')
-        gcode.append('T1 M6')
+        gcode.append('( Spindle )')
         gcode.append(f'S{self.spindle_speed} M3')
-        gcode.append('M7  ; Air blast on')
+        pattern_coolant_on = self._coolant_on_gcode()
+        if pattern_coolant_on:
+            gcode.append(pattern_coolant_on)
         gcode.append('G4 P3.0')
         gcode.append('')
         gcode.append('G55  ; Use jig work coordinate system')
         gcode.append('')
+
+        # Safe height above the tube, in work coordinates (portable - no G53).
+        tube_safe_z = tube_height + 0.25
 
         # Determine tube width for facing operations
         if tube_width is None:
@@ -4646,7 +4709,8 @@ class FRCPostProcessor:
             [
                 'Flip tube 180 degrees around Y-axis',
                 'Holes will be machined on opposite face'
-            ]
+            ],
+            safe_z=tube_safe_z  # must clear the full tube, not just the wall
         ))
 
         # === PHASE 2: SECOND FACE (SQUARE + MACHINE PATTERN) ===
@@ -4707,11 +4771,13 @@ class FRCPostProcessor:
         # === END ===
         gcode.append('')
         gcode.append('( === PROGRAM END === )')
-        gcode.append(f'G53 G0 Z{self.machine_park_z:.4f}')
-        gcode.append(f'G53 G0 X{self.machine_park_x} Y{self.machine_park_y}')
-        gcode.append('M9  ; Air blast off')
+        gcode.append(f'G0 Z{tube_safe_z:.4f}  ; Safe Z clearance')
+        pattern_coolant_off = self._coolant_off_gcode()
+        if pattern_coolant_off:
+            gcode.append(pattern_coolant_off)
         gcode.append('M5')
         gcode.append('G54  ; Reset to standard work coordinate system')
+        gcode.extend(self._park_gcode('Park for part access'))  # G53 park only if configured
         gcode.append('M30')
 
         # Estimate cycle time
@@ -5321,7 +5387,7 @@ def assemble_job_gcode(part_jobs, header_pp, timestamp=None, suggested_filename=
         for i, pj in bodies:
             gcode.append("")
             gcode.append(_part_label(i, pj))
-            gcode.append(f"G53 G0 Z{header_pp.machine_park_z:.4f}  ; Safe Z between parts")
+            gcode.append(f"G0 Z{header_pp._safe_z():.4f}  ; Safe Z between parts")
             gcode.extend(pj[phase_key])
         return True
 

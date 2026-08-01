@@ -20,6 +20,54 @@ from frc_cam_postprocessor import (
 from team_config import TeamConfig, parse_length, DEFAULT_TOOL_DIAMETER_IN
 
 
+class TestControllerPortability(unittest.TestCase):
+    """Default output is G54-only work-coordinate (portable to GRBL/Easel/WinCNC); the
+    G53 machine park and coolant M-codes are opt-in via config."""
+
+    def _flat_gcode(self, cfg=None):
+        doc = ezdxf.new(); msp = doc.modelspace()
+        msp.add_lwpolyline([(0, 0), (4, 0), (4, 4), (0, 4)], close=True)   # simple square
+        path = tempfile.mktemp(suffix='.dxf'); doc.saveas(path)
+        try:
+            pp = FRCPostProcessor(0.25, 0.157, config=cfg) if cfg else FRCPostProcessor(0.25, 0.157)
+            pp.apply_material_preset('aluminum')
+            pp.load_dxf(path)
+            pp.transform_coordinates('bottom-left', 0)
+            pp.identify_perimeter_and_pockets()
+            pp.classify_holes()
+            return pp.generate_gcode(suggested_filename='p', timestamp='2026-07-31 12:00').gcode
+        finally:
+            os.remove(path)
+
+    @staticmethod
+    def _cfg(**machine):
+        return TeamConfig({'version': 2, 'default_machine': 'm',
+                           'machines': {'m': {'name': 'M', 'machine': machine}}})
+
+    def test_default_is_portable(self):
+        g = self._flat_gcode()
+        self.assertNotIn('G53', g)                       # no machine-coordinate moves
+        self.assertNotIn('M7', g)                        # no coolant unless configured
+        self.assertNotIn('M8', g)
+        self.assertIn('G0 Z', g)                         # work-coordinate safe clearance present
+
+    def test_coolant_opt_in(self):
+        g = self._flat_gcode(self._cfg(coolant='Air'))
+        self.assertIn('M7', g)                           # air/mist coolant on
+        self.assertIn('M9  ; Coolant off', g)
+        self.assertNotIn('G53', g)                       # coolant doesn't bring back G53
+
+    def test_flood_coolant_uses_m8(self):
+        g = self._flat_gcode(self._cfg(coolant='Flood'))
+        self.assertIn('M8', g)
+        self.assertNotIn('M7', g)
+
+    def test_park_opt_in(self):
+        g = self._flat_gcode(self._cfg(park_position={'x': 1.0, 'y': 2.0, 'z': -0.5}))
+        self.assertIn('G53 G0 X1.0 Y2.0', g)             # park appears only when configured
+        self.assertIn('G53 G0 Z-0.5000', g)
+
+
 class TestSharedDxfStitcher(unittest.TestCase):
     """dxf_geometry.entities_to_closed_paths is the single stitcher used by both the 2D
     import and the 2.5D reconstruction; lock its contract directly."""

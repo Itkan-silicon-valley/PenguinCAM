@@ -150,25 +150,36 @@
             </tbody>
         </table>
 
-        <h3>Park Position (Machine Coordinates)</h3>
+        <h3>Park Position (Machine Coordinates) &mdash; optional</h3>
         <p>
-            Configure where the machine parks at the end of programs for safe part access.
-            These use G53 (machine coordinates), not work coordinates:
+            Optionally park the gantry at a fixed machine location at the end of a program for
+            easy part access. This uses <strong>G53 machine coordinates</strong>, and it is the
+            <em>only</em> thing that puts <code>G53</code> in the output:
         </p>
         <pre><code>park_position:
   x: 0.5       # X position in machine coords
   y: 0.5       # Y position in machine coords
-  z: -0.5      # Z safe clearance below home</code></pre>
+  z: -0.5      # safe machine Z to raise to before parking</code></pre>
 
-        <div class="info-box">
+        <div class="warning-box info-box">
             <div class="info-icon">⚠️</div>
             <div>
-                <strong>Important for machines with soft limits:</strong> Some controllers (like standalone Omio with Digital Dream)
-                have soft limits near the home position. If your machine trips soft limits when parking at Z=0,
-                set <code>park_z</code> to a negative value (e.g., -0.125 for 3mm clearance from limit).
-                Negative values move <em>below</em> the home position.
+                <strong>Leave this out for GRBL / Easel and other non-G53 controllers.</strong>
+                Without <code>park_position</code>, PenguinCAM emits <strong>portable, G54 work-coordinate
+                only</strong> G-code (start and end retracts use a work-coordinate safe height, no
+                <code>G53</code>). If a machine plunges at the origin or mishandles the safe move, remove
+                this block. Everything else works the same.
             </div>
         </div>
+
+        <h3>Coolant &mdash; optional</h3>
+        <p>
+            Optionally emit coolant M-codes. Omit it (or set <code>None</code>) and no coolant commands
+            are written &mdash; recommended for controllers that don't support them (stock GRBL rejects
+            <code>M7</code> unless compiled with it).
+        </p>
+        <pre><code>machine:
+  coolant: "Air"   # Air/Mist -> M7 (e.g. air blast), Flood -> M8, off -> M9; None/omit -> nothing</code></pre>
 
         <h3>Default Tool</h3>
         <p>
@@ -181,12 +192,29 @@
 
         <h3>Z-Axis Reference System</h3>
         <p>
-            Configure how deep to cut and safe heights for tool changes:
+            Z=0 is the top of the sacrifice board (the bottom of your stock); the stock top
+            sits at Z = material thickness. Configure how deep to cut and how high to clear:
         </p>
         <pre><code>z_reference:
-  sacrifice_board_depth: 0.008    # Cut 0.008" into sacrifice board
-  safe_height: 1.5                # Rapid height for tool changes
-  clearance_height: 0.5           # Clearance above stock</code></pre>
+  sacrifice_board_depth: 0.008    # How far to cut into the sacrifice board (through-cuts)
+  clearance_height: 0.5           # Clearance above the stock for in-part rapids
+  safe_height: 2.0                # OPTIONAL: "clear everything" height (see below)</code></pre>
+        <p>
+            <strong><code>clearance_height</code></strong> is the small hop above the stock used
+            for rapids <em>between features within a part</em> (these stay over the stock, so they
+            only need to clear it).
+        </p>
+        <p>
+            <strong><code>safe_height</code></strong> is optional and is the "clear everything"
+            height (work coordinates, over Z=0) used only for the moves that cross the machine
+            bed: the rapid to the first cut, the final retract, multi-part rapids, and the
+            tube-flip pause. <strong>Set it above your tallest clamp or fixture</strong> so those
+            moves clear it. If you omit it, those moves fall back to
+            <code>material thickness + clearance_height</code> (just above the stock) &mdash; fine
+            for low edge clamps, but it will not clear tall fixturing. (This replaces the old
+            machine-coordinate <code>G53</code> retract, which is now opt-in via
+            <code>park_position</code>.)
+        </p>
 
         <h3>Material Presets</h3>
         <p>
