@@ -327,9 +327,64 @@ def get_onshape_client_or_401():
 # Routes
 # ============================================================================
 
+# Team config is fetched from Onshape at login and cached in the session cookie. Re-fetch
+# it when the cached copy is older than this, so a returning user picks up a config their
+# mentor edited since login - without having to clear cookies or re-authenticate.
+TEAM_CONFIG_TTL_SECONDS = 600  # 10 minutes
+
+
+def _load_team_config_into_session(client):
+    """Fetch PenguinCAM-config.yaml from the user's Onshape classroom and store it in the
+    session. Single source of truth for how config lands in the session - used by the OAuth
+    callback (initial load), the /config/refresh route, and the TTL auto-refresh below."""
+    config_yaml = client.fetch_config_file() if client else None
+    if config_yaml:
+        team_config = TeamConfig.from_yaml(config_yaml)
+        log(f"✅ Team config loaded: {team_config.team_name} (#{team_config.team_number})")
+        session['team_config_data'] = team_config._data
+        session['team_config'] = team_config.to_dict()
+        session['team_number'] = team_config.team_number
+        session['team_config_url'] = getattr(client, 'last_config_url', None)
+        session['using_default_config'] = False
+    else:
+        log("⚠️  No team config found - using defaults")
+        team_config = TeamConfig()
+        session['team_config_data'] = {}
+        session['team_config'] = team_config.to_dict()
+        session['team_number'] = team_config.team_number
+        session.pop('team_config_url', None)
+        session['using_default_config'] = True
+    session['team_config_fetched_at'] = time.time()
+    # Persist any token refresh triggered by the Onshape API calls above.
+    if client:
+        session_manager.update_session_tokens(client)
+    return team_config
+
+
+def _maybe_refresh_team_config():
+    """Best-effort TTL refresh of the cached team config (see TEAM_CONFIG_TTL_SECONDS).
+    Runs on every page render but only actually re-fetches once the cached copy goes stale.
+    Silently keeps the existing session copy if Onshape is unreachable or the re-fetch
+    fails, so a transient error never blocks the page."""
+    if not ONSHAPE_AVAILABLE:
+        return
+    if time.time() - session.get('team_config_fetched_at', 0) < TEAM_CONFIG_TTL_SECONDS:
+        return
+    client = session_manager.get_client(get_current_user_id())
+    if not client:
+        return
+    try:
+        _load_team_config_into_session(client)
+    except Exception as e:
+        log(f"⚠️  Team config TTL refresh failed, keeping cached copy: {e}")
+        # Bump the timestamp so a persistent failure doesn't re-hit Onshape every render.
+        session['team_config_fetched_at'] = time.time()
+
+
 def _app_template_context():
     """Build the shared template context (machines, materials, tool, bed size) used by
     both the legacy single-part page and the multi-part wizard."""
+    _maybe_refresh_team_config()  # opportunistic TTL refresh before we read the cached copy
     user_name = session.get('user_name')
     team_name = session.get('team_name')
 
@@ -511,6 +566,21 @@ def index():
     # ========================================================================
 
     return render_template('index.html', **_app_template_context())
+
+
+@app.route('/config/refresh')
+def refresh_config():
+    """Force an immediate re-fetch of the team config from Onshape (the subtle reload glyph
+    next to the config link). Same fetch-and-store as login and the TTL refresh; returns
+    the user to wherever they were."""
+    if ONSHAPE_AVAILABLE:
+        client = session_manager.get_client(get_current_user_id())
+        if client:
+            try:
+                _load_team_config_into_session(client)
+            except Exception as e:
+                log(f"⚠️  Manual team config refresh failed: {e}")
+    return redirect(request.referrer or '/')
 
 
 @app.route('/app')
@@ -1445,23 +1515,7 @@ def onshape_oauth_callback():
             session['user_email'] = user_email
 
         # Load the team's config file (lives in the user's own Onshape documents).
-        config_yaml = client.fetch_config_file()
-        if config_yaml:
-            team_config = TeamConfig.from_yaml(config_yaml)
-            log(f"✅ Team config loaded: {team_config.team_name} (#{team_config.team_number})")
-            session['team_config_data'] = team_config._data
-            session['team_config'] = team_config.to_dict()
-            session['team_number'] = team_config.team_number
-            session['team_config_url'] = getattr(client, 'last_config_url', None)
-            session['using_default_config'] = False
-        else:
-            log("⚠️  No team config found - using defaults")
-            team_config = TeamConfig()
-            session['team_config_data'] = {}
-            session['team_config'] = team_config.to_dict()
-            session['team_number'] = team_config.team_number
-            session.pop('team_config_url', None)
-            session['using_default_config'] = True
+        _load_team_config_into_session(client)
 
         log("="*60 + "\n")
 

@@ -55,6 +55,7 @@
                 {% else %}
                 {{ session.get('team_config').get('team_number') }} ({{ session.get('team_config').get('team_name', 'Unknown') }})
                 {% endif %}
+                <a href="/config/refresh" class="config-refresh" title="Reload team configuration from Onshape" aria-label="Reload team configuration">&#8635;</a>
             </p>
             {% else %}
             <p class="config-status config-status-default">Using default configuration</p>
