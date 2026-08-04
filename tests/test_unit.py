@@ -68,6 +68,64 @@ class TestControllerPortability(unittest.TestCase):
         self.assertIn('G53 G0 Z-0.5000', g)
 
 
+class TestFirstPlungeClearanceRapid(unittest.TestCase):
+    """At job start the tool sits up at safe_height (which can be several inches, well
+    above any fixture). The FIRST feature must rapid (G0) down to the clearance plane
+    before its slow plunge feed, instead of crawling the whole gap at approach speed.
+    Subsequent features already retract to the clearance plane, so they must NOT emit a
+    redundant rapid."""
+
+    # safe_height (4.0) deliberately well above the retract/clearance plane so the rapid
+    # genuinely descends; matches how a real Mach machine with tall fixtures is configured.
+    CONFIG_YAML = """
+team:
+  number: 6238
+machine:
+  name: "Test"
+  controller: "Mach4"
+machining:
+  z_reference:
+    sacrifice_board_depth: 0.008
+    clearance_height: 1.0
+    safe_height: 4.0
+"""
+
+    def _gcode(self):
+        cfg = TeamConfig.from_yaml(self.CONFIG_YAML)
+        doc = ezdxf.new(); msp = doc.modelspace()
+        msp.add_lwpolyline([(0, 0), (6, 0), (6, 6), (0, 6)], close=True)  # perimeter
+        msp.add_circle((3, 3), 0.6)                                       # + a millable hole
+        path = tempfile.mktemp(suffix='.dxf'); doc.saveas(path)
+        try:
+            pp = FRCPostProcessor(0.25, 0.157, config=cfg)
+            pp.apply_material_preset('aluminum')
+            pp.load_dxf(path)
+            pp.transform_coordinates('bottom-left', 0)
+            pp.identify_perimeter_and_pockets()
+            pp.classify_holes()
+            return pp.generate_gcode(suggested_filename='p', timestamp='2026-08-04 12:00').gcode, pp.retract_height
+        finally:
+            os.remove(path)
+
+    def test_rapid_to_clearance_emitted_once(self):
+        g, _ = self._gcode()
+        # Two features (hole + perimeter) => >=2 approaches, but exactly ONE rapid.
+        self.assertGreaterEqual(g.count('Approach to ramp start height'), 2)
+        self.assertEqual(g.count('Rapid down to clearance plane'), 1)
+
+    def test_first_plunge_starts_from_clearance_plane_not_safe_height(self):
+        g, retract = self._gcode()
+        lines = g.splitlines()
+        rapid_i = next(i for i, l in enumerate(lines) if 'Rapid down to clearance plane' in l)
+        approach_i = next(i for i, l in enumerate(lines) if 'Approach to ramp start height' in l)
+        # The rapid comes right before the first plunge feed...
+        self.assertLess(rapid_i, approach_i)
+        # ...and it rapids to the clearance plane (retract_height), which is below safe Z (4.0).
+        self.assertIn(f'G0 Z{retract:.4f}  ; Rapid down to clearance plane', g)
+        self.assertIn('G0 Z4.0000  ; Safe Z clearance', g)
+        self.assertLess(retract, 4.0)
+
+
 class TestSharedDxfStitcher(unittest.TestCase):
     """dxf_geometry.entities_to_closed_paths is the single stitcher used by both the 2D
     import and the 2.5D reconstruction; lock its contract directly."""

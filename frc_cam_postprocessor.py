@@ -144,6 +144,11 @@ class FRCPostProcessor:
         self.material_top = material_thickness  # Top surface of material
         self.cut_depth = -self.sacrifice_board_depth  # Cut slightly into sacrifice board
 
+        # True when the tool is parked at safe height (above the clearance plane) and the
+        # next feature must first rapid down to the clearance plane before its slow plunge
+        # feed. Set at job start and after any pause/park; consumed by _approach_ramp_start.
+        self._pending_clearance_rapid = False
+
         # Cutting parameters (defaults - can be overridden by material presets)
         self.spindle_speed = 18000  # RPM
         self.feed_rate = 75.0 if units == "inch" else 1905  # Cutting feed rate (IPM or mm/min)
@@ -342,6 +347,9 @@ class FRCPostProcessor:
             gcode.append(coolant_on)
         gcode.append('G4 P3.0  ; 3 second spindle spin-up')
         gcode.append('')
+        # Tool resumes at safe height after the pause; the next feature must rapid down to
+        # the clearance plane before its slow plunge feed (see _approach_ramp_start).
+        self._pending_clearance_rapid = True
         return gcode
 
     def _parse_layer_depth(self, layer_name: str) -> Optional[float]:
@@ -1541,12 +1549,18 @@ class FRCPostProcessor:
 
         self._deferred_tab_positions = []
 
+        # Each phase is assembled under its own "Safe Z between parts" move (see
+        # _emit_phase), so the tool starts each phase up at safe height: flag the first
+        # feature of each to rapid down to the clearance plane before its plunge feed.
+
         # Phase A: interiors (holes + pockets), no per-feature pauses.
+        self._pending_clearance_rapid = True
         interior = self._generate_interior_gcode(emit_contour_pauses=False)
 
         # Phase C: perimeter cut, deferring tab removal to phase D.
         perimeter = []
         if self.perimeter:
+            self._pending_clearance_rapid = True
             if self.tabs_enabled:
                 perimeter.append("(===== PERIMETER WITH TABS =====)")
             else:
@@ -1597,6 +1611,23 @@ class FRCPostProcessor:
             f'G53 G0 Z{pz:.4f}  ; {comment}: raise to safe machine Z',
             f'G53 G0 X{px} Y{py}  ; {comment}: move gantry to park position',
         ]
+
+    def _approach_ramp_start(self, ramp_start_height: float) -> List[str]:
+        """Emit the Z approach down to the ramp-start height (just above the stock), where
+        the helical/ramp entry begins.
+
+        Between features the tool is already parked at the clearance plane
+        (retract_height), so this is a single slow feed covering only the small air gap
+        down to ramp start. But at job start (and after any pause/park) the tool sits up at
+        safe height, potentially several inches up; feeding that whole gap at approach_rate
+        wastes time. In that case, first rapid (G0) down to the clearance plane so the slow
+        feed only covers the last bit of air above the stock."""
+        lines = []
+        if self._pending_clearance_rapid:
+            lines.append(f"G0 Z{self.retract_height:.4f}  ; Rapid down to clearance plane")
+            self._pending_clearance_rapid = False
+        lines.append(f"G1 Z{ramp_start_height:.4f} F{self.approach_rate}  ; Approach to ramp start height")
+        return lines
 
     def _generate_gcode_header(self, timestamp: str = None, is_multilayer: bool = False,
                                is_job: bool = False, job_part_count: int = None) -> List[str]:
@@ -1739,6 +1770,10 @@ class FRCPostProcessor:
         gcode.append(f"G0 Z{self._safe_z():.4f}  ; Safe Z clearance")
         gcode.append("G0 X0 Y0  ; " + ("Origin" if is_multilayer else "Rapid to work origin"))
         gcode.append("")
+
+        # Tool is parked at safe height; the first feature must rapid down to the
+        # clearance plane before its slow plunge feed (see _approach_ramp_start).
+        self._pending_clearance_rapid = True
 
         return gcode
 
@@ -2713,7 +2748,7 @@ class FRCPostProcessor:
         start_x = cx + entry_radius
         start_y = cy
         gcode.append(f"G1 X{start_x:.4f} Y{start_y:.4f} F{self.traverse_rate}  ; Position at entry radius")
-        gcode.append(f"G1 Z{ramp_start_height:.4f} F{self.approach_rate}  ; Approach to ramp start height")
+        gcode.extend(self._approach_ramp_start(ramp_start_height))
 
         # Helical entry in multiple passes using ramp feed rate
         gcode.append(f"(Helical entry: {num_helical_passes} passes at {self.ramp_angle} deg, {depth_per_pass:.4f}\" per pass)")
@@ -2982,7 +3017,7 @@ class FRCPostProcessor:
 
         # Position at pocket center
         gcode.append(f"G1 X{entry_x:.4f} Y{entry_y:.4f} F{self.traverse_rate}  ; Position at pocket center")
-        gcode.append(f"G1 Z{ramp_start_height:.4f} F{self.approach_rate}  ; Approach to ramp start height")
+        gcode.extend(self._approach_ramp_start(ramp_start_height))
 
         # Helical entry at center
         start_x = entry_x + helix_radius
@@ -3210,7 +3245,7 @@ class FRCPostProcessor:
 
         # Position at entry point on ring circumference
         gcode.append(f"G1 X{entry_x:.4f} Y{entry_y:.4f} F{self.traverse_rate}  ; Position at ring entry")
-        gcode.append(f"G1 Z{ramp_start_height:.4f} F{self.approach_rate}  ; Approach to ramp start height")
+        gcode.extend(self._approach_ramp_start(ramp_start_height))
 
         # Ring-centered helical ramp: helix around ring center at entry_radius
         # I,J are offsets from current position to arc center
@@ -3414,7 +3449,7 @@ class FRCPostProcessor:
 
         # Position at entry point
         gcode.append(f"G1 X{entry_x:.4f} Y{entry_y:.4f} F{self.traverse_rate}  ; Position at entry point")
-        gcode.append(f"G1 Z{ramp_start_height:.4f} F{self.approach_rate}  ; Approach to ramp start height")
+        gcode.extend(self._approach_ramp_start(ramp_start_height))
 
         # Helical entry
         start_x = entry_x + helix_radius
@@ -3667,7 +3702,7 @@ class FRCPostProcessor:
             # Move to start
             start = offset_points[0]
             gcode.append(f"G1 X{start[0]:.4f} Y{start[1]:.4f} F{self.traverse_rate}  ; Move to perimeter start")
-            gcode.append(f"G1 Z{ramp_start_height:.4f} F{self.approach_rate}  ; Approach to ramp start height")
+            gcode.extend(self._approach_ramp_start(ramp_start_height))
 
             # Ramp in along the perimeter path
             # Calculate points along perimeter for ramping
