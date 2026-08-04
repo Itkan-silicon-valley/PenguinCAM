@@ -260,6 +260,10 @@ fieldset.field { border: 1px solid var(--line); border-radius: 6px; padding: 8px
 .config-status a { color: var(--accent); text-decoration: none; }
 .config-status a:hover { text-decoration: underline; }
 .config-status-default { color: #d29922; }
+/* Deliberately understated: a reload affordance for the rare config change, not a
+   call-to-action. Nearly invisible until hovered. */
+.config-status a.config-refresh { color: var(--muted); opacity: 0.35; margin-left: 5px; font-size: 0.9em; text-decoration: none; transition: opacity 0.15s ease; }
+.config-status a.config-refresh:hover { opacity: 0.85; text-decoration: none; }
 
 #viewer-container {
   position: relative;
