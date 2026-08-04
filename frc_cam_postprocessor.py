@@ -180,6 +180,10 @@ class FRCPostProcessor:
         # portable across controllers.
         self.park_position = config.park_position  # (x, y, z) machine coords, or None
         self.safe_clearance_height = config.safe_clearance_height  # configured G54 ceiling, or None
+        # Work coordinate system for tube ops. 'G54' (default) = operator zeros G54 to the
+        # tube per job (portable); an alternate fixed WCS (e.g. 'G55') is opt-in for a
+        # permanently-fixtured jig so its zero persists alongside the flat-work G54 zero.
+        self.tube_wcs = config.tube_work_coordinate_system
 
         # Team information from config
         self.team_number = config.team_number  # FRC team number
@@ -1611,6 +1615,33 @@ class FRCPostProcessor:
             f'G53 G0 Z{pz:.4f}  ; {comment}: raise to safe machine Z',
             f'G53 G0 X{px} Y{py}  ; {comment}: move gantry to park position',
         ]
+
+    def _tube_wcs_activate_gcode(self) -> str:
+        """The work-coordinate-system line that opens a tube program. Default G54 (the
+        operator zeros it to the tube for this job); an alternate fixed WCS (e.g. G55) is
+        opt-in for a permanently-fixtured jig whose zero persists in its own system."""
+        if self.tube_wcs == 'G54':
+            return f'{self.tube_wcs}  ; Work coordinate system, zeroed at the tube origin'
+        return f'{self.tube_wcs}  ; Use fixed jig work coordinate system'
+
+    def _tube_wcs_reset_gcode(self):
+        """Reset back to the standard G54 WCS at program end - only needed when the tube job
+        actually switched to an alternate fixed WCS. Returns None for the G54 default (there
+        was nothing to switch away from), keeping that output minimal."""
+        if self.tube_wcs == 'G54':
+            return None
+        return 'G54  ; Reset to standard work coordinate system'
+
+    def _tube_wcs_setup_instruction(self) -> str:
+        """Plain-text instruction for how the operator establishes the tube origin, matched
+        to the configured WCS. Shared by the G-code header comment and the UI setup list."""
+        if self.tube_wcs == 'G54':
+            return 'Zero G54 at the tube origin for this job'
+        return f'Verify {self.tube_wcs} is set to the fixed jig origin'
+
+    def _tube_wcs_setup_comment(self) -> str:
+        """The numbered G-code header comment wrapping the WCS setup instruction."""
+        return f'( 2. {self._tube_wcs_setup_instruction()} )'
 
     def _approach_ramp_start(self, ramp_start_height: float) -> List[str]:
         """Emit the Z approach down to the ramp-start height (just above the stock), where
@@ -4453,7 +4484,7 @@ class FRCPostProcessor:
         gcode.append('( )')
         gcode.append('( SETUP INSTRUCTIONS: )')
         gcode.append('( 1. Mount tube in jig with end facing user )')
-        gcode.append('( 2. Verify G55 is set to jig origin )')
+        gcode.append(self._tube_wcs_setup_comment())
         gcode.append('( 3. Z=0 is at bottom of tube [jig surface] )')
         gcode.append('( 4. Y=0 is at nominal end face of tube )')
         gcode.append('( )')
@@ -4472,7 +4503,7 @@ class FRCPostProcessor:
             gcode.append(tube_coolant_on)
         gcode.append('G4 P3.0')
         gcode.append('')
-        gcode.append('G55  ; Use jig work coordinate system')
+        gcode.append(self._tube_wcs_activate_gcode())
         gcode.append('')
 
         # Safe height above the tube, in work coordinates (portable - no G53).
@@ -4526,7 +4557,9 @@ class FRCPostProcessor:
         if tube_coolant_off:
             gcode.append(tube_coolant_off)
         gcode.append('M5')
-        gcode.append('G54  ; Reset to standard work coordinate system')
+        wcs_reset = self._tube_wcs_reset_gcode()
+        if wcs_reset:
+            gcode.append(wcs_reset)
         gcode.extend(self._park_gcode('Park for part access'))  # G53 park only if configured
         gcode.append('M30')
 
@@ -4561,7 +4594,7 @@ class FRCPostProcessor:
                 'dwell_time': self._format_time(time_estimate['dwell']),
                 'setup_instructions': [
                     'Mount tube in jig with end facing spindle',
-                    'Verify G55 is set to jig origin',
+                    self._tube_wcs_setup_instruction(),
                     'Z=0 is at bottom of tube (jig surface)',
                     'Y=0 is at nominal end face of tube'
                 ],
@@ -4594,7 +4627,8 @@ class FRCPostProcessor:
         - a distinct pattern (two-face mode) when second_face_pp is provided — its
           geometry is X-mirrored the same way to land correctly on the flipped tube.
 
-        The jig uses G55 work coordinate system with:
+        The jig uses the configured tube work coordinate system (default G54; an alternate
+        fixed WCS such as G55 is opt-in via config.tube_work_coordinate_system) with:
         - Origin at bottom-left corner of tube face
         - X-axis along tube width
         - Y-axis pointing away from spindle (into tube)
@@ -4651,8 +4685,11 @@ class FRCPostProcessor:
         gcode.append('( )')
         gcode.append('( SETUP INSTRUCTIONS: )')
         gcode.append('( 1. Mount tube in jig with end facing spindle )')
-        gcode.append('( 2. Jig uses G55 work coordinate system [fixed position] )')
-        gcode.append('( 3. G55 origin is at bottom-left corner of tube face )')
+        if self.tube_wcs == 'G54':
+            gcode.append('( 2. Zero G54 to the tube for this job )')
+        else:
+            gcode.append(f'( 2. Jig uses fixed {self.tube_wcs} work coordinate system )')
+        gcode.append(f'( 3. {self.tube_wcs} origin is at bottom-left corner of tube face )')
         gcode.append('( 4. X = tube width, Y = into tube, Z = tube height )')
         gcode.append('( )')
 
@@ -4670,7 +4707,7 @@ class FRCPostProcessor:
             gcode.append(pattern_coolant_on)
         gcode.append('G4 P3.0')
         gcode.append('')
-        gcode.append('G55  ; Use jig work coordinate system')
+        gcode.append(self._tube_wcs_activate_gcode())
         gcode.append('')
 
         # Safe height above the tube, in work coordinates (portable - no G53).
@@ -4811,7 +4848,9 @@ class FRCPostProcessor:
         if pattern_coolant_off:
             gcode.append(pattern_coolant_off)
         gcode.append('M5')
-        gcode.append('G54  ; Reset to standard work coordinate system')
+        wcs_reset = self._tube_wcs_reset_gcode()
+        if wcs_reset:
+            gcode.append(wcs_reset)
         gcode.extend(self._park_gcode('Park for part access'))  # G53 park only if configured
         gcode.append('M30')
 
@@ -4886,7 +4925,7 @@ class FRCPostProcessor:
                 'dwell_time': self._format_time(time_estimate['dwell']),
                 'setup_instructions': [
                     'Mount tube in jig with end facing spindle',
-                    'Verify G55 is set to jig origin',
+                    self._tube_wcs_setup_instruction(),
                     'Origin (0,0,0) = bottom-left corner of tube face'
                 ],
                 'operation_notes': operation_notes

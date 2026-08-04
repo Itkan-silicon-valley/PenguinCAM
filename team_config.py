@@ -114,12 +114,12 @@ TEAM_6238_DEFAULTS = {
         'manufacturer': 'Generic',
         'controller': 'Generic',
         'dimensions': {'x_max': 24.0, 'y_max': 24.0, 'z_max': 8.0},
-        # park_position and coolant are intentionally NOT defaulted: they are opt-in.
-        # A config with no park_position emits portable G54-only output (no G53); a config
-        # with no coolant emits no M7/M8/M9. Machines that want them (e.g. Mach4 routers)
-        # add them to their config. Keeps output compatible with GRBL/Easel/WinCNC.
-        'standard_work_offset': 'G54',
-        'tube_jig_work_offset': 'G55',
+        # park_position, coolant, and tube_work_coordinate_system are intentionally NOT
+        # defaulted: they are opt-in. A config with no park_position emits portable G54-only
+        # output (no G53); no coolant -> no M7/M8/M9; no tube_work_coordinate_system -> tube
+        # ops use G54 (operator zeros it per tube), instead of a fixed jig WCS. Machines that
+        # want these (e.g. Mach4 routers with a fixed jig) add them to their config. Keeps
+        # output compatible with GRBL/WinCNC.
     },
     'machining': {
         'z_reference': {
@@ -471,6 +471,20 @@ class TeamConfig:
         """Machine coolant type (Air, Flood, Mist) or None. Opt-in: no value -> no coolant
         M-codes are emitted (portable across controllers)."""
         return self._get('machine', 'coolant')
+
+    @property
+    def tube_work_coordinate_system(self) -> str:
+        """Work coordinate system the tube jig is zeroed in. Defaults to 'G54' (portable:
+        the operator zeros G54 to the tube for each job, exactly like flat work). Teams with
+        a permanently-fixtured jig can set an alternate FIXED WCS (e.g. 'G55') so the jig
+        zero persists in its own coordinate system while G54 stays their per-stock flat zero.
+        Only G54-G59 (the bank supported by GRBL/Mach/WinCNC) are honored; anything else
+        (including an unset G59.x sub-system) falls back to 'G54'."""
+        value = self._get('machine', 'tube_work_coordinate_system')
+        if value is None:
+            return 'G54'
+        normalized = str(value).strip().upper()
+        return normalized if normalized in {'G54', 'G55', 'G56', 'G57', 'G58', 'G59'} else 'G54'
 
     @property
     def machine_x_max(self) -> float:
@@ -846,9 +860,13 @@ machine:
     y: 23.5     # Y position when parking (machine coords)
     z: -0.5     # safe machine Z (machine coords) to raise to before parking
 
-  # Coordinate systems
-  standard_work_offset: "G54"       # Work offset for standard operations
-  tube_jig_work_offset: "G55"       # Work offset for tube jig operations
+  # OPTIONAL work coordinate system for TUBE operations. Default (omit this line): tube
+  # jobs use G54, so the operator zeros G54 to each tube just like flat work - fully
+  # portable. If you have a PERMANENTLY-FIXTURED tube jig, set an alternate fixed WCS
+  # (G54-G59) so the jig zero persists in its own system while G54 stays your per-stock
+  # flat zero. That fixed WCS must be pre-set in your controller (e.g. G10 L2 P2 for G55);
+  # an unset WCS defaults to machine zero and will cut in the wrong place.
+  tube_work_coordinate_system: "G55"
 
   # OPTIONAL coolant. If set (Air/Mist -> M7, Flood -> M8, with M9 off), coolant M-codes
   # are emitted. OMIT this line (or use None) on controllers without coolant M-codes

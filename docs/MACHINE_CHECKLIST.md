@@ -16,6 +16,13 @@ Only if you set `machine.coolant` (this is what adds M7/M8/M9):
 ☐ Controller supports the coolant M-codes (stock GRBL needs M7 compiled in)
    → If not, remove `coolant` (or set it to `None`).
 
+Only if you set `machine.tube_work_coordinate_system` to something other than G54 (for a
+permanently-fixtured tube jig):
+☐ That WCS (e.g. G55) is pre-set in the controller to the jig origin (e.g. via G10 L2 P2)
+   → An unset alternate WCS defaults to machine zero and will cut in the wrong place. If in
+     doubt, omit the setting and zero G54 to the tube for each job instead.
+
 Notes:
-- Easel (Inventables) rejects arcs (G2/G3) on import; PenguinCAM's toolpaths are arc-based.
+- Easel (Inventables) is not a supported target (rejects arcs and non-G54 offsets). On an
+  Easel machine, send PenguinCAM output directly to the underlying GRBL controller instead.
 ❌ If a required box is unchecked, review or modify the post-processor before running.

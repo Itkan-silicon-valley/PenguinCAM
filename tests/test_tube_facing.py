@@ -103,15 +103,16 @@ class TestTubeFacingGeneration(unittest.TestCase):
         finally:
             os.unlink(output_path)
 
-    def test_uses_g55_not_g52(self):
-        """Test output uses G55 and doesn't contain G52."""
+    def test_uses_work_offset_not_g52(self):
+        """Tube ops use a standard work coordinate system (G54 by default), never the G52
+        local-offset that some controllers mishandle."""
         with tempfile.NamedTemporaryFile(suffix='.nc', delete=False) as f:
             output_path = f.name
         try:
             self._generate_tube_gcode_to_file(output_path, '1x1')
             with open(output_path) as f:
                 content = f.read()
-            self.assertIn("G55", content)
+            self.assertIn("G54", content)      # default tube WCS
             self.assertNotIn("G52", content)
         finally:
             os.unlink(output_path)
@@ -290,6 +291,37 @@ class TestTubeFacingGeneration(unittest.TestCase):
         content = pp.generate_tube_facing_gcode(tube_size='1x1').gcode
         self.assertIn("G53 G0 Z-0.2500", content)      # raise to machine safe Z
         self.assertIn("G53 G0 X0.5 Y-0.5", content)    # gantry to the configured park spot
+
+    def test_tube_wcs_defaults_to_g54(self):
+        """With no tube WCS configured, tube ops run in G54 (operator zeros it per tube) -
+        portable, with no G55 and no WCS-reset noise."""
+        content = self.pp.generate_tube_facing_gcode(tube_size='1x1').gcode
+        self.assertIn("G54  ; Work coordinate system, zeroed at the tube origin", content)
+        self.assertNotIn("G55", content)
+        self.assertIn("Zero G54 at the tube origin", content)   # setup instruction matches
+        # Never switched away from G54, so there is no "reset" line.
+        self.assertNotIn("Reset to standard work coordinate system", content)
+
+    def test_tube_wcs_opt_in_alternate(self):
+        """A configured fixed WCS (e.g. G55) switches tube ops into it and resets to G54 at
+        program end, for teams with a permanently-fixtured jig."""
+        cfg = TeamConfig({'version': 2, 'default_machine': 'm', 'machines': {'m': {
+            'name': 'Mach', 'machine': {'tube_work_coordinate_system': 'G55'}}}})
+        pp = FRCPostProcessor(0.25, 0.157, config=cfg)
+        content = pp.generate_tube_facing_gcode(tube_size='1x1').gcode
+        self.assertIn("G55  ; Use fixed jig work coordinate system", content)
+        self.assertIn("Verify G55 is set to the fixed jig origin", content)
+        self.assertIn("G54  ; Reset to standard work coordinate system", content)
+
+    def test_tube_wcs_invalid_falls_back_to_g54(self):
+        """An out-of-range WCS value falls back to the safe G54 default rather than emitting
+        a bogus coordinate-system code."""
+        cfg = TeamConfig({'version': 2, 'default_machine': 'm', 'machines': {'m': {
+            'name': 'M', 'machine': {'tube_work_coordinate_system': 'G99'}}}})
+        pp = FRCPostProcessor(0.25, 0.157, config=cfg)
+        content = pp.generate_tube_facing_gcode(tube_size='1x1').gcode
+        self.assertNotIn("G99", content)
+        self.assertIn("G54  ; Work coordinate system, zeroed at the tube origin", content)
 
     def test_safe_z_before_xy_pattern(self):
         """The work-coordinate safe-Z retract precedes the first XY origin move."""

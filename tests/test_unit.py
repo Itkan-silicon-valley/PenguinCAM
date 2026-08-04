@@ -2634,7 +2634,7 @@ class TestTubePatternTwoFace(unittest.TestCase):
                 self.fail(f"Non-ASCII in tube gcode: {line}")
 
     def test_one_face_mirror(self):
-        """One-face mode: two phases, mirror note, G55, flip pause, clean output."""
+        """One-face mode: two phases, mirror note, default G54 WCS, flip pause, clean output."""
         pp = self._make_face([((0.3, 1.0), 0.25)])
         result = pp.generate_tube_pattern_gcode(
             tube_height=2.0, square_end=False, cut_to_length=False,
@@ -2644,7 +2644,7 @@ class TestTubePatternTwoFace(unittest.TestCase):
         self.assertIn('PHASE 1: FIRST FACE', g)
         self.assertIn('PHASE 2: SECOND FACE', g)
         self.assertIn('One-face mode', g)
-        self.assertIn('G55', g)
+        self.assertIn('G54', g)   # default tube WCS (no fixed jig configured)
         self.assertIn('M0', g)
         self.assertFalse(result.stats['two_face'])
         self._assert_clean(g)
