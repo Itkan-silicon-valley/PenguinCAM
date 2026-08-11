@@ -358,6 +358,36 @@ class TestHelicalPassCalculation(unittest.TestCase):
         self.assertGreaterEqual(num_passes, 1)
 
 
+class TestMultilayerRotationConsistency(unittest.TestCase):
+    """2.5D (multi-layer) rotation must move Shapely polygons (partial-depth pockets) the
+    SAME direction as circles/polylines. A sign mismatch (shapely rotates CCW for +angle,
+    the rest rotates CW) put partial-depth pockets 180deg off - overlapping other features."""
+
+    def _coincident_distance(self, rotation):
+        """A circle and a square pocket start at the same center; after a rotation they must
+        remain coincident. Returns the distance between them (0 if rotated consistently)."""
+        from shapely.geometry import box
+        pp = FRCPostProcessor(0.25, 0.157)
+        pp.circles = []; pp.lines = []; pp.arcs = []; pp.splines = []; pp.polylines = []
+        # Off-center, off-axis location (3,1) so clockwise vs counter-clockwise clearly differ;
+        # a second far circle at (0,0) pushes the part center away from (3,1).
+        pp.layer_data = {
+            'through': {'depth': 0.0, 'circles': [{'center': (0.0, 0.0), 'radius': 0.2}],
+                        'polylines': [], 'polygons': []},
+            'pocket': {'depth': -0.1, 'circles': [{'center': (3.0, 1.0), 'radius': 0.2}],
+                       'polylines': [], 'polygons': [box(2.8, 0.8, 3.2, 1.2)]},  # square @ (3,1)
+        }
+        pp.transform_coordinates('bottom-left', rotation, enforce_bounds=False)
+        c = pp.layer_data['pocket']['circles'][0]['center']
+        p = pp.layer_data['pocket']['polygons'][0].centroid
+        return ((c[0] - p.x) ** 2 + (c[1] - p.y) ** 2) ** 0.5
+
+    def test_polygon_and_circle_stay_coincident_after_rotation(self):
+        for rotation in (0, 90, 180, 270):
+            with self.subTest(rotation=rotation):
+                self.assertAlmostEqual(self._coincident_distance(rotation), 0.0, places=6)
+
+
 class TestFilenameSanitization(unittest.TestCase):
     """Onshape part names can contain path separators and header-illegal characters (e.g.
     '1/4" plate'); the output filename must stay safe to write to disk and serve."""

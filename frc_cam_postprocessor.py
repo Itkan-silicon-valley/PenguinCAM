@@ -803,12 +803,17 @@ class FRCPostProcessor:
                     for i, polyline in enumerate(layer_info['polylines']):
                         layer_info['polylines'][i] = [rotate_point(x, y) for x, y in polyline]
 
-                    # Rotate Shapely Polygons
+                    # Rotate Shapely Polygons. NOTE: rotation_angle is degrees CLOCKWISE
+                    # (matching rotate_point above, which uses -radians(rotation_angle)), but
+                    # shapely's affinity.rotate treats a positive angle as COUNTER-clockwise.
+                    # Negate so polygons rotate the SAME direction as circles/polylines -
+                    # otherwise a partial-depth pocket ends up mirrored 180deg from the rest
+                    # of the part (overlapping other features).
                     if 'polygons' in layer_info:
                         rotated_polygons = []
                         for poly in layer_info['polygons']:
-                            # Rotate around center point
-                            rotated = affinity.rotate(poly, rotation_angle, origin=(centerX, centerY), use_radians=False)
+                            # Rotate around center point (clockwise, to match rotate_point)
+                            rotated = affinity.rotate(poly, -rotation_angle, origin=(centerX, centerY), use_radians=False)
                             rotated_polygons.append(rotated)
                         layer_info['polygons'] = rotated_polygons
 
