@@ -20,7 +20,7 @@ from typing import List, Tuple, Optional, Dict, Any
 # Third-party
 import ezdxf
 from shapely import affinity
-from shapely.geometry import Point, Polygon, LinearRing, MultiPolygon
+from shapely.geometry import Point, Polygon, LinearRing, MultiPolygon, LineString
 from shapely.geometry.polygon import orient
 from shapely.ops import unary_union
 
@@ -3056,6 +3056,63 @@ class FRCPostProcessor:
 
         return relative_deviation < tolerance
 
+    @staticmethod
+    def _reorder_closed_ring(points: List[Tuple[float, float]], ref: Tuple[float, float]) -> List[Tuple[float, float]]:
+        """Rotate a closed ring's vertex list so it begins at the vertex nearest `ref`, keeping
+        winding order. Makes the link from the previous ring a short one-stepover hop instead of
+        a long diagonal (shapely's orient() does not fix the start vertex)."""
+        if len(points) < 2:
+            return list(points)
+        rx, ry = ref
+        best = min(range(len(points)), key=lambda i: (points[i][0] - rx) ** 2 + (points[i][1] - ry) ** 2)
+        return list(points[best:]) + list(points[:best])
+
+    def _emit_ring_ramp(self, gcode: List[str], ring: List[Tuple[float, float]],
+                        ramp_start_height: float, final_cut_z: float) -> None:
+        """Descend from ramp_start_height to final_cut_z by walking the closed `ring` (looping
+        as many full laps as the ramp angle needs), ending back at ring[0] at depth. The tool is
+        assumed positioned above ring[0] at ramp_start_height. Ramping ALONG the ring keeps the
+        plunge inside the pocket - never a straight full-depth plunge into keep-material."""
+        drop = ramp_start_height - final_cut_z
+        if drop <= 1e-9:
+            return
+        loop = list(ring) + [ring[0]]
+        perim = sum(math.dist(loop[i], loop[i + 1]) for i in range(len(loop) - 1)) or 1e-9
+        ramp_len = drop / math.tan(math.radians(self.ramp_angle)) if self.ramp_angle > 0 else drop
+        laps = min(max(1, int(math.ceil(ramp_len / perim))), 100)  # cap laps for tiny rings
+        total_len = laps * perim
+        traveled = 0.0
+        prev = ring[0]
+        for _ in range(laps):
+            for pt in loop[1:]:               # one full lap ends back at ring[0]
+                traveled += math.dist(prev, pt)
+                z = ramp_start_height - drop * min(1.0, traveled / total_len)
+                gcode.append(f"G1 X{pt[0]:.4f} Y{pt[1]:.4f} Z{z:.4f} F{self.ramp_feed_rate}  ; Ramp in along ring")
+                prev = pt
+
+    def _link_and_cut_ring(self, gcode: List[str], ring_points: List[Tuple[float, float]],
+                           cur_pos: Tuple[float, float], safe_region, ramp_start_height: float,
+                           final_cut_z: float, link_tol: float) -> Tuple[float, float]:
+        """Move from cur_pos onto a closed contour ring, cut it, and return the end position
+        (its start vertex). The ring is reordered to start nearest cur_pos (fix 2). If the
+        straight link would leave the pocket - a concave notch, or a disconnected buffer region -
+        retract and ramp back down along the ring instead of gouging straight across keep-material
+        (fix 1)."""
+        ring = self._reorder_closed_ring(ring_points, cur_pos)
+        start = ring[0]
+        if safe_region.buffer(link_tol).contains(LineString([cur_pos, start])):
+            gcode.append(f"G1 X{start[0]:.4f} Y{start[1]:.4f} F{self.feed_rate}")
+        else:
+            gcode.append(f"G0 Z{self.retract_height:.4f}  ; Retract - straight link would cross keep-material")
+            gcode.append(f"G0 X{start[0]:.4f} Y{start[1]:.4f}  ; Rapid over the notch to the ring")
+            gcode.append(f"G0 Z{ramp_start_height:.4f}  ; Down to ramp-start height")
+            self._emit_ring_ramp(gcode, ring, ramp_start_height, final_cut_z)  # ends at `start` at depth
+        # Clean lap at depth
+        for p in ring[1:]:
+            gcode.append(f"G1 X{p[0]:.4f} Y{p[1]:.4f} F{self.feed_rate}")
+        gcode.append(f"G1 X{start[0]:.4f} Y{start[1]:.4f} F{self.feed_rate}")
+        return start
+
     def _generate_pocket_gcode(self, pocket_points: List[Tuple[float, float]]) -> List[str]:
         """Generate G-code for a pocket with tool compensation (offset inward) and helical entry.
         Uses spiral clearing for circular pockets, contour-parallel for non-circular."""
@@ -3140,76 +3197,61 @@ class FRCPostProcessor:
         # (a circular spiral would leave material in slot-shaped pockets)
         gcode.append(f"(Pocket clearing - using contour-parallel stepover passes)")
 
-        # Generate inward offsets from perimeter to center
-        current_offset_distance = -self.tool_radius  # Start from tool-compensated perimeter
-        contours = []
+        # Depth the helix reached; every contour/perimeter pass cuts at this Z, and a ramped
+        # re-entry (in _link_and_cut_ring) must ramp back down to it.
+        final_cut_z = ramp_start_height - num_helical_passes * depth_per_pass
 
-        # Calculate how many offset passes we need
-        # Find the maximum inset we can do (when pocket becomes too small)
-        test_offset = current_offset_distance
+        # Generate inward offsets from perimeter to center
+        contours = []
+        test_offset = -self.tool_radius   # Start from the tool-compensated perimeter
         while True:
             test_offset -= stepover
             test_poly = pocket_poly.buffer(test_offset)
             if test_poly.is_empty or test_poly.area < 0.001:
                 break
-            # For complex shapes, buffer can create MultiPolygon - handle both cases
-            contours.append(test_poly)
+            contours.append(test_poly)   # may be a MultiPolygon for complex (e.g. concave) shapes
 
         gcode.append(f"(Contour-parallel clearing: {len(contours)} offset passes)")
 
-        # Cut contours from outside-in (perimeter to center)
+        # Cut contours center-outward, then the exact perimeter. Every ring is linked with a
+        # GUARDED move: a straight feed when the link stays inside the pocket (offset_poly),
+        # otherwise a retract + ramped re-entry along the ring - so a concave (L/U) pocket never
+        # slots straight across the notch through keep-material. Rings are also reordered to
+        # start nearest the tool, keeping links to a short one-stepover hop. The tool sits at the
+        # pocket entry (at depth) after the helix.
+        link_tol = 1e-4
+        cur_pos = (entry_x, entry_y)
         pass_number = 0
         for contour_geom in reversed(contours):
-            # Handle both Polygon and MultiPolygon (complex shapes can split into multiple regions)
             polygons_to_cut = []
             if hasattr(contour_geom, 'exterior'):
-                # Single Polygon
                 polygons_to_cut.append(contour_geom)
             elif hasattr(contour_geom, 'geoms'):
-                # MultiPolygon - cut all separate regions
-                polygons_to_cut.extend(contour_geom.geoms)
-
+                polygons_to_cut.extend(contour_geom.geoms)   # disconnected regions of a concave pocket
             for poly in polygons_to_cut:
                 if not hasattr(poly, 'exterior'):
                     continue
-
-                # Canonical orientation (exterior CCW) = climb milling for interior pockets.
-                poly = orient(poly, 1.0)
+                poly = orient(poly, 1.0)   # exterior CCW = climb milling for interior pockets
                 contour_points = list(poly.exterior.coords)[:-1]
                 if len(contour_points) < 3:
                     continue
-
                 pass_number += 1
                 gcode.append(f"(Contour pass {pass_number})")
+                cur_pos = self._link_and_cut_ring(gcode, contour_points, cur_pos, offset_poly,
+                                                  ramp_start_height, final_cut_z, link_tol)
 
-                # Move to start of contour
-                gcode.append(f"G1 X{contour_points[0][0]:.4f} Y{contour_points[0][1]:.4f} F{self.feed_rate}")
-
-                # Cut the contour
-                for point in contour_points[1:]:
-                    gcode.append(f"G1 X{point[0]:.4f} Y{point[1]:.4f} F{self.feed_rate}")
-
-                # Close the contour
-                gcode.append(f"G1 X{contour_points[0][0]:.4f} Y{contour_points[0][1]:.4f} F{self.feed_rate}")
-
-                # Step directly to the next (larger) ring's start instead of returning to
-                # center. Passes run center-outward with aligned start points, so the next
-                # pass's move-to-start is a clean one-stepover radial link through uncut
-                # material — no wasted in-and-out across the already-cleared interior.
-
-        # Final pass - cut actual perimeter at exact size
+        # Final pass - cut the exact (tool-compensated) perimeter.
         gcode.append(f"(Final pass: cut exact perimeter)")
-        gcode.append(f"G1 X{offset_points[0][0]:.4f} Y{offset_points[0][1]:.4f} F{self.feed_rate}")
-        for point in offset_points[1:]:
-            gcode.append(f"G1 X{point[0]:.4f} Y{point[1]:.4f} F{self.feed_rate}")
-        gcode.append(f"G1 X{offset_points[0][0]:.4f} Y{offset_points[0][1]:.4f} F{self.feed_rate}  ; Close pocket")
+        cur_pos = self._link_and_cut_ring(gcode, offset_points, cur_pos, offset_poly,
+                                          ramp_start_height, final_cut_z, link_tol)
 
-        # Spring pass: re-trace the perimeter at zero stepover to relieve tool
-        # deflection that left the pocket slightly undersized.
+        # Spring pass: re-trace the perimeter at zero stepover to relieve tool deflection that
+        # left the pocket slightly undersized. The tool is already on the perimeter.
         gcode.append(f"(Spring pass - compensate for tool deflection)")
-        for point in offset_points[1:]:
+        spring = self._reorder_closed_ring(offset_points, cur_pos)
+        for point in spring[1:]:
             gcode.append(f"G1 X{point[0]:.4f} Y{point[1]:.4f} F{self.feed_rate}")
-        gcode.append(f"G1 X{offset_points[0][0]:.4f} Y{offset_points[0][1]:.4f} F{self.feed_rate}  ; Close spring pass")
+        gcode.append(f"G1 X{spring[0][0]:.4f} Y{spring[0][1]:.4f} F{self.feed_rate}  ; Close spring pass")
 
         # Retract
         gcode.append(f"G0 Z{self.retract_height:.4f}  ; Retract")

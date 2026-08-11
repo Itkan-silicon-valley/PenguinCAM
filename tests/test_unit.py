@@ -394,6 +394,65 @@ class TestPocketEntryPoint(unittest.TestCase):
         self.assertAlmostEqual(ey, offset.centroid.y, places=3)
 
 
+class TestPocketConcaveClearing(unittest.TestCase):
+    """Concave pockets must never link straight across a notch through keep-material. Aligned
+    ring starts keep links to a short in-pocket hop; a guard + ramped re-entry is the fallback
+    when a link would still exit the pocket."""
+
+    def _cutting_moves_outside(self, pocket_pts):
+        import re
+        from shapely.geometry import Polygon, LineString
+        pp = FRCPostProcessor(0.25, 0.157)
+        pp.apply_material_preset('aluminum')
+        offset = Polygon(pocket_pts).buffer(-pp.tool_radius)   # tool-center safe region
+        text = '\n'.join(pp._generate_pocket_gcode(pocket_pts))
+        cur = None; z = 10.0; outside = 0
+        for l in text.splitlines():
+            mz = re.search(r'Z([-\d.]+)', l); m = re.search(r'G[0-3] X([-\d.]+) Y([-\d.]+)', l)
+            nz = float(mz.group(1)) if mz else z
+            if m:
+                x, y = float(m.group(1)), float(m.group(2))
+                cutting = z < pp.material_top - 1e-6 and nz < pp.material_top - 1e-6 and l.strip().startswith('G1')
+                if cur is not None and cutting and not offset.buffer(1e-3).contains(LineString([cur, (x, y)])):
+                    outside += 1
+                cur = (x, y)
+            z = nz
+        return outside
+
+    def test_u_pocket_never_cuts_outside(self):
+        U = [(0, 0), (5, 0), (5, 4), (3, 4), (3, 1.5), (2, 1.5), (2, 4), (0, 4)]  # centroid in the notch
+        self.assertEqual(self._cutting_moves_outside(U), 0)
+
+    def test_dumbbell_pocket_never_cuts_outside(self):
+        # Two lobes joined by a thin neck: inner offsets split into a MultiPolygon.
+        D = [(0, 0), (2, 0), (2, 0.9), (3, 0.9), (3, 0), (5, 0),
+             (5, 2), (3, 2), (3, 1.1), (2, 1.1), (2, 2), (0, 2)]
+        self.assertEqual(self._cutting_moves_outside(D), 0)
+
+    def test_reorder_ring_starts_nearest_reference(self):
+        ring = [(0, 0), (1, 0), (1, 1), (0, 1)]
+        out = FRCPostProcessor._reorder_closed_ring(ring, (0.9, 1.1))  # nearest vertex is (1,1)
+        self.assertEqual(out[0], (1, 1))
+        self.assertEqual(set(out), set(ring))          # same vertices, just rotated
+
+    def test_ring_reentry_ramps_when_link_would_exit(self):
+        """When a link would leave the pocket, re-enter with a retract + ramp along the ring
+        (down to full cut depth) rather than a straight plunge or a gouge across the notch."""
+        from shapely.geometry import Polygon
+        pp = FRCPostProcessor(0.25, 0.157)
+        pp.apply_material_preset('aluminum')
+        safe = Polygon([(0, 0), (1, 0), (1, 1), (0, 1)])            # small pocket
+        ring = [(0.2, 0.2), (0.8, 0.2), (0.8, 0.8), (0.2, 0.8)]
+        ramp_start = pp.material_top + pp.ramp_start_clearance
+        g = []
+        end = pp._link_and_cut_ring(g, ring, (5.0, 5.0), safe, ramp_start, pp.cut_depth, 1e-4)
+        text = '\n'.join(g)
+        self.assertIn('Retract', text)                             # guard fired
+        self.assertIn('Ramp in along ring', text)                  # ramped, not straight-plunged
+        self.assertIn(f'Z{pp.cut_depth:.4f}', text)                # ramp reaches full depth
+        self.assertEqual(end, (0.8, 0.8))                          # ends at the vertex nearest cur_pos
+
+
 class TestMultilayerRotationConsistency(unittest.TestCase):
     """2.5D (multi-layer) rotation must move Shapely polygons (partial-depth pockets) the
     SAME direction as circles/polylines. A sign mismatch (shapely rotates CCW for +angle,
