@@ -131,6 +131,13 @@ class FRCPostProcessor:
         # Holes smaller than this are skipped
         self.min_millable_hole = tool_diameter * config.min_millable_hole_multiplier
 
+        # Tolerance for the "hole at least tool-sized" gate. Absorbs unit-conversion / DXF
+        # rounding (e.g. a "4mm" -> 0.15748" tool vs a 0.157" hole) so an essentially
+        # tool-sized hole is peck-drilled rather than rejected as "too small", and doubles
+        # as the threshold below which a peck hole is a pure straight plunge with no lateral
+        # clearing (which would otherwise emit a degenerate zero-radius arc).
+        self.hole_size_tolerance = 0.002 if units == "inch" else 0.05
+
         # Multi-layer support
         self.layer_data = None  # Set by load_dxf for multi-layer DXFs
 
@@ -983,16 +990,20 @@ class FRCPostProcessor:
             diameter = circle['diameter']
             center = circle['center']
 
-            # Check if hole is too small to mill with this tool
-            if diameter < self.tool_diameter:
+            # Reject only holes genuinely smaller than the tool (with a tolerance so a hole
+            # that is essentially the tool diameter - within unit-conversion/DXF rounding -
+            # is drilled, not rejected). A hole at the tool size is made by plunging straight
+            # down (peck drill), not milling.
+            if diameter < self.tool_diameter - self.hole_size_tolerance:
                 error_msg = f"Hole at ({center[0]:.3f}, {center[1]:.3f}) has diameter {diameter:.3f}\" which is too small for {self.tool_diameter:.3f}\" tool"
                 self._add_error(error_msg)
                 continue
 
             # Determine machining strategy based on hole size
             if diameter < self.min_millable_hole:
-                # Hole is larger than tool but too small to helical entry
-                # Use peck drilling to get down, then spiral clear at bottom
+                # Hole is tool-sized up to (but not big enough for) helical entry: peck drill
+                # straight down, then spiral-clear at the bottom if there is material to clear
+                # (a hole exactly the tool size is a pure plunge with no clearing).
                 strategy = 'peck+spiral'
                 self.holes.append({'center': center, 'diameter': diameter, 'needs_peck_drill': True})
                 print(f"  Hole (d={diameter:.3f}\") at ({center[0]:.3f}, {center[1]:.3f}) - using peck drill + spiral")
@@ -2682,7 +2693,15 @@ class FRCPostProcessor:
         retract_plane = self.material_top + 0.1  # 0.1" above stock for chip clearing (not full retract)
         final_depth = self.cut_depth  # Bottom of cut (negative value)
 
-        gcode.append(f"(Peck drill at center, then spiral clear to {diameter:.3f}\" diameter)")
+        # A hole at (essentially) the tool diameter has no material to clear beyond the
+        # drilled bore: it's a pure straight peck drill. Skip the spiral + finishing arcs
+        # entirely (a zero-radius arc I0 J0 is degenerate and errors on many controllers).
+        pure_drill = final_toolpath_radius <= self.hole_size_tolerance
+
+        if pure_drill:
+            gcode.append(f"(Peck drill straight down - hole is tool-sized, no lateral clearing)")
+        else:
+            gcode.append(f"(Peck drill at center, then spiral clear to {diameter:.3f}\" diameter)")
 
         # Rapid to hole center above material
         gcode.append(f"G0 X{cx:.4f} Y{cy:.4f}  ; Rapid to hole center")
@@ -2693,6 +2712,10 @@ class FRCPostProcessor:
         # Z = final depth (negative), R = retract plane, Q = peck depth, F = plunge rate
         gcode.append(f"G83 X{cx:.4f} Y{cy:.4f} Z{final_depth:.4f} R{retract_plane:.4f} Q{peck_depth:.4f} F{self.plunge_rate}  ; Peck drill to full depth")
         gcode.append("G80  ; Cancel canned cycle")
+
+        if pure_drill:
+            gcode.append(f"G0 Z{self.retract_height:.4f}  ; Retract")
+            return gcode
 
         # Now at bottom of hole, do spiral clearing pass to open to final diameter
         # Start from center and spiral outward
@@ -2753,13 +2776,15 @@ class FRCPostProcessor:
         hole_radius = diameter / 2
         final_toolpath_radius = hole_radius - self.tool_radius
 
+        # If hole is too small for helical entry, use peck drilling to get down. A hole at
+        # the tool size has a zero (or float-noise-negative) toolpath radius: clamp it to 0
+        # so it becomes a pure straight peck drill (the peck helper skips lateral clearing).
+        if needs_peck_drill:
+            return self._generate_peck_drill_and_spiral_gcode(cx, cy, diameter, max(final_toolpath_radius, 0.0))
+
         if final_toolpath_radius <= 0:
             gcode.append(f"(WARNING: Tool diameter {self.tool_diameter:.4f}\" is too large for {diameter:.4f}\" hole!)")
             return gcode
-
-        # If hole is too small for helical entry, use peck drilling to get down
-        if needs_peck_drill:
-            return self._generate_peck_drill_and_spiral_gcode(cx, cy, diameter, final_toolpath_radius)
 
         # Strategy: Helical entry at small radius, then spiral outward
         # Each pass increases the radius by stepover percentage (material-specific)

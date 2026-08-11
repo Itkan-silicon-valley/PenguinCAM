@@ -391,6 +391,47 @@ class TestHoleClassification(unittest.TestCase):
         self.pp.classify_holes()
         self.assertEqual(len(self.pp.holes), 1)
 
+    def test_hole_exactly_tool_size_is_peck_drilled_not_rejected(self):
+        """A hole exactly the tool diameter must be kept and flagged for peck drilling
+        (straight plunge), not rejected as too small."""
+        self.pp.circles = [
+            {'center': (1, 1), 'radius': self.pp.tool_diameter / 2, 'diameter': self.pp.tool_diameter},
+        ]
+        self.pp.classify_holes()
+        self.assertFalse(any('too small' in e for e in self.pp.errors))
+        self.assertEqual(len(self.pp.holes), 1)
+        self.assertTrue(self.pp.holes[0]['needs_peck_drill'])
+
+    def test_hole_a_hair_under_tool_from_rounding_is_kept(self):
+        """A hole a hair under the tool size (e.g. a 0.157" hole vs a "4mm"->0.15748" tool)
+        is within tolerance and drilled, not rejected."""
+        pp = FRCPostProcessor(0.25, 4.0 / 25.4)   # 4mm tool = 0.15748"
+        pp.circles = [{'center': (1, 1), 'radius': 0.157 / 2, 'diameter': 0.157}]
+        pp.classify_holes()
+        self.assertFalse(any('too small' in e for e in pp.errors))
+        self.assertEqual(len(pp.holes), 1)
+        self.assertTrue(pp.holes[0]['needs_peck_drill'])
+
+    def test_hole_genuinely_smaller_than_tool_is_rejected(self):
+        """A hole clearly smaller than the tool (beyond the rounding tolerance) is still
+        rejected - the tool physically cannot make it."""
+        self.pp.circles = [
+            {'center': (1, 1), 'radius': 0.05, 'diameter': 0.10},   # 0.10" << 0.157" tool
+        ]
+        self.pp.classify_holes()
+        self.assertTrue(any('too small' in e for e in self.pp.errors))
+        self.assertEqual(len(self.pp.holes), 0)
+
+    def test_tool_sized_hole_gcode_is_pure_drill_no_degenerate_arc(self):
+        """The G-code for a tool-sized hole peck-drills straight down and emits no
+        zero-radius (I0 J0) arc, which many controllers reject."""
+        self.pp.apply_material_preset('aluminum')   # sets peck_drill_depth
+        g = '\n'.join(self.pp._generate_hole_gcode(1.0, 1.0, self.pp.tool_diameter,
+                                                   needs_peck_drill=True))
+        self.assertIn('G83', g)                     # peck drill happens
+        self.assertNotIn('I0.0000 J0', g)           # no degenerate finishing arc
+        self.assertIn('no lateral clearing', g)     # pure straight drill path taken
+
 
 class TestHoleSorting(unittest.TestCase):
     """Test hole sorting for travel optimization using nearest neighbor + 2-opt"""
