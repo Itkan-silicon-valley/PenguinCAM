@@ -358,6 +358,42 @@ class TestHelicalPassCalculation(unittest.TestCase):
         self.assertGreaterEqual(num_passes, 1)
 
 
+class TestPocketEntryPoint(unittest.TestCase):
+    """A pocket's helical plunge point must lie INSIDE the pocket. For a concave pocket
+    (L/U shape) the centroid can fall outside, which used to plunge into keep-material and
+    slot laterally to reach the pocket."""
+
+    import re as _re
+
+    def _entry_point(self, pocket_points):
+        pp = FRCPostProcessor(0.25, 0.157)
+        pp.apply_material_preset('aluminum')
+        text = '\n'.join(pp._generate_pocket_gcode(pocket_points))
+        m = TestPocketEntryPoint._re.search(
+            r'X([-\d.]+) Y([-\d.]+) F[\d.]+  ; Position at pocket center', text)
+        self.assertIsNotNone(m, "no pocket entry line emitted")
+        return float(m.group(1)), float(m.group(2))
+
+    def test_l_shaped_pocket_entry_is_inside(self):
+        from shapely.geometry import Polygon, Point
+        L = [(0, 0), (3, 0), (3, 1), (1, 1), (1, 3), (0, 3)]   # concave: centroid is in the notch
+        poly = Polygon(L)
+        self.assertFalse(poly.contains(poly.centroid))          # precondition: centroid is outside
+        ex, ey = self._entry_point(L)
+        offset = poly.buffer(-0.157 / 2)                        # tool-compensated pocket
+        self.assertTrue(offset.contains(Point(ex, ey)),
+                        f"entry ({ex},{ey}) must lie inside the pocket")
+
+    def test_convex_pocket_still_enters_at_centroid(self):
+        from shapely.geometry import Polygon
+        rect = [(0, 0), (4, 0), (4, 2), (0, 2)]
+        offset = Polygon(rect).buffer(-0.157 / 2)
+        ex, ey = self._entry_point(rect)
+        # No regression: convex pocket still plunges at the (inside) centroid.
+        self.assertAlmostEqual(ex, offset.centroid.x, places=3)
+        self.assertAlmostEqual(ey, offset.centroid.y, places=3)
+
+
 class TestMultilayerRotationConsistency(unittest.TestCase):
     """2.5D (multi-layer) rotation must move Shapely polygons (partial-depth pockets) the
     SAME direction as circles/polylines. A sign mismatch (shapely rotates CCW for +angle,

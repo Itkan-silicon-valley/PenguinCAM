@@ -3086,9 +3086,16 @@ class FRCPostProcessor:
             self._add_error(error_msg)
             return gcode
 
-        # Use pocket centroid as entry position (center of pocket)
-        entry_x = offset_poly.centroid.x
-        entry_y = offset_poly.centroid.y
+        # Entry (plunge) point. The offset polygon's centroid is a nicely-centered plunge
+        # point for convex pockets, but for a CONCAVE pocket (e.g. an L or U shape) the
+        # centroid can fall OUTSIDE the polygon - which would helical-bore into keep-material
+        # and then slot laterally across to reach the pocket. Fall back to
+        # representative_point() (guaranteed inside the polygon) in that case.
+        entry_point = offset_poly.centroid
+        if not offset_poly.contains(entry_point):
+            entry_point = offset_poly.representative_point()
+        entry_x = entry_point.x
+        entry_y = entry_point.y
 
         # Calculate helical entry parameters
         helix_radius = self.tool_radius * self.helix_radius_multiplier  # Helix radius from material preset
