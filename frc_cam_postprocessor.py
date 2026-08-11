@@ -101,6 +101,32 @@ MATERIAL_PRESETS = {
 }
 
 
+def sanitize_filename_base(name: str, fallback: str = "output") -> str:
+    """Make an arbitrary Onshape part / job name safe to use as a filename base.
+
+    Onshape names can contain path separators and characters that are illegal in filenames
+    or in the download's Content-Disposition header - e.g. a part named '1/4" plate', where
+    the '/' otherwise makes os.path.join write into a nonexistent '1/' subdirectory (the
+    write fails, silently to the UI) and the '"' breaks the Content-Disposition quoting.
+    Replaces [/ \\ : * ? " < > |] with '-', collapses whitespace, trims stray leading/
+    trailing dots and dashes, and falls back to `fallback` if nothing usable remains."""
+    if not name:
+        return fallback
+    cleaned = re.sub(r'[/\\:*?"<>|]+', '-', name)   # path separators + filename/header-illegal chars
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip()  # collapse whitespace runs
+    cleaned = cleaned.strip('.-').strip()           # no leading/trailing dots or dashes
+    return cleaned if cleaned else fallback
+
+
+def build_output_filename(suggested_filename: str, timestamp: str, fallback: str = "output") -> str:
+    """Build the '<name>_<timestamp>.nc' output filename, sanitizing the (possibly CAD- or
+    user-supplied) name so it is safe to write to disk and serve. Single chokepoint shared
+    by every generator and the multi-part job assembler."""
+    base_name = sanitize_filename_base(suggested_filename, fallback)
+    timestamp_for_file = timestamp.replace('-', '').replace(' ', '_').replace(':', '')
+    return f"{base_name}_{timestamp_for_file}.nc"
+
+
 class FRCPostProcessor:
     def __init__(self, material_thickness: float, tool_diameter: float, units: str = "inch",
                  config: Optional[TeamConfig] = None):
@@ -1510,11 +1536,8 @@ class FRCPostProcessor:
                     gcode.insert(insert_idx + j, time_line)
                 break
 
-        # Generate filename with timestamp
-        base_name = suggested_filename if suggested_filename else "output"
-        # Format timestamp for filename: YYYYMMDD_HHMMSS
-        timestamp_for_file = timestamp.replace('-', '').replace(' ', '_').replace(':', '')
-        filename = f"{base_name}_{timestamp_for_file}.nc"
+        # Generate filename with timestamp (name sanitized for safe disk write + download)
+        filename = build_output_filename(suggested_filename, timestamp, "output")
 
         # Return result
         return PostProcessorResult(
@@ -2614,10 +2637,8 @@ class FRCPostProcessor:
                 errors=self.errors.copy()
             )
 
-        # Generate filename
-        base_name = suggested_filename if suggested_filename else "output"
-        timestamp_for_file = timestamp.replace('-', '').replace(' ', '_').replace(':', '')
-        filename = f"{base_name}_{timestamp_for_file}.nc"
+        # Generate filename (name sanitized for safe disk write + download)
+        filename = build_output_filename(suggested_filename, timestamp, "output")
 
         return PostProcessorResult(
             success=True,
@@ -4591,11 +4612,8 @@ class FRCPostProcessor:
         # Estimate cycle time
         time_estimate = self._estimate_cycle_time(gcode)
 
-        # Generate filename with timestamp
-        base_name = suggested_filename if suggested_filename else "tube_facing"
-        # Format timestamp for filename: YYYYMMDD_HHMMSS
-        timestamp_for_file = timestamp.replace('-', '').replace(' ', '_').replace(':', '')
-        filename = f"{base_name}_{timestamp_for_file}.nc"
+        # Generate filename with timestamp (name sanitized for safe disk write + download)
+        filename = build_output_filename(suggested_filename, timestamp, "tube_facing")
 
         # Return result
         return PostProcessorResult(
@@ -4894,11 +4912,8 @@ class FRCPostProcessor:
         num_holes = face1_holes + face2_holes
         num_pockets = face1_pockets + face2_pockets
 
-        # Generate filename with timestamp
-        base_name = suggested_filename if suggested_filename else "tube_pattern"
-        # Format timestamp for filename: YYYYMMDD_HHMMSS
-        timestamp_for_file = timestamp.replace('-', '').replace(' ', '_').replace(':', '')
-        filename = f"{base_name}_{timestamp_for_file}.nc"
+        # Generate filename with timestamp (name sanitized for safe disk write + download)
+        filename = build_output_filename(suggested_filename, timestamp, "tube_pattern")
 
         # Build operation notes based on configuration
         phase2_note = ('Phase 2: Machine distinct pattern on opposite face'
@@ -5528,9 +5543,7 @@ def assemble_job_gcode(part_jobs, header_pp, timestamp=None, suggested_filename=
                 gcode.insert(i + 1 + j, time_line)
             break
 
-    base_name = suggested_filename if suggested_filename else "job"
-    timestamp_for_file = timestamp.replace('-', '').replace(' ', '_').replace(':', '')
-    filename = f"{base_name}_{timestamp_for_file}.nc"
+    filename = build_output_filename(suggested_filename, timestamp, "job")
 
     return PostProcessorResult(
         success=True,

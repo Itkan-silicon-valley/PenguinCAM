@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from frc_cam_postprocessor import (
     FRCPostProcessor, MATERIAL_PRESETS, assemble_job_gcode, validate_job_layout,
+    sanitize_filename_base, build_output_filename,
 )
 from team_config import TeamConfig, parse_length, DEFAULT_TOOL_DIAMETER_IN
 
@@ -355,6 +356,56 @@ class TestHelicalPassCalculation(unittest.TestCase):
         # Even tiny holes need at least 1 pass
         num_passes, _ = self.pp._calculate_helical_passes(0.001)
         self.assertGreaterEqual(num_passes, 1)
+
+
+class TestFilenameSanitization(unittest.TestCase):
+    """Onshape part names can contain path separators and header-illegal characters (e.g.
+    '1/4" plate'); the output filename must stay safe to write to disk and serve."""
+
+    def test_slash_and_quote_are_removed(self):
+        # The reported failure case: '/' broke os.path.join, '"' broke Content-Disposition.
+        out = sanitize_filename_base('1/4" plate')
+        self.assertNotIn('/', out)
+        self.assertNotIn('"', out)
+        self.assertTrue(out)                 # not empty
+
+    def test_all_illegal_characters_stripped(self):
+        out = sanitize_filename_base('a/b\\c:d*e?f"g<h>i|j')
+        for bad in '/\\:*?"<>|':
+            self.assertNotIn(bad, out)
+
+    def test_empty_and_all_illegal_fall_back(self):
+        self.assertEqual(sanitize_filename_base('', 'job'), 'job')
+        self.assertEqual(sanitize_filename_base('///', 'job'), 'job')   # collapses then trims to nothing
+
+    def test_normal_name_preserved(self):
+        self.assertEqual(sanitize_filename_base('Left Gusset'), 'Left Gusset')
+
+    def test_build_output_filename_is_path_safe(self):
+        fn = build_output_filename('1/4" plate', '2026-08-10 15:30', 'output')
+        self.assertTrue(fn.endswith('.nc'))
+        self.assertNotIn('/', fn)
+        self.assertNotIn('"', fn)
+        # os.path.join must keep it in the target folder (no '/' escaping into a subdir).
+        self.assertEqual(os.path.basename(os.path.join('/tmp/out', fn)), fn)
+
+    def test_generate_gcode_produces_safe_filename_end_to_end(self):
+        doc = ezdxf.new(); msp = doc.modelspace()
+        msp.add_lwpolyline([(0, 0), (4, 0), (4, 4), (0, 4)], close=True)
+        path = tempfile.mktemp(suffix='.dxf'); doc.saveas(path)
+        try:
+            pp = FRCPostProcessor(0.25, 0.157)
+            pp.apply_material_preset('aluminum')
+            pp.load_dxf(path)
+            pp.transform_coordinates('bottom-left', 0)
+            pp.identify_perimeter_and_pockets()
+            pp.classify_holes()
+            res = pp.generate_gcode(suggested_filename='1/4" plate', timestamp='2026-08-10 15:30')
+            self.assertNotIn('/', res.filename)
+            self.assertNotIn('"', res.filename)
+            self.assertEqual(os.path.basename(res.filename), res.filename)
+        finally:
+            os.remove(path)
 
 
 class TestHoleClassification(unittest.TestCase):
