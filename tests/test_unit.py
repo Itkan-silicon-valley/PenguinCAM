@@ -19,6 +19,7 @@ from frc_cam_postprocessor import (
     sanitize_filename_base, build_output_filename,
 )
 from team_config import TeamConfig, parse_length, DEFAULT_TOOL_DIAMETER_IN
+from onshape_integration import OnshapeClient
 
 
 class TestControllerPortability(unittest.TestCase):
@@ -392,6 +393,46 @@ class TestPocketEntryPoint(unittest.TestCase):
         # No regression: convex pocket still plunges at the (inside) centroid.
         self.assertAlmostEqual(ex, offset.centroid.x, places=3)
         self.assertAlmostEqual(ey, offset.centroid.y, places=3)
+
+
+class TestStockThicknessDiscovery(unittest.TestCase):
+    """Designed stock thickness is derived from parallel-face depth bins - one formula shared
+    by the 2.5D export and the 2D thickness probe. No Onshape credentials needed: the pure
+    formula is tested directly, and detect_stock_thickness is tested against a stubbed
+    depth-binning call (the network seam)."""
+
+    def test_thickness_from_depth_bins(self):
+        f = OnshapeClient._thickness_from_depth_bins
+        self.assertAlmostEqual(f({0.0: [], -0.25: []}), 0.25)     # top - bottom
+        self.assertAlmostEqual(f({0.118: [], 0.0: []}), 0.118)    # order-independent
+        self.assertIsNone(f({0.0: []}))                            # single face -> undefined
+        self.assertIsNone(f({}))                                   # nothing found
+
+    def test_detect_stock_thickness_delegates_and_computes(self):
+        client = OnshapeClient()   # no network in __init__
+        captured = {}
+
+        def fake_bins(did, wid, eid, normal, origin, body_id=None, cached_faces_data=None, **kw):
+            captured.update(did=did, wid=wid, eid=eid, normal=normal, origin=origin,
+                            body_id=body_id, cached=cached_faces_data)
+            return {0.0: [{'face_id': 'A'}], -0.19: [{'face_id': 'B'}]}
+
+        client.find_parallel_faces_by_depth = fake_bins
+        faces = {'bodies': []}   # stand-in for a cached bodydetails response
+        thickness = client.detect_stock_thickness(
+            'D', 'W', 'E', {'x': 0, 'y': 0, 'z': 1}, {'x': 0, 'y': 0, 'z': 0},
+            body_id='BID', cached_faces_data=faces)
+        self.assertAlmostEqual(thickness, 0.19)
+        # It must pass the reference face + cached faces straight through (no re-fetch).
+        self.assertEqual(captured['body_id'], 'BID')
+        self.assertIs(captured['cached'], faces)
+        self.assertEqual(captured['normal'], {'x': 0, 'y': 0, 'z': 1})
+
+    def test_detect_stock_thickness_none_when_single_depth(self):
+        client = OnshapeClient()
+        client.find_parallel_faces_by_depth = lambda *a, **k: {0.0: [{'face_id': 'A'}]}
+        self.assertIsNone(client.detect_stock_thickness(
+            'D', 'W', 'E', {'x': 0, 'y': 0, 'z': 1}, {'x': 0, 'y': 0, 'z': 0}))
 
 
 class TestPocketConcaveClearing(unittest.TestCase):

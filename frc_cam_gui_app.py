@@ -1653,6 +1653,7 @@ def onshape_export_face():
         # part name (for the parts list) in one bodydetails call. Reused below for the
         # 2.5D depth-layer construction so we don't re-fetch faces.
         face_normal = None
+        reference_origin = None   # selected face's plane origin; needed to probe stock thickness
         name = data.get('name')
         faces = None
         resolved_bid = None
@@ -1661,7 +1662,9 @@ def onshape_export_face():
             for body in (faces or {}).get('bodies', []):
                 for fc in body.get('faces', []):
                     if fc.get('id') == fid:
-                        face_normal = (fc.get('surface') or {}).get('normal')
+                        surface = fc.get('surface') or {}
+                        face_normal = surface.get('normal')
+                        reference_origin = surface.get('origin')
                         resolved_bid = body.get('id')
                         if not name:
                             name = (body.get('properties') or {}).get('name')
@@ -1688,6 +1691,16 @@ def onshape_export_face():
             )
         else:
             dxf_bytes = client.export_face_to_dxf(did, wid, eid, fid, body_id=bid, face_normal=face_normal)
+            # Seed the (still-editable) 2D thickness field from the part's designed stock
+            # height, reusing the same parallel-face depth discovery 2.5D uses. Best-effort:
+            # on any failure detected_thickness stays None and the UI keeps its default.
+            if face_normal and reference_origin is not None:
+                try:
+                    detected_thickness = client.detect_stock_thickness(
+                        did, wid, eid, face_normal, reference_origin,
+                        body_id=bid, cached_faces_data=faces)
+                except Exception as e:
+                    log(f"[EXPORT] 2D thickness discovery failed (non-fatal): {e}")
         session_manager.update_session_tokens(client)
         if not dxf_bytes:
             return jsonify({'error': 'Onshape returned no DXF for that face.'}), 502
@@ -1705,8 +1718,8 @@ def onshape_export_face():
         geo['name'] = name or 'Onshape part'
         geo['success'] = True
         geo['multilayer'] = multilayer
-        # Thickness is derived from the CAD layers server-side (2.5D only); pass it
-        # back so the wizard's summary/preview reflect the CAD-authoritative value.
+        # Thickness discovered from the CAD part server-side: authoritative in 2.5D, and a
+        # seed for the editable field in 2D. Pass it back when we found one.
         if detected_thickness:
             geo['thickness'] = detected_thickness
         geo['dxf'] = base64.b64encode(dxf_bytes).decode('ascii')

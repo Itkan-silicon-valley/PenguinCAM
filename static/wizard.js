@@ -573,12 +573,16 @@
       alert('Tubing allows at most two faces (one per side). Remove a face first.');
       return;
     }
-    // In 2.5D the thickness is derived from the CAD layers server-side (the field
-    // is hidden in the UI). Adopt it so the summary/preview show the real value;
-    // the G-code path re-derives it from the DXF regardless.
-    if (state.mode === '2.5d' && data.thickness) {
+    // Adopt the CAD-discovered stock thickness when the server found one.
+    //  - 2.5D: the field is hidden and thickness is authoritative (G-code re-derives it
+    //    from the DXF regardless); always adopt.
+    //  - 2D: seed the still-editable field from the first part's designed height so the
+    //    user starts from the real value and can change it. Only the first part seeds it,
+    //    so re-importing later parts won't clobber a value the user may have adjusted.
+    if (data.thickness && (state.mode === '2.5d' || state.parts.length === 0)) {
       state.thickness = data.thickness;
-      state.thickness_text = (Math.round(data.thickness * 10000) / 10000) + '"';   // derived from CAD, shown in inches
+      state.thickness_text = (Math.round(data.thickness * 10000) / 10000) + '"';   // shown in inches
+      var tin = $('#f-thickness'); if (tin) tin.value = state.thickness_text;       // reflect in the editable 2D field
     }
     var p = {
       id: ++partSeq,

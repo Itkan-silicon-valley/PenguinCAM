@@ -1054,6 +1054,30 @@ class OnshapeClient:
 
         return sorted_bins
 
+    @staticmethod
+    def _thickness_from_depth_bins(depth_bins):
+        """Designed stock thickness = the span of parallel-face depths (top minus bottom),
+        in inches - or None if fewer than two distinct depths were found (a single flat face
+        has no defined thickness). Single definition used by both the 2.5D multilayer export
+        and the 2D thickness probe."""
+        depths = list(depth_bins.keys())
+        if len(depths) < 2:
+            return None
+        return max(depths) - min(depths)
+
+    def detect_stock_thickness(self, document_id, workspace_id, element_id,
+                               reference_normal, reference_origin,
+                               body_id=None, cached_faces_data=None):
+        """Discover a part's designed stock thickness (height along the reference-face normal)
+        by binning its parallel faces by depth - the same derivation 2.5D uses, exposed so the
+        2D path can seed its (still-editable) thickness field. Returns inches, or None if it
+        can't be determined. Best-effort: callers should tolerate None."""
+        depth_bins = self.find_parallel_faces_by_depth(
+            document_id, workspace_id, element_id,
+            reference_normal, reference_origin,
+            body_id=body_id, cached_faces_data=cached_faces_data)
+        return self._thickness_from_depth_bins(depth_bins)
+
     def _convert_geometry_to_solid_hatch(self, source_msp, target_msp, layer_name):
         """
         Convert circles and polylines from source to solid HATCH entities in target.
@@ -1499,15 +1523,15 @@ class OnshapeClient:
 
             log(f"  Depth {depth:.4f}\": {len(faces)} faces, offset (0.0000, 0.0000)")
 
-        # Calculate part thickness from depth bins
-        # Depths are signed distances from reference (top) face
-        # Reference face ≈ 0, bottom face ≈ -thickness (or +thickness if flipped)
+        # Calculate part thickness from depth bins (shared formula with the 2D probe).
+        # Depths are signed distances from reference (top) face:
+        # reference face ≈ 0, bottom face ≈ -thickness (or +thickness if flipped).
         depths = list(depth_bins.keys())
+        detected_thickness = self._thickness_from_depth_bins(depth_bins)
         if depths:
-            max_depth = max(depths)  # Shallowest (closest to reference, typically ~0)
             min_depth = min(depths)  # Deepest (bottom face, typically negative)
-            detected_thickness = max_depth - min_depth
-            log(f"\n📏 Detected part thickness: {detected_thickness:.4f}\" (from Z={max_depth:+.4f}\" to Z={min_depth:+.4f}\")")
+            thickness_str = f"{detected_thickness:.4f}" if detected_thickness is not None else "unknown"
+            log(f"\n📏 Detected part thickness: {thickness_str}\" (from Z={max(depths):+.4f}\" to Z={min_depth:+.4f}\")")
 
             # COORDINATE SYSTEM TRANSFORMATION
             # Transform from "distance from reference face" to "height above sacrifice board"
@@ -1533,7 +1557,6 @@ class OnshapeClient:
             dxf_contents = transformed_contents
             depth_metadata = transformed_metadata
         else:
-            detected_thickness = None
             log("\n⚠️  Could not detect part thickness (no depth bins)")
 
         # Merge DXFs with layer names and coordinate alignment
