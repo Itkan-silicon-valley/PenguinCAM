@@ -133,6 +133,29 @@ p {
     margin-bottom: 2rem;
 }
 
+/* A lead paragraph that introduces a list: hug the list below it. */
+.lead-tight {
+    margin-bottom: 0.6rem;
+}
+
+/* Lists in the intro: white like the surrounding .lead prose (not the dimmer default
+   documentation lists) and tighter vertical rhythm. */
+.lead-list {
+    font-size: 1.125rem;
+    color: var(--text);
+    margin-bottom: 2rem;
+}
+
+.lead-list li {
+    color: var(--text);
+    margin-bottom: 0.3rem;
+}
+
+.lead-list ul {
+    margin-top: 0.3rem;
+    margin-bottom: 0;
+}
+
 a {
     color: var(--primary);
     text-decoration: none;

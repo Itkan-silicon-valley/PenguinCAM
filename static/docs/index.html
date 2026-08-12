@@ -25,8 +25,51 @@
         <h1>Welcome to PenguinCAM</h1>
 
         <p class="lead">
-            PenguinCAM is a CAM post-processor that generates CNC G-code from DXF files exported from Onshape.
-            Built for <strong>FRC Team 6238 Popcorn Penguins</strong>, it automates the CAD-to-CNC workflow for flat plates without requiring CAM software.
+            PenguinCAM is a CAM post-processor that generates 3-axis CNC router G-code from DXF files exported from Onshape.
+            Built for <strong>FRC Team 6238 Popcorn Penguins</strong>, it automates the CAD-to-CNC workflow for flat plates and tubes without requiring CAM software.
+        </p>
+
+        <p class="lead">
+            <strong>Philosophy</strong>: FRC doesn't need to teach machining. Most teams do not have traditional machine tools. A (relatively) inexpensive
+            3-axis CNC router is all an FRC team really needs. But the traditional software to use any sort of CNC machine is fairly daunting. Instead,
+            PenguinCAM has the attitude that students want to get their part out of their CAD screen and into their hands with as little friction as possible,
+            similar to a laser cutter or 3D printer.
+        </p>
+
+        <p class="lead lead-tight">To accomplish this simplicity, it takes two strategies:</p>
+        <ul class="lead-list">
+            <li>Move the repetitive and opaque tasks into a one-time setup task (create a config file and save it in Onshape classroom) so that team-specific
+                choices are shared by all students on the team, with reasonable defaults so that most teams won't even need to do it.</li>
+            <li>Make the per-part inputs as minimal as possible. It does this by making some FRC-realistic assumptions:
+                <ul>
+                    <li>The machine is a 3-axis CNC router that speaks standard G-code (e.g. Omio, ShopBot, ShopSabre, Avid, XCarve, and similar)</li>
+                    <li>The parts will be cut from a small library of common FRC materials</li>
+                    <li>The parts are flat in nature (2D/2.5D plates and faces of tubes)</li>
+                    <li>A single tool (often a 4mm end mill) is sufficient to cut all features</li>
+                </ul>
+            </li>
+        </ul>
+
+        <p class="lead lead-tight">This design with these assumptions make it such that the student making parts only has to do minimal manual steps:</p>
+        <ul class="lead-list">
+            <li>Pick the part type</li>
+            <li>Identify the part(s) to be cut in CAD</li>
+            <li>Specify per-job variables (material, tool size)</li>
+            <li>Affix the stock to the CNC router and set the X/Y zero point on the stock</li>
+            <li>Load the G-code into the router</li>
+            <li>Press Go!</li>
+        </ul>
+
+        <p class="lead">
+            There might be certain machines for which there are extra steps. Some might require manual moving of the G-code to the router.
+            Some might require re-zeroing the Z axis. Some might require manually starting the spindle or the cooling system. But where
+            available, PenguinCAM will generate gcode to do all of that. PenguinCAM will even move the spindle out of the way at the end of
+            the job for you! If it's a repetitive manual step, PenguinCAM will attempt to automate it for you.
+        </p>
+
+        <p class="lead">
+            Because there are so few inputs and decisions made by the student, there is very little risk that anything will go wrong. If
+            an end mill breaks, it's almost certainly PenguinCAM's fault, not the student's.
         </p>
 
         <div class="feature-grid">
@@ -152,7 +195,7 @@
 
         <footer>
             <p>PenguinCAM is maintained by FRC Team 6238 Popcorn Penguins</p>
-            <p>Last Updated: July 2026</p>
+            <p>Last Updated: August 2026</p>
         </footer>
     </main>
 </body>
