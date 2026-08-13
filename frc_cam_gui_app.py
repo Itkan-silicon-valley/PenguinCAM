@@ -55,7 +55,7 @@ def log(*args, **kwargs):
 
 # Import Google Drive integration (optional - will work without it)
 try:
-    from google_drive_integration import upload_gcode_to_drive, GoogleDriveUploader
+    from google_drive_integration import GoogleDriveUploader
     GOOGLE_DRIVE_AVAILABLE = True
 except ImportError:
     GOOGLE_DRIVE_AVAILABLE = False
@@ -1893,7 +1893,11 @@ def set_machine():
 @app.route('/debug/session')
 @limiter.limit("30 per minute")
 def debug_session():
-    """Debug endpoint to see session contents (especially team config)"""
+    """Debug endpoint to see session contents (especially team config). Admin-only: it
+    exposes the user's email and team config."""
+    auth_error = require_admin()
+    if auth_error:
+        return auth_error
     return jsonify({
         'user_name': session.get('user_name'),
         'user_email': session.get('user_email'),
@@ -1906,7 +1910,11 @@ def debug_session():
 @app.route('/debug/onshape/faces')
 @limiter.limit("10 per minute")
 def debug_onshape_faces():
-    """Debug endpoint to test Onshape face listing"""
+    """Debug endpoint to test Onshape face listing. Admin-only: it makes live Onshape API
+    calls on the caller's behalf and returns raw tracebacks."""
+    auth_error = require_admin()
+    if auth_error:
+        return auth_error
     if not ONSHAPE_AVAILABLE:
         return jsonify({'error': 'Onshape integration not available'}), 400
 
@@ -1976,7 +1984,6 @@ def debug_onshape_faces():
         })
 
     except Exception as e:
-        import traceback
         return jsonify({
             'success': False,
             'error': str(e),
