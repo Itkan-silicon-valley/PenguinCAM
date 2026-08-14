@@ -240,97 +240,6 @@ class OnshapeClient:
             log(f"Error getting user info: {e}")
             return None
 
-    def get_user_session_info(self):
-        """
-        Get detailed session info for the authenticated user
-
-        Returns:
-            dict with user session info including name, email, etc.
-        """
-        try:
-            log("   Fetching user session info...")
-            response = self._make_api_request('GET', '/users/sessioninfo')
-            if response.status_code == 200:
-                user_info = response.json()
-                log(f"   ✅ User: {user_info.get('name', 'Unknown')}")
-                return user_info
-            else:
-                log(f"   ❌ Failed to get session info: HTTP {response.status_code}")
-                return None
-        except Exception as e:
-            log(f"   ❌ Error getting session info: {e}")
-            log(traceback.format_exc())
-            return None
-
-    def get_companies(self):
-        """
-        Get list of companies/teams the user belongs to
-
-        Returns:
-            list of company dicts
-        """
-        try:
-            log("   Fetching companies...")
-            response = self._make_api_request('GET', '/companies?activeOnly=true&includeAll=false')
-            if response.status_code == 200:
-                companies = response.json().get('items', [])
-                log(f"   ✅ Found {len(companies)} companies: {[c.get('name') for c in companies]}")
-                return companies
-            else:
-                log(f"   ❌ Failed to get companies: HTTP {response.status_code}")
-                return None
-        except Exception as e:
-            log(f"   ❌ Error getting companies: {e}")
-            log(traceback.format_exc())
-            return None
-
-    def get_document_company(self, document_id):
-        """
-        Get the company/team that owns a specific document
-
-        Args:
-            document_id: Onshape document ID
-
-        Returns:
-            dict with company info, or None if not found
-        """
-        try:
-            log("   Determining document owner company...")
-
-            # Get document info to find owner
-            doc_info = self.get_document_info(document_id)
-            if not doc_info:
-                log("   ❌ Could not get document info")
-                return None
-
-            # Documents have an 'owner' field with type and id
-            # type: 0 = user, 1 = company, 2 = team (I think - need to verify)
-            owner_info = doc_info.get('owner', {})
-            owner_type = owner_info.get('type')
-            owner_id = owner_info.get('id')
-            owner_name = owner_info.get('name', 'Unknown')
-
-            log(f"   Document owner: {owner_name} (type={owner_type}, id={owner_id[:8]}...)")
-
-            # If owner is a company/team (type 1 or 2), find it in the companies list
-            if owner_type in [1, 2]:
-                companies = self.get_companies()
-                if companies:
-                    for company in companies:
-                        if company.get('id') == owner_id:
-                            log(f"   ✅ Document belongs to company: {company.get('name')}")
-                            return company
-                    log(f"   ⚠️  Document owner company not found in user's companies")
-                    return None
-            else:
-                log(f"   ℹ️  Document is owned by user (not a company/team)")
-                return None
-
-        except Exception as e:
-            log(f"   ❌ Error getting document company: {e}")
-            log(traceback.format_exc())
-            return None
-    
     def _calculate_view_matrix(self, normal):
         """
         Calculate a view matrix that looks at a face straight-on based on its normal.
@@ -511,27 +420,6 @@ class OnshapeClient:
         
         log("\n=== All export methods failed ===")
         return None
-    
-    def _export_element_to_dxf(self, document_id, workspace_id, element_id):
-        """Try to export entire element as DXF"""
-        endpoint = f"/partstudios/d/{document_id}/w/{workspace_id}/e/{element_id}/dxf"
-        
-        try:
-            log(f"Exporting entire element as DXF...")
-            response = self._make_api_request('GET', endpoint)
-            
-            log(f"Response status: {response.status_code}")
-            
-            if response.status_code == 200:
-                log(f"Success! DXF content length: {len(response.content)} bytes")
-                return response.content
-            else:
-                log(f"Failed: {response.status_code} - {response.text}")
-                return None
-                
-        except Exception as e:
-            log(f"Error: {e}")
-            return None
     
     def start_dxf_translation(self, document_id, workspace_id, element_id):
         """
@@ -1209,7 +1097,7 @@ class OnshapeClient:
                 poly = Polygon(polyline)
                 if poly.is_valid:
                     geoms.append(poly)
-            except:
+            except Exception:
                 pass
 
         # Containment-aware union: if a smaller polygon is fully inside a larger one,
@@ -1346,7 +1234,7 @@ class OnshapeClient:
                     for entity in source_msp:
                         try:
                             entity.translate(offset_x, offset_y, 0)
-                        except:
+                        except Exception:
                             pass
 
                 # Convert geometry to solid HATCH entities
@@ -1374,11 +1262,14 @@ class OnshapeClient:
 
         log(f"\nMerged DXF size: {len(merged_bytes)} bytes")
 
-        # DEBUG: Save merged DXF for inspection
-        debug_path = "/tmp/debug_merged.dxf"
-        with open(debug_path, "wb") as f:
-            f.write(merged_bytes)
-        log(f"DEBUG: Saved merged DXF to {debug_path}")
+        # Optionally dump the merged DXF for inspection. Off by default so production 2.5D
+        # imports don't write to a world-readable /tmp path on every request; set
+        # PENGUINCAM_DEBUG_DXF=1 to enable locally.
+        if os.environ.get('PENGUINCAM_DEBUG_DXF'):
+            debug_path = "/tmp/debug_merged.dxf"
+            with open(debug_path, "wb") as f:
+                f.write(merged_bytes)
+            log(f"DEBUG: Saved merged DXF to {debug_path}")
 
         return merged_bytes
 
@@ -1629,32 +1520,6 @@ class OnshapeClient:
             log(traceback.format_exc())
             return None
     
-    def get_element_info(self, document_id, workspace_id, element_id):
-        """Get information about an element (Part Studio, Assembly, etc.)"""
-        try:
-            # Get all elements in the document
-            response = self._make_api_request(
-                'GET',
-                f'/documents/d/{document_id}/w/{workspace_id}/elements'
-            )
-            if response.status_code == 200:
-                elements = response.json()
-                log(f"   Found {len(elements)} elements in document")
-                # Find the matching element
-                for element in elements:
-                    if element.get('id') == element_id:
-                        return element
-                log(f"   Element {element_id} not found in {len(elements)} elements")
-                return None
-            else:
-                log(f"Failed to get elements: HTTP {response.status_code}")
-                log(f"Response: {response.text[:200]}")
-                return None
-        except Exception as e:
-            log(f"Error getting element info: {e}")
-            log(traceback.format_exc())
-            return None
-
     def get_user_session_info(self):
         """
         Get detailed session info for the authenticated user
@@ -1696,53 +1561,6 @@ class OnshapeClient:
                 return None
         except Exception as e:
             log(f"   ❌ Error getting companies: {e}")
-            log(traceback.format_exc())
-            return None
-
-    def get_document_company(self, document_id):
-        """
-        Get the company/team that owns a specific document
-
-        Args:
-            document_id: Onshape document ID
-
-        Returns:
-            dict with company info, or None if not found
-        """
-        try:
-            log("   Determining document owner company...")
-
-            # Get document info to find owner
-            doc_info = self.get_document_info(document_id)
-            if not doc_info:
-                log("   ❌ Could not get document info")
-                return None
-
-            # Documents have an 'owner' field with type and id
-            # type: 0 = user, 1 = company, 2 = team
-            owner_info = doc_info.get('owner', {})
-            owner_type = owner_info.get('type')
-            owner_id = owner_info.get('id')
-            owner_name = owner_info.get('name', 'Unknown')
-
-            log(f"   Document owner: {owner_name} (type={owner_type}, id={owner_id[:8]}...)")
-
-            # If owner is a company/team (type 1 or 2), find it in the companies list
-            if owner_type in [1, 2]:
-                companies = self.get_companies()
-                if companies:
-                    for company in companies:
-                        if company.get('id') == owner_id:
-                            log(f"   ✅ Document belongs to company: {company.get('name')}")
-                            return company
-                    log(f"   ⚠️  Document owner company not found in user's companies")
-                    return None
-            else:
-                log(f"   ℹ️  Document is owned by user (not a company/team)")
-                return None
-
-        except Exception as e:
-            log(f"   ❌ Error getting document company: {e}")
             log(traceback.format_exc())
             return None
 
@@ -1942,42 +1760,6 @@ class OnshapeClient:
         except Exception as e:
             log(f"   ❌ EXCEPTION in fetch_config_file: {e}")
             log(f"   Full traceback:\n{traceback.format_exc()}")
-            return None
-
-    def parse_onshape_url(self, url):
-        """
-        Parse an Onshape URL to extract document/workspace/element IDs
-        
-        Args:
-            url: Onshape URL (e.g., https://cad.onshape.com/documents/d/abc.../w/def.../e/ghi...)
-            
-        Returns:
-            dict with 'document_id', 'workspace_id', 'element_id' or None if invalid
-        """
-        try:
-            parts = url.split('/')
-            
-            result = {}
-            
-            # Find document ID
-            if '/d/' in url:
-                d_idx = parts.index('d')
-                result['document_id'] = parts[d_idx + 1]
-            
-            # Find workspace ID
-            if '/w/' in url:
-                w_idx = parts.index('w')
-                result['workspace_id'] = parts[w_idx + 1]
-            
-            # Find element ID
-            if '/e/' in url:
-                e_idx = parts.index('e')
-                result['element_id'] = parts[e_idx + 1]
-            
-            return result if len(result) == 3 else None
-            
-        except Exception as e:
-            log(f"Error parsing Onshape URL: {e}")
             return None
 
 

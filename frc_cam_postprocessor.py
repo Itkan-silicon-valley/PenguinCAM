@@ -10,10 +10,10 @@ Generates G-code from DXF files with predefined operations for:
 # Standard library
 import argparse
 import datetime
-import json
 import math
 import os
 import re
+import sys
 from dataclasses import dataclass, field
 from typing import List, Tuple, Optional, Dict, Any
 
@@ -1052,12 +1052,10 @@ class FRCPostProcessor:
                 # Hole is tool-sized up to (but not big enough for) helical entry: peck drill
                 # straight down, then spiral-clear at the bottom if there is material to clear
                 # (a hole exactly the tool size is a pure plunge with no clearing).
-                strategy = 'peck+spiral'
                 self.holes.append({'center': center, 'diameter': diameter, 'needs_peck_drill': True})
                 print(f"  Hole (d={diameter:.3f}\") at ({center[0]:.3f}, {center[1]:.3f}) - using peck drill + spiral")
             else:
                 # Hole is large enough for helical entry
-                strategy = 'helical+spiral'
                 self.holes.append({'center': center, 'diameter': diameter, 'needs_peck_drill': False})
                 print(f"  Hole (d={diameter:.3f}\") at ({center[0]:.3f}, {center[1]:.3f}) - using helical + spiral")
 
@@ -1243,7 +1241,7 @@ class FRCPostProcessor:
                 poly = Polygon(points)
                 if poly.is_valid:
                     polygons.append((poly, points, path_idx))
-            except:
+            except Exception:
                 pass
 
         if not polygons:
@@ -2056,30 +2054,6 @@ class FRCPostProcessor:
                 results.append(candidates[i])
 
         return results
-
-    def _geometries_to_shapely(self, circles, polylines):
-        """Convert circles and polylines to shapely geometries"""
-        geoms = []
-
-        # Convert circles to polygons (buffered points)
-        for circle in circles:
-            center = circle['center']
-            radius = circle['radius']
-            geoms.append(Point(center).buffer(radius))
-
-        # Convert polylines to polygons
-        for polyline in polylines:
-            if len(polyline) >= 3:
-                try:
-                    poly = Polygon(polyline)
-                    if poly.is_valid:
-                        geoms.append(poly)
-                except:
-                    pass
-
-        if geoms:
-            return unary_union(geoms)
-        return None
 
     def _subtract_geometry(self, circles, polylines, cut_geometry):
         """
@@ -5190,43 +5164,6 @@ class FRCPostProcessor:
             toolpath = [self._offset_z_coordinate(line, z_offset) for line in toolpath]
 
         return toolpath
-
-    def _mirror_x_coordinate(self, line: str, tube_width: float) -> str:
-        """
-        Mirror X coordinate in a G-code line around tube centerline.
-
-        When flipping tube end-for-end, X coordinates reflect around the centerline.
-        Arc direction (G2/G3) stays the same because the physical cutting conditions
-        are unchanged - the spindle is in the same position and tool rotation is the same.
-
-        Transformations:
-        - X_new = tube_width - X_old
-        - I_new = -I_old (flip X arc offset)
-        - J_new = J_old (Y arc offset unchanged)
-        - G2/G3 unchanged (arc direction stays the same)
-
-        Args:
-            line: G-code line to modify
-            tube_width: Width of tube face
-
-        Returns:
-            Modified G-code line with mirrored X coordinates
-        """
-        # Mirror X coordinates
-        def replace_x(match):
-            x_val = float(match.group(1))
-            new_x = tube_width - x_val
-            return f'X{new_x:.4f}'
-        line = re.sub(r'X(-?\d+\.?\d*)', replace_x, line)
-
-        # Flip I offset sign (X component of arc center)
-        def replace_i(match):
-            i_val = float(match.group(1))
-            new_i = -i_val
-            return f'I{new_i:.4f}'
-        line = re.sub(r'I(-?\d+\.?\d*)', replace_i, line)
-
-        return line
 
     def _offset_z_coordinate(self, line: str, z_offset: float) -> str:
         """

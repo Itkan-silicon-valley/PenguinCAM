@@ -2,31 +2,14 @@
 // Application State
 // ============================================================================
 
+// The live 3D/DXF/Drive state lives as closure locals below (let scene, dxfGeometry, …);
+// only these fields are actually read off appState.
 const appState = {
-    // File upload
     uploadedFile: null,
     suggestedFilename: null,
     gcodeContent: null,
     outputFilename: null,
-
-    // 3D Visualization
-    scene: null,
-    camera: null,
-    renderer: null,
-    controls: null,
-    optimalCameraPosition: { x: 10, y: 10, z: 10 },
-    optimalLookAtPosition: { x: 0, y: 0, z: 0 },
-
-    // DXF Setup
-    currentMode: 'setup',
-    dxfGeometry: null,
     rotationAngle: 0,
-    dxfCanvas2D: null,
-    dxfCtx2D: null,
-    dxfBounds: null,
-
-    // Drive integration
-    driveAvailable: false
 };
 
 // ============================================================================
@@ -209,44 +192,6 @@ function setupSettingsAutoSave() {
 // ============================================================================
 // Helper Functions
 // ============================================================================
-
-/**
- * Create a bounds tracker for calculating min/max coordinates
- */
-function createBounds() {
-    return {
-        minX: Infinity,
-        maxX: -Infinity,
-        minY: Infinity,
-        maxY: -Infinity,
-        minZ: Infinity,
-        maxZ: -Infinity,
-
-        update(x, y, z) {
-            if (x !== undefined) {
-                this.minX = Math.min(this.minX, x);
-                this.maxX = Math.max(this.maxX, x);
-            }
-            if (y !== undefined) {
-                this.minY = Math.min(this.minY, y);
-                this.maxY = Math.max(this.maxY, y);
-            }
-            if (z !== undefined) {
-                this.minZ = Math.min(this.minZ, z);
-                this.maxZ = Math.max(this.maxZ, z);
-            }
-        },
-
-        isValid() {
-            return this.minX !== Infinity;
-        },
-
-        reset() {
-            this.minX = this.minY = this.minZ = Infinity;
-            this.maxX = this.maxY = this.maxZ = -Infinity;
-        }
-    };
-}
 
 // ============================================================================
 // Part Selection Modal
@@ -1718,10 +1663,6 @@ document.addEventListener('DOMContentLoaded', () => {
             animate();
         }
 
-        function addAxisLabels() {
-            // Not needed - origin marker added in visualizeGcode with proper sizing
-        }
-
         // Reset view button handler
         document.getElementById('resetView').addEventListener('click', () => {
             if (!controls) return;
@@ -2544,20 +2485,9 @@ document.addEventListener('DOMContentLoaded', () => {
         }
 
         // Initialize on load
-        // Initialize on load
         window.addEventListener('load', () => {
             initVisualization();
             initDxfSetup();
-
-            // DEBUG: Check if Onshape provides context via JavaScript
-            console.log('=== Onshape Context Debug ===');
-            console.log('window.opener:', window.opener);
-            console.log('window.parent:', window.parent);
-            console.log('URL params:', new URLSearchParams(window.location.search));
-            console.log('Onshape globals:', {
-                onshape: typeof window.onshape !== 'undefined' ? window.onshape : 'undefined',
-                OnshapeClient: typeof window.OnshapeClient !== 'undefined' ? window.OnshapeClient : 'undefined'
-            });
 
             // Check for error message from Onshape import
             const errorMessage = window.ONSHAPE_DATA?.errorMessage || '';

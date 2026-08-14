@@ -150,28 +150,6 @@ class GoogleDriveUploader:
         
         return current_folder_id
     
-    def create_folder(self, drive_id, parent_folder_id, folder_name):
-        """Create a folder in the shared drive"""
-        try:
-            file_metadata = {
-                'name': folder_name,
-                'mimeType': 'application/vnd.google-apps.folder',
-                'driveId': drive_id,
-                'parents': [parent_folder_id] if parent_folder_id else []
-            }
-            
-            folder = self.service.files().create(
-                body=file_metadata,
-                supportsAllDrives=True,
-                fields='id'
-            ).execute()
-            
-            return folder['id']
-            
-        except HttpError as error:
-            log(f"Error creating folder: {error}")
-            return None
-    
     def upload_file(self, file_path, filename=None):
         """
         Upload a file to the configured Google Drive folder
@@ -251,30 +229,3 @@ class GoogleDriveUploader:
                 'message': f"Upload failed: {str(error)}"
             }
     
-    def is_configured(self):
-        """Check if Google Drive is set up and ready"""
-        if not os.path.exists(CREDENTIALS_FILE):
-            return False, "Missing credentials.json - see GOOGLE_DRIVE_SETUP.md"
-        
-        try:
-            if not self.service:
-                self.authenticate()
-            return True, "Google Drive ready"
-        except Exception as e:
-            return False, f"Authentication error: {str(e)}"
-
-
-# Convenience function
-def upload_gcode_to_drive(file_path, filename=None):
-    """
-    Upload a G-code file to the team's Google Drive
-    
-    Args:
-        file_path: Path to the G-code file
-        filename: Optional custom filename
-    
-    Returns:
-        dict with upload result
-    """
-    uploader = GoogleDriveUploader()
-    return uploader.upload_file(file_path, filename)

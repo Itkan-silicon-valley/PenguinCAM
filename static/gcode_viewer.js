@@ -257,7 +257,6 @@
 
     if (this.completedLine) this.scene.remove(this.completedLine);
     if (this.upcomingLine) this.scene.remove(this.upcomingLine);
-    var self = this;
 
     if (idx < this.moves.length - 1) {
       var up = [];
