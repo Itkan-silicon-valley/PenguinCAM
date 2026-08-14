@@ -435,6 +435,69 @@ class TestStockThicknessDiscovery(unittest.TestCase):
             'D', 'W', 'E', {'x': 0, 'y': 0, 'z': 1}, {'x': 0, 'y': 0, 'z': 0}))
 
 
+class TestCornerSlowdown(unittest.TestCase):
+    """Contour-parallel pocket clearing eases the feed through sharp interior corners (where
+    the cutter wraps two edges and engagement spikes) without changing the toolpath geometry."""
+
+    def setUp(self):
+        self.pp = FRCPostProcessor(0.25, 0.157)
+        self.pp.apply_material_preset('aluminum')   # feed 55 IPM
+
+    def test_corner_feed_scale_by_angle(self):
+        s = self.pp._corner_feed_scale
+        self.assertAlmostEqual(s((-1, 0), (0, 0), (1, 0)), 1.0)                  # straight -> no slowdown
+        self.assertAlmostEqual(s((0, 1), (0, 0), (1, 0)), 0.6, places=2)        # 90 deg -> partial
+        self.assertAlmostEqual(s((0, 0), (0, 0), (1, 0)), 1.0)                  # degenerate -> safe 1.0
+        # A sharp (<=60 deg) corner hits the floor.
+        import math as m
+        v = (0, 0); p = (m.cos(m.radians(25)), m.sin(m.radians(25))); n = (m.cos(m.radians(-25)), m.sin(m.radians(-25)))
+        self.assertAlmostEqual(s(p, v, n), self.pp.corner_min_feed_scale)       # 50 deg included
+
+    def _triangle_feeds(self):
+        import re, math as m
+        tri = [(0, 0), (3, 0), (1.5, 3 * m.sqrt(3) / 2)]   # equilateral, 60 deg corners
+        g = '\n'.join(self.pp._generate_pocket_gcode(tri))
+        feeds = [float(x) for x in re.findall(r'F(\d+\.\d+)', g)]
+        return tri, g, feeds
+
+    def test_sharp_pocket_slows_at_corners_full_speed_on_straights(self):
+        _, g, feeds = self._triangle_feeds()
+        base = self.pp.feed_rate
+        floor = round(base * self.pp.corner_min_feed_scale, 1)
+        self.assertIn(base, feeds)                       # straights still cut at full feed
+        self.assertIn(floor, feeds)                      # 60 deg corners cut at the floor feed
+        self.assertIn('corner slowdown', g)
+        cut_feeds = [f for f in feeds if f <= base]      # ignore rapid/traverse (200)
+        self.assertGreaterEqual(min(cut_feeds), floor - 1e-6)   # never below the floor
+
+    def test_corner_floor_is_material_aware(self):
+        al = FRCPostProcessor(0.25, 0.157); al.apply_material_preset('aluminum')
+        pc = FRCPostProcessor(0.25, 0.157); pc.apply_material_preset('polycarbonate')
+        self.assertAlmostEqual(al.corner_min_feed_scale, 0.4)   # force-limited: aggressive slowdown
+        self.assertAlmostEqual(pc.corner_min_feed_scale, 0.7)   # heat-limited: gentler, preserve chip load
+        # A custom/unknown material falls back to the (softer) default, not the aluminum floor.
+        cust = FRCPostProcessor(0.25, 0.157); cust.apply_material_preset('mystery_material')
+        self.assertAlmostEqual(cust.corner_min_feed_scale, 0.7)
+
+    def test_corner_slowdown_preserves_pocket_geometry(self):
+        import re
+        from shapely.geometry import Polygon, LineString
+        tri, g, _ = self._triangle_feeds()
+        offset = Polygon(tri).buffer(-self.pp.tool_radius)
+        cur = None; z = 10.0; outside = 0
+        for l in g.splitlines():
+            mz = re.search(r'Z([-\d.]+)', l); mm = re.search(r'G1 X([-\d.]+) Y([-\d.]+)', l)
+            nz = float(mz.group(1)) if mz else z
+            if mm:
+                x, y = float(mm.group(1)), float(mm.group(2))
+                if cur is not None and z < self.pp.material_top - 1e-6 and nz < self.pp.material_top - 1e-6 \
+                        and not offset.buffer(1e-3).contains(LineString([cur, (x, y)])):
+                    outside += 1
+                cur = (x, y)
+            z = nz
+        self.assertEqual(outside, 0)   # collinear waypoints only: geometry unchanged
+
+
 class TestPocketConcaveClearing(unittest.TestCase):
     """Concave pockets must never link straight across a notch through keep-material. Aligned
     ring starts keep links to a short in-pocket hop; a guard + ramped re-entry is the fallback

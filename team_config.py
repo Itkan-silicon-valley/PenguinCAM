@@ -184,6 +184,7 @@ TEAM_6238_DEFAULTS = {
             'helix_radius_multiplier': 0.75,
             'max_slotting_depth': 0.4,
             'peck_drill_depth': 0.05,
+            'corner_min_feed_scale': 0.7,   # softer/heat-limited: keep feed up to preserve chip load
             'tab_width': 0.25,
             'tab_height': 0.15
         },
@@ -201,6 +202,7 @@ TEAM_6238_DEFAULTS = {
             'helix_radius_multiplier': 0.5,
             'max_slotting_depth': 0.2,
             'peck_drill_depth': 0.05,
+            'corner_min_feed_scale': 0.4,   # force-limited: aggressive corner slowdown to protect the tool
             'tab_width': 0.25,
             'tab_height': 0.15
         },
@@ -218,6 +220,7 @@ TEAM_6238_DEFAULTS = {
             'helix_radius_multiplier': 0.75,
             'max_slotting_depth': 0.25,
             'peck_drill_depth': 0.05,
+            'corner_min_feed_scale': 0.7,   # softer/heat-limited: keep feed up to preserve chip load
             'tab_width': 0.25,
             'tab_height': 0.15
         }
@@ -986,6 +989,13 @@ materials:
 
     # Multi-pass parameters
     max_slotting_depth: 0.2         # Shallower passes for aluminum
+
+    # OPTIONAL: feed floor at sharp pocket corners, as a fraction of feed_rate. At a sharp
+    # corner the cutter wraps two edges and engagement spikes, so we ease the feed down (the
+    # toolpath itself is unchanged). Lower = more protection. Aluminum is force-limited, so an
+    # aggressive 0.4 is good; softer/heat-limited materials (plywood, polycarbonate) use ~0.7
+    # to keep the feed up and preserve chip load (avoid rubbing/melting). Omit for the default.
+    corner_min_feed_scale: 0.4
 
     # Tab parameters
     tab_width: 0.25

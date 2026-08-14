@@ -64,6 +64,7 @@ MATERIAL_PRESETS = {
         'stepover_percentage': 0.65,    # Radial stepover as fraction of tool diameter (65% for plywood)
         'helix_radius_multiplier': 0.75, # Helix entry radius as fraction of tool radius
         'max_slotting_depth': 0.4,      # Maximum depth per pass for perimeter slotting (inches)
+        'corner_min_feed_scale': 0.7,   # Corner-slowdown feed floor (softer/heat-limited material)
         'tab_width': 0.25,        # Tab width (inches)
         'tab_height': 0.15,        # Tab height (inches)
         'description': 'Standard plywood settings - 18K RPM, 75 IPM cutting'
@@ -79,6 +80,7 @@ MATERIAL_PRESETS = {
         'stepover_percentage': 0.25,    # Radial stepover as fraction of tool diameter (25% conservative for aluminum)
         'helix_radius_multiplier': 0.5,  # Helix entry radius as fraction of tool radius (conservative for aluminum)
         'max_slotting_depth': 0.2,      # Maximum depth per pass for perimeter slotting (inches)
+        'corner_min_feed_scale': 0.4,   # Corner-slowdown feed floor (aggressive; aluminum is force-limited)
         'tab_width': 0.25,        # Tab width (inches) - same as plywood
         'tab_height': 0.15,       # Tab height (inches) - same as plywood
         'description': 'Aluminum box tubing - 18K RPM, 55 IPM cutting, 4° ramp'
@@ -94,6 +96,7 @@ MATERIAL_PRESETS = {
         'stepover_percentage': 0.55,    # Radial stepover as fraction of tool diameter (55% moderate for polycarbonate)
         'helix_radius_multiplier': 0.75, # Helix entry radius as fraction of tool radius
         'max_slotting_depth': 0.25,     # Maximum depth per pass for perimeter slotting (inches)
+        'corner_min_feed_scale': 0.7,   # Corner-slowdown feed floor (softer/heat-limited material)
         'tab_width': 0.25,        # Tab width (inches) - same as plywood
         'tab_height': 0.15,        # Tab height (inches) - same as plywood
         'description': 'Polycarbonate - same as plywood settings'
@@ -149,6 +152,15 @@ class FRCPostProcessor:
         self.tool_diameter = tool_diameter
         self.tool_radius = tool_diameter / 2
         self.units = units
+
+        # Corner slowdown for contour-parallel pocket clearing. At a sharp interior corner the
+        # cutter wraps around two edges at once, so its engagement (and cutting force) spikes
+        # well above the straight-edge stepover. We keep the toolpath geometry identical but
+        # reduce the feed within `corner_slowdown_zone` of a sharp corner, down to
+        # `corner_min_feed_scale` x feed at the sharpest corners, easing back to full feed on
+        # the straights. Only collinear waypoints are added, so the path is unchanged.
+        self.corner_slowdown_zone = tool_diameter        # reduced-feed distance on each side of a corner
+        self.corner_min_feed_scale = 0.4                 # default; set per-material in apply_material_preset
 
         # Hole detection tolerance from config
         self.tolerance = config.hole_detection_tolerance
@@ -288,6 +300,11 @@ class FRCPostProcessor:
             self.peck_drill_depth = preset['peck_drill_depth'] * 25.4
         else:
             self.peck_drill_depth = preset['peck_drill_depth']
+
+        # Corner-slowdown floor (material-aware, dimensionless). Aluminum is force-limited and
+        # wants an aggressive slowdown (0.4); softer, heat-limited materials keep more feed to
+        # preserve chip load and avoid rubbing (0.7). Falls back to the __init__ default.
+        self.corner_min_feed_scale = preset.get('corner_min_feed_scale', self.corner_min_feed_scale)
 
         print(f"\nApplied material preset: {preset.get('name', material.capitalize())}")
         if 'description' in preset:
@@ -3090,6 +3107,61 @@ class FRCPostProcessor:
                 gcode.append(f"G1 X{pt[0]:.4f} Y{pt[1]:.4f} Z{z:.4f} F{self.ramp_feed_rate}  ; Ramp in along ring")
                 prev = pt
 
+    def _corner_feed_scale(self, prev: Tuple[float, float], v: Tuple[float, float],
+                           nxt: Tuple[float, float]) -> float:
+        """Feed multiplier for the corner at vertex v, from the included angle between its two
+        edges (v->prev and v->nxt). Straight-through (~180 deg) -> 1.0 (no slowdown); sharper
+        corners scale down toward corner_min_feed_scale, easing the feed through the high
+        engagement where the cutter wraps two edges at once."""
+        ax, ay = prev[0] - v[0], prev[1] - v[1]
+        bx, by = nxt[0] - v[0], nxt[1] - v[1]
+        la = math.hypot(ax, ay)
+        lb = math.hypot(bx, by)
+        if la < 1e-9 or lb < 1e-9:
+            return 1.0
+        cos_a = max(-1.0, min(1.0, (ax * bx + ay * by) / (la * lb)))
+        included = math.degrees(math.acos(cos_a))   # 0 (spike back on itself) .. 180 (straight)
+        GENTLE, SHARP = 150.0, 60.0                  # >= GENTLE: full feed; <= SHARP: full slowdown
+        if included >= GENTLE:
+            return 1.0
+        if included <= SHARP:
+            return self.corner_min_feed_scale
+        t = (included - SHARP) / (GENTLE - SHARP)
+        return self.corner_min_feed_scale + t * (1.0 - self.corner_min_feed_scale)
+
+    def _emit_ring_cut_with_corner_slowdown(self, gcode: List[str],
+                                            ring: List[Tuple[float, float]], base_feed: float) -> None:
+        """Trace a CLOSED ring (ring[0] -> ... -> ring[0]) as G1 cutting moves at base_feed,
+        easing the feed down within corner_slowdown_zone of each sharp corner (see
+        _corner_feed_scale) to tame the engagement/force spike there. Only collinear waypoints
+        are inserted, so the toolpath geometry is unchanged. Assumes the tool is at ring[0]."""
+        n = len(ring)
+        if n < 2:
+            return
+        scale = [self._corner_feed_scale(ring[(i - 1) % n], ring[i], ring[(i + 1) % n]) for i in range(n)]
+        for i in range(n):
+            a, b = ring[i], ring[(i + 1) % n]
+            sa, sb = scale[i], scale[(i + 1) % n]
+            seg = math.hypot(b[0] - a[0], b[1] - a[1])
+            slow_a, slow_b = sa < 0.999, sb < 0.999
+            if seg < 1e-9 or (not slow_a and not slow_b):
+                gcode.append(f"G1 X{b[0]:.4f} Y{b[1]:.4f} F{base_feed:.1f}")
+                continue
+            zone = min(self.corner_slowdown_zone, seg / 2.0)
+            ux, uy = (b[0] - a[0]) / seg, (b[1] - a[1]) / seg
+            cur = a
+            if slow_a:  # ease OUT of the corner at a
+                p1 = (a[0] + ux * zone, a[1] + uy * zone)
+                gcode.append(f"G1 X{p1[0]:.4f} Y{p1[1]:.4f} F{base_feed * sa:.1f}  ; corner slowdown")
+                cur = p1
+            if slow_b:  # full feed across the middle, then ease INTO the corner at b
+                p2 = (b[0] - ux * zone, b[1] - uy * zone)
+                if math.hypot(p2[0] - cur[0], p2[1] - cur[1]) > 1e-6:
+                    gcode.append(f"G1 X{p2[0]:.4f} Y{p2[1]:.4f} F{base_feed:.1f}")
+                gcode.append(f"G1 X{b[0]:.4f} Y{b[1]:.4f} F{base_feed * sb:.1f}  ; corner slowdown")
+            else:
+                gcode.append(f"G1 X{b[0]:.4f} Y{b[1]:.4f} F{base_feed:.1f}")
+
     def _link_and_cut_ring(self, gcode: List[str], ring_points: List[Tuple[float, float]],
                            cur_pos: Tuple[float, float], safe_region, ramp_start_height: float,
                            final_cut_z: float, link_tol: float) -> Tuple[float, float]:
@@ -3107,10 +3179,8 @@ class FRCPostProcessor:
             gcode.append(f"G0 X{start[0]:.4f} Y{start[1]:.4f}  ; Rapid over the notch to the ring")
             gcode.append(f"G0 Z{ramp_start_height:.4f}  ; Down to ramp-start height")
             self._emit_ring_ramp(gcode, ring, ramp_start_height, final_cut_z)  # ends at `start` at depth
-        # Clean lap at depth
-        for p in ring[1:]:
-            gcode.append(f"G1 X{p[0]:.4f} Y{p[1]:.4f} F{self.feed_rate}")
-        gcode.append(f"G1 X{start[0]:.4f} Y{start[1]:.4f} F{self.feed_rate}")
+        # Clean lap at depth, easing the feed through sharp (high-engagement) corners.
+        self._emit_ring_cut_with_corner_slowdown(gcode, ring, self.feed_rate)
         return start
 
     def _generate_pocket_gcode(self, pocket_points: List[Tuple[float, float]]) -> List[str]:

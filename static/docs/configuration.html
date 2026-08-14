@@ -271,6 +271,34 @@
             </div>
         </div>
 
+        <h3>Corner Feed Slowdown &mdash; optional</h3>
+        <p>
+            When clearing a pocket, the cutter takes a light bite (the stepover) along a straight edge, but
+            at a <strong>sharp interior corner</strong> it wraps around two edges at once and its engagement
+            &mdash; and cutting force &mdash; spikes. To tame that, PenguinCAM eases the feed rate down within
+            a tool-diameter of each sharp corner and ramps it back up on the straights. <strong>The toolpath
+            geometry is unchanged</strong> &mdash; only the feed changes near corners.
+        </p>
+        <p>
+            How much to slow is a per-material setting, <code>corner_min_feed_scale</code> (a fraction of the
+            material's <code>feed_rate</code>, applied at the sharpest corners):
+        </p>
+        <pre><code>materials:
+  aluminum:
+    corner_min_feed_scale: 0.4    # aggressive slowdown
+  polycarbonate:
+    corner_min_feed_scale: 0.7    # gentler slowdown</code></pre>
+        <p>
+            The right value depends on what limits the material. <strong>Aluminum</strong> is
+            <em>force-limited</em> &mdash; a sharp corner can deflect or break the tool &mdash; so an aggressive
+            floor (<code>0.4</code>, i.e. 40% of feed) is worthwhile. <strong>Softer, heat-sensitive materials</strong>
+            like polycarbonate and plywood are <em>low-force but rubbing-limited</em>: cutting the feed too far
+            drops the chip load and the tool starts rubbing instead of cutting, which builds heat (and melts
+            plastics). Those use a gentler floor (<code>0.7</code>) to keep the chips shearing. Omit the setting
+            to use PenguinCAM's built-in per-material default (0.4 for aluminum, 0.7 for softer materials); set
+            it to <code>1.0</code> to disable corner slowdown for that material entirely.
+        </p>
+
         <h3>Tab Settings</h3>
         <p>
             Configure how parts are secured during perimeter cutting. Two strategies are available:
