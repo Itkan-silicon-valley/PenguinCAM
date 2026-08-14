@@ -540,9 +540,14 @@ def _compute_dxf_outline(path):
             'outline': outline, 'holes': holes, 'inner': inner}
 
 
-@app.route('/')
-def index():
-    """Render the main GUI page"""
+def _serve_wizard_upload():
+    """Render the multi-part wizard full-screen in DXF-upload (non-Onshape) mode.
+
+    Shared by the root route and the `/app` alias. Requires Onshape OAuth as a
+    bot-gate even for upload users (see `_require_onshape_auth`); the wizard's
+    upload source then forces DXF imports rather than relying on Onshape face
+    selection. Returns the OAuth redirect response when unauthenticated.
+    """
     # ========================================================================
     # AUTHENTICATION GATE: Require Onshape OAuth to access app
     # ========================================================================
@@ -560,8 +565,14 @@ def index():
     # ========================================================================
     # End authentication gate
     # ========================================================================
+    return render_template('wizard.html', source='upload', authenticated=True,
+                           onshape_ctx={}, theme='dark', **_app_template_context())
 
-    return render_template('index.html', **_app_template_context())
+
+@app.route('/')
+def index():
+    """Render the main app: the multi-part wizard, full-screen, in DXF-upload mode."""
+    return _serve_wizard_upload()
 
 
 @app.route('/config/refresh')
@@ -581,13 +592,9 @@ def refresh_config():
 
 @app.route('/app')
 def wizard_app():
-    """Multi-part wizard, standalone (DXF upload) source. Same backend as everything
-    else; this is also the no-Onshape test vehicle."""
-    gate = _require_onshape_auth()
-    if gate:
-        return gate
-    return render_template('wizard.html', source='upload', authenticated=True,
-                           onshape_ctx={}, theme='dark', **_app_template_context())
+    """Alias for the root route: the standalone (DXF upload) wizard. Kept so existing
+    links to /app keep working; both it and / render the same full-screen upload wizard."""
+    return _serve_wizard_upload()
 
 
 def _serve_onshape_panel():
