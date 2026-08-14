@@ -1215,12 +1215,7 @@ class FRCPostProcessor:
                     if r <= 0:
                         continue
                     # Create polyline from circle (50 points)
-                    points = []
-                    for j in range(50):
-                        angle = (j / 50) * 2 * math.pi
-                        x = cx + r * math.cos(angle)
-                        y = cy + r * math.sin(angle)
-                        points.append((x, y))
+                    points = self._tessellate_circle(cx, cy, r)
                     path_idx = len(all_paths)
                     all_paths.append(points)
                     # Map path index to circle index
@@ -1330,9 +1325,6 @@ class FRCPostProcessor:
         if self.holes:
             gcode.append("(===== HOLES =====)")
 
-            # Get pocket contouring threshold from config (applies to circular holes too)
-            contour_threshold = self.config._get('machining', 'pockets', 'contour_threshold', default=510)
-
             # Check if this is a through-cut (to sacrifice board)
             # Only contour through-cuts; partial-depth features must be fully cleared
             is_through_cut = self.cut_depth <= 0  # At or below Z=0 means cutting into sacrifice board
@@ -1349,8 +1341,7 @@ class FRCPostProcessor:
                 # Calculate hole area: π × r²
                 hole_area = math.pi * (diameter / 2) ** 2
 
-                # Calculate threshold area (same formula as pockets)
-                threshold_area = (contour_threshold * self.tool_diameter**2 * self.stepover_percentage) if contour_threshold > 0 else float('inf')
+                threshold_area = self._contour_threshold_area()
 
                 # Only contour if it's a through-cut AND exceeds size threshold
                 if is_through_cut and hole_area > threshold_area:
@@ -1392,14 +1383,8 @@ class FRCPostProcessor:
                     center = hole['center']
                     diameter = hole['diameter']
 
-                    # Generate circular points for contouring
-                    num_points = 50  # Tessellate circle into 50 segments
-                    circle_points = []
-                    for j in range(num_points):
-                        angle = (j / num_points) * 2 * math.pi
-                        x = center[0] + (diameter / 2) * math.cos(angle)
-                        y = center[1] + (diameter / 2) * math.sin(angle)
-                        circle_points.append((x, y))
+                    # Generate circular points for contouring (50-segment tessellation)
+                    circle_points = self._tessellate_circle(center[0], center[1], diameter / 2)
 
                     gcode.append(f"(Hole {i} - {diameter:.3f}\" dia, {area:.3f} sq in - CONTOUR ONLY)")
                     gcode.extend(self._generate_pocket_contour_gcode(circle_points))
@@ -1408,9 +1393,6 @@ class FRCPostProcessor:
         # Pockets
         if self.pockets:
             gcode.append("(===== POCKETS =====)")
-
-            # Get pocket contouring threshold from config
-            contour_threshold = self.config._get('machining', 'pockets', 'contour_threshold', default=510)
 
             # Check if this is a through-cut (to sacrifice board)
             # Only contour through-cuts; partial-depth features must be fully cleared
@@ -1424,9 +1406,7 @@ class FRCPostProcessor:
                 pocket_poly = Polygon(pocket)
                 pocket_area = pocket_poly.area
 
-                # Calculate threshold area: contour_threshold × tool_diameter² / stepover
-                # Set contour_threshold to 0 to disable contouring entirely
-                threshold_area = (contour_threshold * self.tool_diameter**2 * self.stepover_percentage) if contour_threshold > 0 else float('inf')
+                threshold_area = self._contour_threshold_area()
 
                 # Only contour if it's a through-cut AND exceeds size threshold
                 if is_through_cut and pocket_area > threshold_area:
@@ -1542,19 +1522,7 @@ class FRCPostProcessor:
         time_estimate = self._estimate_cycle_time(gcode)
 
         # Add cycle time to header (insert after the operations section)
-        for i, line in enumerate(gcode):
-            if line.startswith("(Operations:"):
-                # Find where to insert (after "No straight plunges")
-                insert_idx = i + 3  # After Operations, Helical angle, No straight plunges
-                time_lines = [
-                    "",
-                    f"(Estimated cycle time: {self._format_time(time_estimate['total'])})",
-                    f"(  Cutting: {self._format_time(time_estimate['cutting'])}, Rapids: {self._format_time(time_estimate['rapid'])}, Spindle: {self._format_time(time_estimate['dwell'])})",
-                    "(  Note: Estimate does not include acceleration/deceleration)"
-                ]
-                for j, time_line in enumerate(time_lines):
-                    gcode.insert(insert_idx + j, time_line)
-                break
+        self._insert_cycle_time_comment(gcode, time_estimate)
 
         # Generate filename with timestamp (name sanitized for safe disk write + download)
         filename = build_output_filename(suggested_filename, timestamp, "output")
@@ -2403,8 +2371,7 @@ class FRCPostProcessor:
 
             # Generate toolpaths at this depth
             # Apply same contouring logic as 2D mode
-            contour_threshold = self.config._get('machining', 'pockets', 'contour_threshold', default=510)
-            threshold_area = (contour_threshold * self.tool_diameter**2 * self.stepover_percentage) if contour_threshold > 0 else float('inf')
+            threshold_area = self._contour_threshold_area()
 
             # Check if this layer is a through-cut (at or below Z=0)
             # Only contour through-cuts; partial-depth layers must be fully cleared
@@ -2435,14 +2402,8 @@ class FRCPostProcessor:
                 for hole in contoured_holes:
                     center = hole['center']
                     diameter = hole['diameter']
-                    # Generate circular points for contouring
-                    num_points = 50
-                    circle_points = []
-                    for j in range(num_points):
-                        angle = (j / num_points) * 2 * math.pi
-                        x = center[0] + (diameter / 2) * math.cos(angle)
-                        y = center[1] + (diameter / 2) * math.sin(angle)
-                        circle_points.append((x, y))
+                    # Generate circular points for contouring (50-segment tessellation)
+                    circle_points = self._tessellate_circle(center[0], center[1], diameter / 2)
                     gcode.append(f"(Large hole {diameter:.3f}\" dia - CONTOUR ONLY)")
                     gcode.extend(self._generate_pocket_contour_gcode(circle_points))
 
@@ -2513,8 +2474,7 @@ class FRCPostProcessor:
             gcode.append(f"(Bottom face at Z={depth:.4f}\" - through-holes and through-pockets)")
 
             # Apply contouring logic to bottom face (same as depth layers)
-            contour_threshold = self.config._get('machining', 'pockets', 'contour_threshold', default=510)
-            threshold_area = (contour_threshold * self.tool_diameter**2 * self.stepover_percentage) if contour_threshold > 0 else float('inf')
+            threshold_area = self._contour_threshold_area()
 
             # Bottom face is always through-cut (Z=0)
             is_through_cut = True
@@ -2546,14 +2506,8 @@ class FRCPostProcessor:
                 for i, hole in enumerate(contoured_holes, 1):
                     center = hole['center']
                     diameter = hole['diameter']
-                    # Generate circular points for contouring
-                    num_points = 50
-                    circle_points = []
-                    for j in range(num_points):
-                        angle = (j / num_points) * 2 * math.pi
-                        x = center[0] + (diameter / 2) * math.cos(angle)
-                        y = center[1] + (diameter / 2) * math.sin(angle)
-                        circle_points.append((x, y))
+                    # Generate circular points for contouring (50-segment tessellation)
+                    circle_points = self._tessellate_circle(center[0], center[1], diameter / 2)
                     gcode.append(f"(Hole {len(cleared_holes) + i} - {diameter:.3f}\" diameter - CONTOUR ONLY)")
                     gcode.extend(self._generate_pocket_contour_gcode(circle_points))
                     gcode.append("")
@@ -2612,19 +2566,7 @@ class FRCPostProcessor:
         time_estimate = self._estimate_cycle_time(gcode)
 
         # Add cycle time to header (insert after the operations section)
-        for i, line in enumerate(gcode):
-            if line.startswith("(Operations:"):
-                # Find where to insert (after "No straight plunges")
-                insert_idx = i + 3  # After Operations, Helical angle, No straight plunges
-                time_lines = [
-                    "",
-                    f"(Estimated cycle time: {self._format_time(time_estimate['total'])})",
-                    f"(  Cutting: {self._format_time(time_estimate['cutting'])}, Rapids: {self._format_time(time_estimate['rapid'])}, Spindle: {self._format_time(time_estimate['dwell'])})",
-                    "(  Note: Estimate does not include acceleration/deceleration)"
-                ]
-                for j, time_line in enumerate(time_lines):
-                    gcode.insert(insert_idx + j, time_line)
-                break
+        self._insert_cycle_time_comment(gcode, time_estimate)
 
         # Check for errors that occurred during generation
         if self.errors:
@@ -3046,6 +2988,42 @@ class FRCPostProcessor:
         relative_deviation = max_deviation / avg_dist if avg_dist > 0 else 0
 
         return relative_deviation < tolerance
+
+    def _contour_threshold_area(self) -> float:
+        """Area above which a through-cut hole/pocket is contour-cleared rather than
+        pocket-cleared. From config `machining.pockets.contour_threshold` (default 510; set 0
+        to disable contouring -> infinite threshold), scaled by the tool footprint and
+        stepover: contour_threshold * tool_diameter^2 * stepover_percentage."""
+        contour_threshold = self.config._get('machining', 'pockets', 'contour_threshold', default=510)
+        if contour_threshold <= 0:
+            return float('inf')
+        return contour_threshold * self.tool_diameter ** 2 * self.stepover_percentage
+
+    def _insert_cycle_time_comment(self, gcode: List[str], time_estimate: dict, offset: int = 3) -> None:
+        """Insert the estimated-cycle-time comment block into `gcode`, just after the header's
+        (Operations: ...) line. `offset` is where the block lands relative to that line: the
+        standard header has two more lines after Operations (offset 3); the multi-part job
+        header does not (offset 1). Mutates gcode in place; no-op if there is no Operations line."""
+        for i, line in enumerate(gcode):
+            if line.startswith("(Operations:"):
+                time_lines = [
+                    "",
+                    f"(Estimated cycle time: {self._format_time(time_estimate['total'])})",
+                    f"(  Cutting: {self._format_time(time_estimate['cutting'])}, Rapids: {self._format_time(time_estimate['rapid'])}, Spindle: {self._format_time(time_estimate['dwell'])})",
+                    "(  Note: Estimate does not include acceleration/deceleration)"
+                ]
+                for j, time_line in enumerate(time_lines):
+                    gcode.insert(i + offset + j, time_line)
+                break
+
+    @staticmethod
+    def _tessellate_circle(cx: float, cy: float, radius: float, segments: int = 50) -> List[Tuple[float, float]]:
+        """Return `segments` points evenly spaced around a circle (open loop - no repeated
+        closing point), the long-standing tessellation used to turn a CAD circle into a
+        polyline for contouring/containment."""
+        return [(cx + radius * math.cos((j / segments) * 2 * math.pi),
+                 cy + radius * math.sin((j / segments) * 2 * math.pi))
+                for j in range(segments)]
 
     @staticmethod
     def _reorder_closed_ring(points: List[Tuple[float, float]], ref: Tuple[float, float]) -> List[Tuple[float, float]]:
@@ -5590,19 +5568,10 @@ def assemble_job_gcode(part_jobs, header_pp, timestamp=None, suggested_filename=
 
     gcode.extend(header_pp._generate_gcode_footer())
 
-    # Estimate total cycle time across the whole program and insert into the header.
+    # Estimate total cycle time across the whole program and insert into the header. The job
+    # header has no Helical/plunge lines after (Operations:), so the block lands at offset 1.
     time_estimate = header_pp._estimate_cycle_time(gcode)
-    for i, line in enumerate(gcode):
-        if line.startswith("(Operations:"):
-            time_lines = [
-                "",
-                f"(Estimated cycle time: {header_pp._format_time(time_estimate['total'])})",
-                f"(  Cutting: {header_pp._format_time(time_estimate['cutting'])}, Rapids: {header_pp._format_time(time_estimate['rapid'])}, Spindle: {header_pp._format_time(time_estimate['dwell'])})",
-                "(  Note: Estimate does not include acceleration/deceleration)"
-            ]
-            for j, time_line in enumerate(time_lines):
-                gcode.insert(i + 1 + j, time_line)
-            break
+    header_pp._insert_cycle_time_comment(gcode, time_estimate, offset=1)
 
     filename = build_output_filename(suggested_filename, timestamp, "job")
 

@@ -3,10 +3,8 @@ Onshape Integration for PenguinCAM
 Handles OAuth authentication and DXF export from Onshape
 """
 
-import logging
 import math
 import os
-import sys
 import json
 import tempfile
 import time
@@ -24,21 +22,7 @@ from shapely.geometry import Point, Polygon
 from shapely.ops import unary_union
 
 from dxf_geometry import entities_to_closed_paths
-
-# Configure logging for Vercel
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(message)s',
-    stream=sys.stderr,
-    force=True
-)
-logger = logging.getLogger(__name__)
-
-# Logging helper for Vercel/serverless environments
-def log(*args, **kwargs):
-    """Log to stderr using Python logging module for better Vercel compatibility"""
-    message = ' '.join(str(arg) for arg in args)
-    logger.info(message)
+from logging_config import log  # shared log() + logging setup (was duplicated per module)
 
 class OnshapeClient:
     """Client for interacting with Onshape API"""

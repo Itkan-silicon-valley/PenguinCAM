@@ -4,7 +4,6 @@ Saves G-code files directly to team's shared Google Drive
 """
 
 import os
-import sys
 import json
 import pickle
 from pathlib import Path
@@ -14,22 +13,7 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from googleapiclient.errors import HttpError
-import logging
-
-# Configure logging for Vercel
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(message)s',
-    stream=sys.stderr,
-    force=True
-)
-logger = logging.getLogger(__name__)
-
-# Logging helper for Vercel/serverless environments
-def log(*args, **kwargs):
-    """Log to stderr using Python logging module for better Vercel compatibility"""
-    message = ' '.join(str(arg) for arg in args)
-    logger.info(message)
+from logging_config import log  # shared log() + logging setup (was duplicated per module)
 
 # Scopes needed - only Drive file access
 SCOPES = ['https://www.googleapis.com/auth/drive.file']

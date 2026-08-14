@@ -9,7 +9,18 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import ezdxf
-from frc_cam_gui_app import app
+from frc_cam_gui_app import app, normalize_material
+
+
+class TestNormalizeMaterial(unittest.TestCase):
+    """The shared material-id canonicalizer used by both /process and /process-job."""
+
+    def test_special_cases_and_passthrough(self):
+        self.assertEqual(normalize_material('aluminum_tube'), 'aluminum')   # UI-only id -> aluminum preset
+        self.assertEqual(normalize_material('ALUMINUM_TUBE'), 'aluminum')   # case-insensitive
+        self.assertEqual(normalize_material('polycarb'), 'polycarbonate')   # legacy alias
+        self.assertEqual(normalize_material('aluminum'), 'aluminum')        # already canonical
+        self.assertEqual(normalize_material('MyCustom'), 'MyCustom')        # custom passes through, case kept
 
 
 def _square_dxf_bytes(size):

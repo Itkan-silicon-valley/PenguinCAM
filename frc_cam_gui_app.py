@@ -9,7 +9,6 @@ from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from werkzeug.middleware.proxy_fix import ProxyFix
 import os
-import sys
 import subprocess
 import tempfile
 import shutil
@@ -30,28 +29,14 @@ from shapely.ops import unary_union
 import logging
 import metrics
 import feeds_speeds
+from logging_config import log  # shared log() + base logging setup (was duplicated per module)
 
-# Configure logging for Vercel
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(message)s',
-    stream=sys.stderr,
-    force=True
-)
-logger = logging.getLogger(__name__)
-
-# Disable Werkzeug's request logging (clutters Vercel logs)
-# Try multiple approaches since WSGI environment might be tricky
+# Quiet Werkzeug's request logging (clutters Vercel logs); the base logging config and log()
+# now come from logging_config (imported above).
 logging.getLogger('werkzeug').disabled = True
 logging.getLogger('werkzeug').setLevel(logging.ERROR)  # Only show errors, not INFO
 werkzeug_logger = logging.getLogger('werkzeug')
 werkzeug_logger.handlers = []  # Remove all handlers
-
-# Logging helper for Vercel/serverless environments
-def log(*args, **kwargs):
-    """Log to stderr using Python logging module for better Vercel compatibility"""
-    message = ' '.join(str(arg) for arg in args)
-    logger.info(message)
 
 # Import Google Drive integration (optional - will work without it)
 try:
@@ -304,6 +289,17 @@ POST_PROCESSOR = SCRIPT_DIR / 'frc_cam_postprocessor.py'
 def get_current_user_id():
     """Get the current user ID from session"""
     return session.get('user_email', 'default_user')
+
+def normalize_material(material):
+    """Canonicalize a material id from the request form. 'aluminum_tube' -> 'aluminum' (a
+    UI-only id that uses the aluminum preset) and 'polycarb' -> 'polycarbonate' (legacy);
+    everything else, including custom materials, passes through unchanged."""
+    m = str(material).lower()
+    if m == 'aluminum_tube':
+        return 'aluminum'
+    if m == 'polycarb':
+        return 'polycarbonate'
+    return material
 
 def get_onshape_client_or_401():
     """
@@ -685,15 +681,7 @@ def process_file():
         material = request.form.get('material', 'plywood')
         is_aluminum_tube = (material.lower() == 'aluminum_tube')
         machine_id = request.form.get('machine_id', None)  # Optional machine selection
-
-        # Map special cases:
-        # - 'aluminum_tube' -> 'aluminum' (aluminum_tube is UI-only, uses aluminum preset)
-        # - 'polycarb' -> 'polycarbonate' (legacy compatibility)
-        # All other materials pass through as-is (including custom materials from config)
-        if material.lower() == 'aluminum_tube':
-            material = 'aluminum'
-        elif material.lower() == 'polycarb':
-            material = 'polycarbonate'
+        material = normalize_material(material)  # aluminum_tube->aluminum, polycarb->polycarbonate
 
         tool_diameter = float(request.form.get('tool_diameter', DEFAULT_TOOL_DIAMETER_IN))
         origin_corner = request.form.get('origin_corner', 'bottom-left')
@@ -952,11 +940,7 @@ def process_job():
             return jsonify({'error': 'Job has no parts'}), 400
 
         # Shared job parameters (one tool/material per job in v1).
-        material = job.get('material', 'plywood')
-        if str(material).lower() == 'polycarb':
-            material = 'polycarbonate'
-        elif str(material).lower() == 'aluminum_tube':
-            material = 'aluminum'
+        material = normalize_material(job.get('material', 'plywood'))  # aluminum_tube->aluminum, polycarb->polycarbonate
         tool_diameter = float(job.get('tool_diameter', DEFAULT_TOOL_DIAMETER_IN))
         thickness = float(job.get('thickness', 0.25))
         tab_spacing = float(job.get('tab_spacing', 6.0))
