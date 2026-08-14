@@ -1,10 +1,9 @@
 /* Self-contained 3D G-code toolpath viewer with playback.
  *
- * Mirrors the proven visualization in app.js (arc tessellation, coordinate mapping
- * gcode (x,y,z) -> THREE (x, z, -y) with gcode-Z as the up axis, stock box, tool,
- * green-completed / gold-upcoming toolpath, scrubber + playback) but as a reusable
- * module with no coupling to a specific page. The wizard uses it; index.html can
- * adopt it later.
+ * Arc tessellation, coordinate mapping gcode (x,y,z) -> THREE (x, z, -y) with
+ * gcode-Z as the up axis, stock box, tool, green-completed / gold-upcoming
+ * toolpath, scrubber + playback, packaged as a reusable module with no coupling
+ * to a specific page. The wizard uses it.
  *
  * Usage:
  *   var v = new GcodeViewer({ canvas, container, scrubber, scrubberLabel,

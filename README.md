@@ -12,7 +12,7 @@ A ground-up rework, delivered as a **step wizard** (Setup → Parts → Layout �
 - **2.5D fixes:** correct handling of islands / enclosed features (N-boundary polygon nesting) and stock thickness derived from the CAD layers.
 - **Onshape embedding:** popup OAuth with `SameSite=None; Secure` cookies, continuous face-selection, light/dark theme tied to Onshape's `?theme=`.
 - **Save:** split "Download Program / Send to Google Drive" button (Drive gated by config, remembers last choice).
-- Legacy single-part page (`/`, `templates/index.html`) stays until cutover.
+- The wizard is the whole app: `/` (and `/app`) serve it full-screen in DXF-upload mode; the Onshape panel serves the same wizard with face-selection as the source.
 
 Key files: `templates/wizard.html`, `static/wizard.js`, `static/gcode_viewer.js`, `static/source_onshape.js`; engine in `frc_cam_postprocessor.py`, routes in `frc_cam_gui_app.py`. Planned next: **V3 config / computed feeds-&-speeds** model (`docs/FEEDSandSPEEDS.md`). Run `make test` after changes.
 
@@ -222,7 +222,8 @@ Google Drive Upload
 - `penguincam_auth.py` - Google OAuth authentication
 
 **Frontend:**
-- `templates/index.html` - Web interface with Three.js visualization
+- `templates/wizard.html` - Multi-part wizard UI (the whole app; served at `/`, `/app`, and the Onshape panel)
+- `static/wizard.js` - Wizard logic; `static/gcode_viewer.js` - Three.js toolpath viewer
 - `static/popcornlogo.png` - Team branding
 
 **Configuration:**
@@ -320,7 +321,7 @@ penguincam/
 │   └── popcornlogo.png                # Team logo
 │
 ├── templates/                         # HTML templates
-│   └── index.html                     # Main web interface
+│   └── wizard.html                    # Multi-part wizard (the whole app UI)
 │
 ├── frc_cam_gui_app.py                # Flask web server
 ├── frc_cam_postprocessor.py          # G-code generator

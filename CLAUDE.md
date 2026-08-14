@@ -82,8 +82,8 @@ When generating G-code comments:
 ## Architecture
 
 ```
-Browser (index.html + Three.js)
-    ↓ HTTP POST /process
+Browser (wizard.html + Three.js)
+    ↓ HTTP POST /process, /process-job
 Flask Server (frc_cam_gui_app.py)
     ↓ subprocess
 G-code Generator (frc_cam_postprocessor.py)
@@ -94,7 +94,7 @@ G-code Generator (frc_cam_postprocessor.py)
 **Key files:**
 - `frc_cam_gui_app.py` - Flask routes, Onshape OAuth, Drive integration
 - `frc_cam_postprocessor.py` - Core G-code generation (`FRCPostProcessor` class)
-- `templates/index.html` - Single-page app with Three.js 3D visualization
+- `templates/wizard.html` - Multi-part wizard UI (the whole app; served at `/`, `/app`, and the Onshape panel), with `static/wizard.js` + `static/gcode_viewer.js` (Three.js 3D visualization)
 - `onshape_integration.py` - Onshape API client for one-click export
 - `penguincam_auth.py` - Google Workspace OAuth (optional)
 - `google_drive_integration.py` - Drive upload (optional)
