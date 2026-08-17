@@ -3017,10 +3017,28 @@ class FRCPostProcessor:
                 break
 
     @staticmethod
-    def _tessellate_circle(cx: float, cy: float, radius: float, segments: int = 50) -> List[Tuple[float, float]]:
-        """Return `segments` points evenly spaced around a circle (open loop - no repeated
-        closing point), the long-standing tessellation used to turn a CAD circle into a
-        polyline for contouring/containment."""
+    def _tessellate_circle(cx: float, cy: float, radius: float, segments: int = None,
+                           chord_tol: float = 0.001, min_segments: int = 50,
+                           max_segments: int = 400) -> List[Tuple[float, float]]:
+        """Return points evenly spaced around a circle (open loop - no repeated closing
+        point), used to turn a CAD circle into a polyline for contouring/containment.
+
+        By default the segment count is chosen adaptively so the chord deviation from the
+        true circle stays within `chord_tol` inches - a large circle (big bore or round
+        plate perimeter) gets more segments instead of faceting, while the count is floored
+        at `min_segments` (the long-standing 50) so small circles keep their exact prior
+        density and output. Pass an explicit `segments` to force a fixed count."""
+        if segments is None:
+            if radius > 0 and chord_tol > 0:
+                ratio = 1.0 - chord_tol / radius
+                if ratio <= -1.0:      # tolerance dwarfs a sub-tol radius
+                    n = min_segments
+                else:
+                    dtheta = 2.0 * math.acos(ratio)   # sagitta = r(1-cos(dtheta/2)) = chord_tol
+                    n = math.ceil(2 * math.pi / dtheta)
+                segments = max(min_segments, min(max_segments, n))
+            else:
+                segments = min_segments
         return [(cx + radius * math.cos((j / segments) * 2 * math.pi),
                  cy + radius * math.sin((j / segments) * 2 * math.pi))
                 for j in range(segments)]

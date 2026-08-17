@@ -18,14 +18,37 @@ from shapely.geometry import LineString
 from shapely.ops import linemerge
 
 
-def sample_arc(arc, num_points=20):
-    """Sample an ARC entity into a list of (x, y) points."""
+# Max deviation (sagitta) allowed when flattening a curve to line segments, in drawing
+# units (inches). All curve samplers below share it so arcs, ellipses, and splines are
+# tessellated to the SAME fidelity. Well under machining tolerance, so the linearized
+# cut is visually and dimensionally indistinguishable from the true curve.
+CHORD_TOLERANCE = 0.001
+
+
+def sample_arc(arc, distance=CHORD_TOLERANCE):
+    """Sample an ARC entity into a list of (x, y) points.
+
+    Uses ezdxf's chord-tolerance flattening (like sample_ellipse/sample_spline) so the
+    deviation from the true arc stays within `distance`, which means big-radius arcs get
+    proportionally more points. This was previously a FIXED 20 points regardless of radius,
+    which visibly facets a large-radius perimeter arc - e.g. a 2" radius / 205 deg outer
+    profile came out as ~0.36" chords (8 mil off true). The stitched perimeter is emitted
+    as linear moves, so this sampling density is exactly what the cut curve inherits.
+    Falls back to manual fixed-count sampling if flattening is unavailable.
+    """
+    try:
+        pts = [(p.x, p.y) for p in arc.flattening(distance)]
+        if len(pts) >= 2:
+            return pts
+    except Exception:
+        pass
     center = (arc.dxf.center.x, arc.dxf.center.y)
     radius = arc.dxf.radius
     start_angle = math.radians(arc.dxf.start_angle)
     end_angle = math.radians(arc.dxf.end_angle)
     if end_angle <= start_angle:
         end_angle += 2 * math.pi
+    num_points = 20
     return [
         (center[0] + radius * math.cos(start_angle + (end_angle - start_angle) * k / num_points),
          center[1] + radius * math.sin(start_angle + (end_angle - start_angle) * k / num_points))
@@ -33,7 +56,7 @@ def sample_arc(arc, num_points=20):
     ]
 
 
-def sample_ellipse(ellipse, distance=0.001):
+def sample_ellipse(ellipse, distance=CHORD_TOLERANCE):
     """Sample an ELLIPSE entity (full or arc) into a list of (x, y) points.
 
     Onshape exports curved perimeter transitions/fillets as ELLIPSE arcs; a full
@@ -46,7 +69,7 @@ def sample_ellipse(ellipse, distance=0.001):
         return []
 
 
-def sample_spline(spline, distance=0.01):
+def sample_spline(spline, distance=CHORD_TOLERANCE):
     """Sample a SPLINE entity into a list of (x, y) points (control points as fallback)."""
     try:
         points = [(p[0], p[1]) for p in spline.flattening(distance=distance)]
