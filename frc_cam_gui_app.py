@@ -620,14 +620,20 @@ def _serve_onshape_panel():
     Onshape's login). Instead it passes an `authenticated` flag and the wizard shows
     a Connect button that runs OAuth in a popup. Sets framing + cookie headers so the
     iframe and its OAuth/session work inside Onshape."""
+    # Pass the launch ids through RAW (do NOT clean placeholders here). These feed the
+    # wizard's Onshape postMessage calls (applicationInit / requestSelection), and
+    # Onshape's selection channel breaks if we hand it an EMPTY workspaceId - it
+    # tolerates the unsubstituted '{$workspaceId}' literal (version context) but not ''.
+    # Placeholder cleaning + wvm resolution happens at the real API boundary instead:
+    # /onshape/export-face cleans the POST body via _clean_onshape_id before any call.
     onshape_ctx = {
-        'documentId': _clean_onshape_id(request.args.get('documentId', '')),
-        'workspaceId': _clean_onshape_id(request.args.get('workspaceId', '')),
+        'documentId': request.args.get('documentId', ''),
+        'workspaceId': request.args.get('workspaceId', ''),
         # A panel opened on an older version/microversion gets these instead of a
         # workspace id; carried through so the export path can address that snapshot.
-        'versionId': _clean_onshape_id(request.args.get('versionId', '')),
-        'microversionId': _clean_onshape_id(request.args.get('microversionId', '')),
-        'elementId': _clean_onshape_id(request.args.get('elementId', '')),
+        'versionId': request.args.get('versionId', ''),
+        'microversionId': request.args.get('microversionId', ''),
+        'elementId': request.args.get('elementId', ''),
         'server': request.args.get('server', 'https://cad.onshape.com'),
     }
     # Onshape passes the user's current theme (e.g. ?theme=light|dark) when it loads the
