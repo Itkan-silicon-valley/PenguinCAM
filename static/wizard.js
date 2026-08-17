@@ -641,7 +641,10 @@
       };
       window.PenguinCAM.onSelectionError = function (msg) {
         dbg('onshape:error', msg);
-        setSel('Import failed: ' + msg + '. Select a face to try again.');
+        // Strip any trailing sentence punctuation the server message already carries
+        // so we don't render a double period before the appended instruction.
+        var clean = String(msg == null ? '' : msg).replace(/[.!?\s]+$/, '');
+        setSel('Import failed: ' + clean + '. Select a face to try again.');
       };
     } else {
       var dz = $('#dropzone'), input = $('#f-dxf');

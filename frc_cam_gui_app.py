@@ -597,6 +597,22 @@ def wizard_app():
     return _serve_wizard_upload()
 
 
+def _clean_onshape_id(value):
+    """Return a usable Onshape id, or '' if the value is an unsubstituted URL-template
+    placeholder. When Onshape launches our element panel it fills placeholders like
+    {$workspaceId}/{$versionId} in the configured URL - but only for ids that exist in
+    the current context. Opened on an older VERSION, a document has no workspace, so
+    {$workspaceId} arrives literally (e.g. '{$workspaceId}' / '%7B$workspaceId%7D').
+    Treat any value containing '{' or '$' (or empty) as absent so the wvm resolver can
+    fall back to the version/microversion id that DID substitute."""
+    if not value:
+        return ''
+    s = str(value).strip()
+    if '{' in s or '$' in s:
+        return ''
+    return s
+
+
 def _serve_onshape_panel():
     """Render the multi-part wizard for embedding in the Onshape right-side panel.
 
@@ -605,9 +621,13 @@ def _serve_onshape_panel():
     a Connect button that runs OAuth in a popup. Sets framing + cookie headers so the
     iframe and its OAuth/session work inside Onshape."""
     onshape_ctx = {
-        'documentId': request.args.get('documentId', ''),
-        'workspaceId': request.args.get('workspaceId', ''),
-        'elementId': request.args.get('elementId', ''),
+        'documentId': _clean_onshape_id(request.args.get('documentId', '')),
+        'workspaceId': _clean_onshape_id(request.args.get('workspaceId', '')),
+        # A panel opened on an older version/microversion gets these instead of a
+        # workspace id; carried through so the export path can address that snapshot.
+        'versionId': _clean_onshape_id(request.args.get('versionId', '')),
+        'microversionId': _clean_onshape_id(request.args.get('microversionId', '')),
+        'elementId': _clean_onshape_id(request.args.get('elementId', '')),
         'server': request.args.get('server', 'https://cad.onshape.com'),
     }
     # Onshape passes the user's current theme (e.g. ?theme=light|dark) when it loads the
@@ -1555,7 +1575,7 @@ def onshape_authed():
 
 
 def build_multilayer_dxf(client, did, wid, eid, face_id, body_id, face_normal,
-                         cached_faces_data=None):
+                         cached_faces_data=None, version_id=None, microversion_id=None):
     """Build a single multi-layer (2.5D) DXF for the selected reference face.
 
     Resolves the reference face's normal (if not already known) and origin, then
@@ -1567,7 +1587,8 @@ def build_multilayer_dxf(client, did, wid, eid, face_id, body_id, face_normal,
     postprocessor's load_dxf), so detected_thickness here is informational.
     Raises RuntimeError with a user-facing message on failure.
     """
-    faces_data = cached_faces_data or client.list_faces(did, wid, eid)
+    faces_data = cached_faces_data or client.list_faces(
+        did, wid, eid, version_id=version_id, microversion_id=microversion_id)
     if not faces_data:
         raise RuntimeError("Failed to retrieve face data from Onshape. Your "
                            "authentication token may have expired. Please "
@@ -1597,7 +1618,8 @@ def build_multilayer_dxf(client, did, wid, eid, face_id, body_id, face_normal,
     result = client.export_multilayer_dxf(
         did, wid, eid,
         face_id, body_id, face_normal, reference_origin,
-        body_id=body_id, cached_faces_data=faces_data
+        body_id=body_id, cached_faces_data=faces_data,
+        version_id=version_id, microversion_id=microversion_id
     )
     # Backwards-compatible unpack if the client doesn't return thickness.
     if isinstance(result, tuple):
@@ -1626,16 +1648,22 @@ def onshape_export_face():
         return err_resp, err_code
 
     data = request.get_json(force=True, silent=True) or {}
-    did = data.get('documentId')
-    wid = data.get('workspaceId')
-    eid = data.get('elementId')
+    did = _clean_onshape_id(data.get('documentId'))
+    # Onshape addresses element data by workspace (live), version, or microversion.
+    # A panel launched on an older version sends versionId with workspaceId left as an
+    # unsubstituted placeholder, so clean all three and require at least one.
+    wid = _clean_onshape_id(data.get('workspaceId'))
+    vid = _clean_onshape_id(data.get('versionId'))
+    mvid = _clean_onshape_id(data.get('microversionId'))
+    eid = _clean_onshape_id(data.get('elementId'))
     fid = data.get('faceId')
     bid = data.get('partId') or data.get('bodyId')
     multilayer = str(data.get('multilayer', '')).lower() in ('true', '1', 'yes')
-    if not all([did, wid, eid, fid]):
-        return jsonify({'error': 'Missing selection IDs (need document/workspace/element/face).'}), 400
+    if not all([did, eid, fid]) or not (wid or vid or mvid):
+        return jsonify({'error': 'Missing selection IDs (need document/workspace-or-version/element/face).'}), 400
 
     log(f"[EXPORT] face did={str(did)[:8]} eid={str(eid)[:8]} fid={fid} bid={bid} "
+        f"ctx={'w/'+wid[:8] if wid else ('v/'+vid[:8] if vid else 'm/'+mvid[:8])} "
         f"mode={'2.5D' if multilayer else 'flat'}")
     path = None
     keep_dxf = False  # set once the DXF is registered for debug download (see finally)
@@ -1649,7 +1677,7 @@ def onshape_export_face():
         faces = None
         resolved_bid = None
         try:
-            faces = client.list_faces(did, wid, eid)
+            faces = client.list_faces(did, wid, eid, version_id=vid, microversion_id=mvid)
             for body in (faces or {}).get('bodies', []):
                 for fc in body.get('faces', []):
                     if fc.get('id') == fid:
@@ -1678,10 +1706,12 @@ def onshape_export_face():
         detected_thickness = None
         if multilayer:
             dxf_bytes, detected_thickness = build_multilayer_dxf(
-                client, did, wid, eid, fid, bid, face_normal, cached_faces_data=faces
+                client, did, wid, eid, fid, bid, face_normal, cached_faces_data=faces,
+                version_id=vid, microversion_id=mvid
             )
         else:
-            dxf_bytes = client.export_face_to_dxf(did, wid, eid, fid, body_id=bid, face_normal=face_normal)
+            dxf_bytes = client.export_face_to_dxf(did, wid, eid, fid, body_id=bid, face_normal=face_normal,
+                                                  version_id=vid, microversion_id=mvid)
             # Seed the (still-editable) 2D thickness field from the part's designed stock
             # height, reusing the same parallel-face depth discovery 2.5D uses. Best-effort:
             # on any failure detected_thickness stays None and the UI keeps its default.
@@ -1689,7 +1719,8 @@ def onshape_export_face():
                 try:
                     detected_thickness = client.detect_stock_thickness(
                         did, wid, eid, face_normal, reference_origin,
-                        body_id=bid, cached_faces_data=faces)
+                        body_id=bid, cached_faces_data=faces,
+                        version_id=vid, microversion_id=mvid)
                 except Exception as e:
                     log(f"[EXPORT] 2D thickness discovery failed (non-fatal): {e}")
         session_manager.update_session_tokens(client)

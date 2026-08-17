@@ -297,7 +297,30 @@ class OnshapeClient:
         # Convert to comma-separated string
         return ','.join(str(v) for v in matrix)
 
-    def export_face_to_dxf(self, document_id, workspace_id, element_id, face_id, body_id=None, face_normal=None):
+    @staticmethod
+    def _wvm_path(document_id, workspace_id=None, version_id=None, microversion_id=None):
+        """Build the Onshape document-context path segment 'd/{did}/{w|v|m}/{id}'.
+
+        Onshape addresses element data by workspace (w, live/editable), version (v),
+        or microversion (m) - the latter two are read-only snapshots. When our element
+        panel is launched on an OLDER VERSION of a document, Onshape substitutes the
+        {$versionId} placeholder in the panel URL but leaves {$workspaceId} unfilled
+        (there is no workspace in that context). Callers pass whichever id they were
+        handed and this picks the matching segment, preferring workspace when present.
+        Read is valid against all three, so DXF export works from a version too.
+        """
+        if workspace_id:
+            wvm = f"w/{workspace_id}"
+        elif version_id:
+            wvm = f"v/{version_id}"
+        elif microversion_id:
+            wvm = f"m/{microversion_id}"
+        else:
+            raise ValueError("Onshape document context needs a workspace, version, or microversion id")
+        return f"d/{document_id}/{wvm}"
+
+    def export_face_to_dxf(self, document_id, workspace_id, element_id, face_id, body_id=None, face_normal=None,
+                           version_id=None, microversion_id=None):
         """
         Export a face from a Part Studio as DXF
 
@@ -323,7 +346,7 @@ class OnshapeClient:
         
         # Try the internal export endpoint that Onshape's web UI uses
         log("\n[Method 1] Trying exportinternal endpoint (web UI method)...")
-        endpoint = f"/documents/d/{document_id}/w/{workspace_id}/e/{element_id}/exportinternal"
+        endpoint = f"/documents/{self._wvm_path(document_id, workspace_id, version_id, microversion_id)}/e/{element_id}/exportinternal"
         
         try:
             # For Part Studios, Onshape's "partIds" parameter actually expects face IDs, not body IDs
@@ -376,13 +399,14 @@ class OnshapeClient:
         
         # Fallback: Try async translations API
         log("\n[Method 2] Trying async translations API...")
-        result = self.export_dxf_async(document_id, workspace_id, element_id)
+        result = self.export_dxf_async(document_id, workspace_id, element_id,
+                                       version_id=version_id, microversion_id=microversion_id)
         if result:
             return result
-        
+
         # Fallback: Try POST /export endpoint
         log("\n[Method 3] Trying POST /export endpoint...")
-        endpoint = f"/partstudios/d/{document_id}/w/{workspace_id}/e/{element_id}/export"
+        endpoint = f"/partstudios/{self._wvm_path(document_id, workspace_id, version_id, microversion_id)}/e/{element_id}/export"
         
         try:
             body = {
@@ -405,14 +429,15 @@ class OnshapeClient:
         log("\n=== All export methods failed ===")
         return None
     
-    def start_dxf_translation(self, document_id, workspace_id, element_id):
+    def start_dxf_translation(self, document_id, workspace_id, element_id,
+                              version_id=None, microversion_id=None):
         """
         Start an async DXF export translation
-        
+
         Returns:
             Translation ID if successful, None otherwise
         """
-        endpoint = f"/partstudios/d/{document_id}/w/{workspace_id}/e/{element_id}/translations"
+        endpoint = f"/partstudios/{self._wvm_path(document_id, workspace_id, version_id, microversion_id)}/e/{element_id}/translations"
         
         try:
             log(f"\nStarting DXF translation for element {element_id}")
@@ -498,17 +523,19 @@ class OnshapeClient:
             log(f"Error downloading result: {e}")
             return None
     
-    def export_dxf_async(self, document_id, workspace_id, element_id, timeout=60):
+    def export_dxf_async(self, document_id, workspace_id, element_id, timeout=60,
+                         version_id=None, microversion_id=None):
         """
         Export DXF using async translations API
         Polls until complete or timeout
-        
+
         Returns:
             DXF content as bytes, or None
         """
-        
+
         # Start translation
-        translation_id = self.start_dxf_translation(document_id, workspace_id, element_id)
+        translation_id = self.start_dxf_translation(document_id, workspace_id, element_id,
+                                                    version_id=version_id, microversion_id=microversion_id)
         if not translation_id:
             return None
         
@@ -547,14 +574,15 @@ class OnshapeClient:
         log(f"Translation timed out after {timeout} seconds")
         return None
     
-    def list_faces(self, document_id, workspace_id, element_id):
+    def list_faces(self, document_id, workspace_id, element_id,
+                   version_id=None, microversion_id=None):
         """
         List all faces in a Part Studio element using bodydetails endpoint
 
         Returns:
             Dict with bodies and their faces, or None if failed
         """
-        endpoint = f"/partstudios/d/{document_id}/w/{workspace_id}/e/{element_id}/bodydetails"
+        endpoint = f"/partstudios/{self._wvm_path(document_id, workspace_id, version_id, microversion_id)}/e/{element_id}/bodydetails"
 
         try:
             log(f"\n{'='*70}")
@@ -623,7 +651,8 @@ class OnshapeClient:
             log(f"{'='*70}\n")
             return None
     
-    def get_body_faces(self, document_id, workspace_id, element_id, body_id=None, cached_faces_data=None):
+    def get_body_faces(self, document_id, workspace_id, element_id, body_id=None, cached_faces_data=None,
+                       version_id=None, microversion_id=None):
         """
         Get face information for bodies in an element
 
@@ -634,7 +663,8 @@ class OnshapeClient:
         Returns:
             Dict mapping body IDs to lists of face info dicts with id, area, surface type, position
         """
-        data = cached_faces_data if cached_faces_data else self.list_faces(document_id, workspace_id, element_id)
+        data = cached_faces_data if cached_faces_data else self.list_faces(
+            document_id, workspace_id, element_id, version_id=version_id, microversion_id=microversion_id)
         
         if not data or 'bodies' not in data:
             return None
@@ -682,7 +712,8 @@ class OnshapeClient:
         
         return result
     
-    def auto_select_top_face(self, document_id, workspace_id, element_id, body_id=None, cached_faces_data=None):
+    def auto_select_top_face(self, document_id, workspace_id, element_id, body_id=None, cached_faces_data=None,
+                             version_id=None, microversion_id=None):
         """
         Automatically select the largest planar face
 
@@ -705,7 +736,8 @@ class OnshapeClient:
         log(f"Requested body_id: {body_id if body_id else '(auto-detect)'}")
         log(f"Using cached data: {cached_faces_data is not None}")
 
-        faces_by_body = self.get_body_faces(document_id, workspace_id, element_id, body_id, cached_faces_data)
+        faces_by_body = self.get_body_faces(document_id, workspace_id, element_id, body_id, cached_faces_data,
+                                            version_id=version_id, microversion_id=microversion_id)
 
         if not faces_by_body:
             log("❌ get_body_faces returned None - no bodies found")
@@ -799,7 +831,8 @@ class OnshapeClient:
     def find_parallel_faces_by_depth(self, document_id, workspace_id, element_id,
                                       reference_normal, reference_origin,
                                       body_id=None, cached_faces_data=None,
-                                      angle_tolerance=0.1, depth_tolerance=0.01):
+                                      angle_tolerance=0.1, depth_tolerance=0.01,
+                                      version_id=None, microversion_id=None):
         """
         Find all planar faces parallel to a reference plane, binned by depth
 
@@ -820,7 +853,8 @@ class OnshapeClient:
         log(f"{'='*70}")
 
         # Get all faces
-        faces_by_body = self.get_body_faces(document_id, workspace_id, element_id, body_id, cached_faces_data)
+        faces_by_body = self.get_body_faces(document_id, workspace_id, element_id, body_id, cached_faces_data,
+                                            version_id=version_id, microversion_id=microversion_id)
         if not faces_by_body:
             log("No faces found")
             return {}
@@ -939,7 +973,8 @@ class OnshapeClient:
 
     def detect_stock_thickness(self, document_id, workspace_id, element_id,
                                reference_normal, reference_origin,
-                               body_id=None, cached_faces_data=None):
+                               body_id=None, cached_faces_data=None,
+                               version_id=None, microversion_id=None):
         """Discover a part's designed stock thickness (height along the reference-face normal)
         by binning its parallel faces by depth - the same derivation 2.5D uses, exposed so the
         2D path can seed its (still-editable) thickness field. Returns inches, or None if it
@@ -947,7 +982,8 @@ class OnshapeClient:
         depth_bins = self.find_parallel_faces_by_depth(
             document_id, workspace_id, element_id,
             reference_normal, reference_origin,
-            body_id=body_id, cached_faces_data=cached_faces_data)
+            body_id=body_id, cached_faces_data=cached_faces_data,
+            version_id=version_id, microversion_id=microversion_id)
         return self._thickness_from_depth_bins(depth_bins)
 
     def _convert_geometry_to_solid_hatch(self, source_msp, target_msp, layer_name):
@@ -1259,7 +1295,8 @@ class OnshapeClient:
 
     def export_multilayer_dxf(self, document_id, workspace_id, element_id,
                              reference_face_id, reference_body_id, reference_normal, reference_origin,
-                             body_id=None, cached_faces_data=None):
+                             body_id=None, cached_faces_data=None,
+                             version_id=None, microversion_id=None):
         """
         Export multiple parallel faces as a single multi-layer DXF for 2.5D machining
 
@@ -1287,7 +1324,8 @@ class OnshapeClient:
             document_id, workspace_id, element_id,
             reference_normal, reference_origin,
             body_id, cached_faces_data,
-            depth_tolerance=0.001  # 0.001" = 1 mil tolerance
+            depth_tolerance=0.001,  # 0.001" = 1 mil tolerance
+            version_id=version_id, microversion_id=microversion_id
         )
 
         if not depth_bins:
@@ -1349,7 +1387,8 @@ class OnshapeClient:
             # We'll modify export_face_to_dxf to accept multiple IDs
             return depth, self._export_faces_group_to_dxf(
                 document_id, workspace_id, element_id,
-                face_ids_str, reference_normal
+                face_ids_str, reference_normal,
+                version_id=version_id, microversion_id=microversion_id
             )
 
         # Export depth groups in parallel
@@ -1441,7 +1480,8 @@ class OnshapeClient:
         # For now, just return both values
         return merged_dxf, detected_thickness
 
-    def _export_faces_group_to_dxf(self, document_id, workspace_id, element_id, face_ids_str, face_normal=None):
+    def _export_faces_group_to_dxf(self, document_id, workspace_id, element_id, face_ids_str, face_normal=None,
+                                   version_id=None, microversion_id=None):
         """
         Export multiple faces as a single DXF (helper for multi-layer export)
 
@@ -1452,7 +1492,7 @@ class OnshapeClient:
         Returns:
             DXF file content as bytes, or None if failed
         """
-        endpoint = f"/documents/d/{document_id}/w/{workspace_id}/e/{element_id}/exportinternal"
+        endpoint = f"/documents/{self._wvm_path(document_id, workspace_id, version_id, microversion_id)}/e/{element_id}/exportinternal"
 
         try:
             # Calculate view matrix based on face normal

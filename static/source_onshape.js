@@ -86,6 +86,8 @@
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         documentId: ctx.documentId, workspaceId: ctx.workspaceId, elementId: ctx.elementId,
+        // Present when the panel was launched on an older version/microversion (no workspace).
+        versionId: ctx.versionId, microversionId: ctx.microversionId,
         faceId: faceId, partId: partId, multilayer: multilayer
       })
     })
