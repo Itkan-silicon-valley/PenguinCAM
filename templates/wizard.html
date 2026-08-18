@@ -13,7 +13,7 @@
             <!-- Loaded team configuration (so the user can confirm it resolved correctly,
                  even in the Onshape panel). Clickable when we know the config file URL. -->
             <div class="config-info">
-                {% if session.get('team_config') and session.get('team_config').get('team_number') %}
+                {% if not session.get('using_default_config') and session.get('team_config') and session.get('team_config').get('team_number') %}
                 {% set _config_url = session.get('team_config_url') %}
                 <p class="config-status">Config:
                     {% if _config_url %}
