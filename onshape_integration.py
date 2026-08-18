@@ -13,6 +13,8 @@ import traceback
 import ezdxf
 import requests
 import base64
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from urllib.parse import urlencode, parse_qs
@@ -23,6 +25,23 @@ from shapely.ops import unary_union
 
 from dxf_geometry import entities_to_closed_paths
 from logging_config import log  # shared log() + logging setup (was duplicated per module)
+
+
+def mask(secret):
+    """Redact a secret for logging.
+
+    Returns a fingerprint that is safe to write to logs / stack traces without
+    revealing the value. Never returns enough characters to reconstruct it.
+    Used anywhere an API key/secret (or a derived auth header) might otherwise
+    be printed.
+    """
+    if not secret:
+        return '<unset>'
+    s = str(secret)
+    if len(s) <= 8:
+        return '****'
+    return f'****{s[-4:]}'
+
 
 class OnshapeClient:
     """Client for interacting with Onshape API"""
@@ -35,7 +54,46 @@ class OnshapeClient:
         self.access_token = None
         self.refresh_token = None
         self.token_expires = None
-    
+        # Auth mode: 'oauth' (interactive, session-driven) or 'apikey' (headless).
+        self.auth_mode = 'oauth'
+        self.api_access_key = None
+        self.api_secret_key = None
+        # Shared connection pool with retry/backoff for transient failures
+        # (connection resets, 429/5xx). Applies to every API call in both auth
+        # modes; important for the headless harness that fires many requests.
+        self.session = requests.Session()
+        retry = Retry(
+            total=4, connect=4, read=4, status=4,
+            backoff_factor=0.5,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=frozenset(['GET', 'POST', 'PUT', 'DELETE']),
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(max_retries=retry)
+        self.session.mount('https://', adapter)
+        self.session.mount('http://', adapter)
+
+    @classmethod
+    def from_api_keys(cls, access_key=None, secret_key=None):
+        """Build a headless client authenticated with an Onshape API key pair.
+
+        No OAuth / Flask session involved. When args are omitted, reads
+        ONSHAPE_ACCESS_KEY / ONSHAPE_SECRET_KEY from the environment. The secret
+        stays inside this process and is never logged; only a masked fingerprint
+        of the access key is emitted so runs are traceable.
+        """
+        client = cls()
+        client.auth_mode = 'apikey'
+        client.api_access_key = access_key or os.environ.get('ONSHAPE_ACCESS_KEY')
+        client.api_secret_key = secret_key or os.environ.get('ONSHAPE_SECRET_KEY')
+        if not client.api_access_key or not client.api_secret_key:
+            raise ValueError(
+                "API-key auth requires ONSHAPE_ACCESS_KEY and ONSHAPE_SECRET_KEY "
+                "environment variables to be set (their values are never printed)."
+            )
+        log(f"   Onshape API-key mode: access key {mask(client.api_access_key)}")
+        return client
+
     def _load_config(self):
         """Load Onshape OAuth configuration, prioritizing environment variables"""
         # Try to load from file first
@@ -184,6 +242,11 @@ class OnshapeClient:
     
     def _ensure_valid_token(self):
         """Ensure we have a valid access token"""
+        if self.auth_mode == 'apikey':
+            # API keys don't expire and carry no refresh flow; nothing to do.
+            if not (self.api_access_key and self.api_secret_key):
+                raise ValueError("API-key mode selected but keys are not set")
+            return
         if not self.access_token:
             raise ValueError("No access token. User must authenticate first.")
         
@@ -205,13 +268,20 @@ class OnshapeClient:
             Response object
         """
         self._ensure_valid_token()
-        
+
         url = f"{self.API_BASE}{endpoint}"
-        
         headers = kwargs.pop('headers', {})
+
+        if self.auth_mode == 'apikey':
+            # HTTP Basic (accessKey:secretKey). requests builds the header
+            # internally; the credential is never placed in a variable we log.
+            return self.session.request(
+                method, url, headers=headers,
+                auth=(self.api_access_key, self.api_secret_key), **kwargs
+            )
+
         headers['Authorization'] = f'Bearer {self.access_token}'
-        
-        return requests.request(method, url, headers=headers, **kwargs)
+        return self.session.request(method, url, headers=headers, **kwargs)
     
     def get_user_info(self):
         """Get information about the authenticated user"""
@@ -986,6 +1056,151 @@ class OnshapeClient:
             version_id=version_id, microversion_id=microversion_id)
         return self._thickness_from_depth_bins(depth_bins)
 
+    # Typical tube wall thickness ceiling (inches). Real extrusion walls are
+    # 1/16"-1/8"; a "wall" thicker than this is more likely a real machining
+    # level than a hollow-section wall.
+    _TUBE_WALL_MAX_IN = 0.2
+
+    @staticmethod
+    def _classify_from_depths(depths, name_hint=''):
+        """Decide a machining setup from a part's parallel-face depths (pure logic).
+
+        This is the heuristic the harness uses to replicate what a user picks in
+        the wizard, factored out of any API calls so it is unit-testable.
+
+        Args:
+            depths: iterable of parallel-face depths in inches (0 = reference/top
+                face, negative going down). Order doesn't matter; sorted here.
+            name_hint: part/document name, used only as a weak tube signal.
+
+        Returns:
+            dict with:
+              part_type: '2d' | '2.5d' | 'tube' | 'unknown'
+              export_strategy: 'onshape_standard_dxf' | 'constructed_multilayer'
+                               | 'tube' | None
+              thickness_in: material/wall thickness (inches) or None
+              tube_height_in: full tube height (inches) for tubes, else None
+              confidence: 'high' | 'low'
+              needs_review: bool
+              notes: list[str] explaining the decision
+        """
+        name_l = (name_hint or '').lower()
+        ds = sorted(set(round(d, 4) for d in depths), reverse=True)  # shallow->deep
+        n = len(ds)
+        notes = []
+
+        if n <= 1:
+            return {
+                'part_type': 'unknown', 'export_strategy': None,
+                'thickness_in': None, 'tube_height_in': None,
+                'confidence': 'low', 'needs_review': True,
+                'notes': [f'Only {n} distinct parallel-face depth(s); '
+                          'cannot determine thickness. Needs a human.'],
+            }
+
+        gaps = [ds[i] - ds[i + 1] for i in range(n - 1)]  # all > 0
+        span = ds[0] - ds[-1]
+
+        # Tube signature: a thin wall at BOTH the top and bottom of the section
+        # with a large hollow void between them -> gap pattern small, big, small.
+        tube_by_geometry = (
+            n >= 4
+            and gaps[0] < OnshapeClient._TUBE_WALL_MAX_IN
+            and gaps[-1] < OnshapeClient._TUBE_WALL_MAX_IN
+            and max(gaps[1:-1]) > 3 * max(gaps[0], gaps[-1])
+        )
+        tube_by_name = 'tube' in name_l
+        if tube_by_geometry or tube_by_name:
+            if tube_by_geometry:
+                notes.append('Thin-wall/hollow depth signature (small-big-small gaps).')
+            if tube_by_name:
+                notes.append('Name mentions "tube".')
+            # Tube wizard fields: material thickness = wall, tube_height = section.
+            wall = gaps[0] if tube_by_geometry else None
+            return {
+                'part_type': 'tube', 'export_strategy': 'tube',
+                'thickness_in': wall, 'tube_height_in': span if tube_by_geometry else None,
+                # Tube is the riskiest call and the tube path differs the most,
+                # so always route it past a human even when both signals agree.
+                'confidence': 'high' if (tube_by_geometry and tube_by_name) else 'low',
+                'needs_review': True, 'notes': notes,
+            }
+
+        if n == 2:
+            return {
+                'part_type': '2d', 'export_strategy': 'onshape_standard_dxf',
+                'thickness_in': span, 'tube_height_in': None,
+                'confidence': 'high', 'needs_review': False,
+                'notes': ['Two parallel faces (top + bottom): simple through-cut '
+                          '-> devolve to a standard Onshape DXF export.'],
+            }
+
+        return {
+            'part_type': '2.5d', 'export_strategy': 'constructed_multilayer',
+            'thickness_in': span, 'tube_height_in': None,
+            'confidence': 'high', 'needs_review': False,
+            'notes': [f'{n} distinct depths: pocketed/multi-level part '
+                      '-> construct a multilayer DXF ourselves.'],
+        }
+
+    def classify_part(self, document_id, workspace_id, element_id,
+                      version_id=None, microversion_id=None):
+        """Infer how a user would set up a part in the wizard, from its geometry.
+
+        Mirrors the live 2.5D path's analyze-first approach but with no user in
+        the loop: auto-selects the largest planar face (instead of a click) and
+        decides 2D vs 2.5D vs tube from the parallel-face depth bins (instead of
+        a toggle). The result names the export_strategy Phase 3 dispatches on and
+        carries the face_id/body_id/normal those export calls need.
+
+        Returns a dict (see _classify_from_depths) augmented with source and
+        selection fields, or a low-confidence 'unknown' entry on any failure.
+        """
+        def _unknown(reason):
+            return {
+                'part_type': 'unknown', 'export_strategy': None,
+                'thickness_in': None, 'tube_height_in': None,
+                'confidence': 'low', 'needs_review': True, 'notes': [reason],
+                'face_id': None, 'body_id': None, 'face_normal': None,
+                'part_name': None, 'depth_bins_in': [],
+            }
+
+        faces = self.list_faces(document_id, workspace_id, element_id,
+                                version_id=version_id, microversion_id=microversion_id)
+        if not faces:
+            return _unknown('Onshape returned no face data for this element.')
+
+        face_id, body_id, part_name, normal = self.auto_select_top_face(
+            document_id, workspace_id, element_id, cached_faces_data=faces,
+            version_id=version_id, microversion_id=microversion_id)
+        if not face_id:
+            return _unknown('No planar face found to use as the reference/top face.')
+
+        # The selected face's plane origin is needed to measure depths from it.
+        reference_origin = None
+        for body in faces.get('bodies', []):
+            for fc in body.get('faces', []):
+                if fc.get('id') == face_id:
+                    reference_origin = (fc.get('surface') or {}).get('origin')
+                    break
+            if reference_origin is not None:
+                break
+        if reference_origin is None:
+            return _unknown('Could not resolve the reference face origin.')
+
+        depth_bins = self.find_parallel_faces_by_depth(
+            document_id, workspace_id, element_id, normal, reference_origin,
+            body_id=body_id, cached_faces_data=faces,
+            version_id=version_id, microversion_id=microversion_id)
+
+        result = self._classify_from_depths(list(depth_bins.keys()), name_hint=part_name)
+        result.update({
+            'face_id': face_id, 'body_id': body_id, 'face_normal': normal,
+            'part_name': part_name,
+            'depth_bins_in': sorted((round(d, 4) for d in depth_bins.keys()), reverse=True),
+        })
+        return result
+
     def _convert_geometry_to_solid_hatch(self, source_msp, target_msp, layer_name):
         """
         Convert circles and polylines from source to solid HATCH entities in target.
@@ -1544,6 +1759,78 @@ class OnshapeClient:
             log(traceback.format_exc())
             return None
     
+    def list_folder_documents(self, folder_id):
+        """List documents directly contained in an Onshape folder (non-recursive).
+
+        Uses the global tree nodes API with offset pagination. Subfolders are
+        ignored here (recursion can be layered on later if the corpus grows a
+        nested structure).
+
+        Returns:
+            list of {'id', 'name'} dicts, one per document node.
+        """
+        documents = []
+        offset = 0
+        limit = 50
+        while True:
+            endpoint = (
+                f'/globaltreenodes/folder/{folder_id}'
+                f'?getPathToRoot=false&offset={offset}&limit={limit}'
+            )
+            response = self._make_api_request('GET', endpoint)
+            if response.status_code != 200:
+                log(f"Failed to list folder {folder_id}: "
+                    f"HTTP {response.status_code} {response.text[:200]}")
+                break
+            items = response.json().get('items', [])
+            for item in items:
+                # Document nodes carry resourceType 'document' (subfolders are
+                # 'folder'); jsonType is the belt-and-suspenders fallback.
+                if (item.get('resourceType') == 'document'
+                        or item.get('jsonType') == 'document-summary'):
+                    documents.append({
+                        'id': item.get('id'),
+                        'name': item.get('name', 'unnamed'),
+                    })
+            if len(items) < limit:
+                break
+            offset += len(items)
+        return documents
+
+    def list_part_studios(self, document_id, workspace_id=None):
+        """List Part Studio elements in a document's default (or given) workspace.
+
+        Returns:
+            list of {'id', 'name', 'workspace_id'} dicts, one per Part Studio.
+        """
+        if workspace_id is None:
+            doc_info = self.get_document_info(document_id)
+            if not doc_info:
+                return []
+            workspace_id = doc_info.get('defaultWorkspace', {}).get('id')
+            if not workspace_id:
+                log(f"No default workspace for document {document_id}")
+                return []
+
+        response = self._make_api_request(
+            'GET', f'/documents/d/{document_id}/w/{workspace_id}/elements'
+        )
+        if response.status_code != 200:
+            log(f"Failed to list elements for {document_id}: "
+                f"HTTP {response.status_code}")
+            return []
+
+        studios = []
+        for elem in response.json():
+            if (elem.get('type') == 'Part Studio'
+                    or elem.get('elementType') == 'PARTSTUDIO'):
+                studios.append({
+                    'id': elem.get('id'),
+                    'name': elem.get('name', 'unnamed'),
+                    'workspace_id': workspace_id,
+                })
+        return studios
+
     def get_user_session_info(self):
         """
         Get detailed session info for the authenticated user
@@ -1785,6 +2072,69 @@ class OnshapeClient:
             log(f"   ❌ EXCEPTION in fetch_config_file: {e}")
             log(f"   Full traceback:\n{traceback.format_exc()}")
             return None
+
+
+def build_multilayer_dxf(client, did, wid, eid, face_id, body_id, face_normal,
+                         cached_faces_data=None, version_id=None, microversion_id=None):
+    """Build a single multi-layer (2.5D) DXF for the selected reference face.
+
+    Resolves the reference face's normal (if not already known) and origin, then
+    asks the Onshape client to bin all parallel faces by depth and merge them into
+    one depth-layered DXF. Returns (dxf_bytes, detected_thickness).
+
+    This is the sole home of the 2.5D DXF construction. The G-code path derives
+    the actual stock thickness from the DXF layers themselves (see the
+    postprocessor's load_dxf), so detected_thickness here is informational.
+    Raises RuntimeError with a user-facing message on failure.
+
+    Lives here (not in the Flask app) so both the web export route and the
+    headless test harness construct 2.5D DXFs the exact same way.
+    """
+    faces_data = cached_faces_data or client.list_faces(
+        did, wid, eid, version_id=version_id, microversion_id=microversion_id)
+    if not faces_data:
+        raise RuntimeError("Failed to retrieve face data from Onshape. Your "
+                           "authentication token may have expired. Please "
+                           "re-authenticate with Onshape.")
+
+    # Locate the selected reference face (for the normal fallback + origin).
+    reference_face = None
+    for body in faces_data.get('bodies', []):
+        if body_id and body.get('id') != body_id:
+            continue
+        for face in body.get('faces', []):
+            if face.get('id') == face_id:
+                reference_face = face
+                break
+        if reference_face:
+            break
+
+    if reference_face is None:
+        raise RuntimeError("Could not find the selected face for multi-layer "
+                           "export. Please select a flat top face.")
+
+    surface = reference_face.get('surface', {}) or {}
+    if not face_normal:
+        face_normal = surface.get('normal', {'x': 0, 'y': 0, 'z': 1})
+    reference_origin = surface.get('origin', {'x': 0, 'y': 0, 'z': 0})
+
+    result = client.export_multilayer_dxf(
+        did, wid, eid,
+        face_id, body_id, face_normal, reference_origin,
+        body_id=body_id, cached_faces_data=faces_data,
+        version_id=version_id, microversion_id=microversion_id
+    )
+    # Backwards-compatible unpack if the client doesn't return thickness.
+    if isinstance(result, tuple):
+        dxf_bytes, detected_thickness = result
+    else:
+        dxf_bytes, detected_thickness = result, None
+
+    if not dxf_bytes:
+        raise RuntimeError("Onshape returned no multi-layer DXF for that face. "
+                           "Make sure the selected face is a flat top face of a "
+                           "2.5D part.")
+    return dxf_bytes, detected_thickness
 
 
 class OnshapeSessionManager:

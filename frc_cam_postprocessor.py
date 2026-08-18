@@ -1194,10 +1194,16 @@ class FRCPostProcessor:
 
     def identify_perimeter_and_pockets(self):
         """Identify the outer perimeter and any inner pockets"""
-        # Collect all closed paths: polylines OR circles (converted to polylines)
-        # Only use circles as perimeter candidates if there are NO polylines
+        # Collect all closed paths as perimeter candidates: polylines AND circles.
+        # Circles must be candidates even when polylines are present, because a
+        # round part's OUTER boundary is a circle while its interior features
+        # (bore, slots, lightening cuts) are polylines - the perimeter is the
+        # largest boundary of EITHER kind. (Non-perimeter circles still stay holes,
+        # not pockets; see the pocket assignment below.) Previously circles were
+        # only considered when NO polylines existed, so a round part with any
+        # interior polyline had its circular perimeter ignored and mis-detected.
         all_paths = []
-        circle_to_path_map = {}  # Track which circles were converted to paths
+        circle_to_path_map = {}  # Track which paths came from circles (path idx -> circle idx)
 
         # Add existing polylines
         polyline_count = 0
@@ -1205,9 +1211,8 @@ class FRCPostProcessor:
             all_paths.extend(self.polylines)
             polyline_count = len(self.polylines)
 
-        # Convert circles to polylines ONLY if there are no existing polylines
-        # (e.g., for a washer with just two concentric circles)
-        if not self.polylines and hasattr(self, 'circles') and self.circles:
+        # Add circles as candidates too (tessellated to polylines)
+        if hasattr(self, 'circles') and self.circles:
             for i, circle in enumerate(self.circles):
                 try:
                     cx, cy = circle['center']
@@ -1216,10 +1221,8 @@ class FRCPostProcessor:
                         continue
                     # Create polyline from circle (50 points)
                     points = self._tessellate_circle(cx, cy, r)
-                    path_idx = len(all_paths)
+                    circle_to_path_map[len(all_paths)] = i
                     all_paths.append(points)
-                    # Map path index to circle index
-                    circle_to_path_map[path_idx] = i
                 except (KeyError, TypeError):
                     # Skip circles with missing/invalid data
                     continue
@@ -1274,32 +1277,18 @@ class FRCPostProcessor:
 
         self.perimeter = candidate_perimeter
 
-        # For circles-as-perimeter (no polylines), don't treat other circles as pockets
-        # They should remain as holes. Only actual polylines can be pockets.
-        if polyline_count > 0:
-            # Normal case: we have polylines, add remaining ones as pockets
-            self.pockets = [p[1] for p in polygons[1:]]
-        else:
-            # Circles-only case (like a washer): no pockets, keep inner circles as holes
-            self.pockets = []
+        # Pockets are polyline-derived regions only (excluding whichever one is the
+        # perimeter). Circles that aren't the perimeter remain holes, never pockets -
+        # so a washer's inner circle and a round part's bolt holes stay holes.
+        self.pockets = [points for (poly, points, path_idx) in polygons[1:]
+                        if path_idx not in circle_to_path_map]
 
-        # Remove circles that were used as perimeter from self.circles
-        circles_to_remove = set()
-
-        # Check if perimeter came from a circle - if so, remove it
+        # If the perimeter itself came from a circle (round part / washer), drop that
+        # circle from self.circles so it isn't also machined as a hole.
         if perimeter_path_idx in circle_to_path_map:
-            circles_to_remove.add(circle_to_path_map[perimeter_path_idx])
-
-        # If we created pockets from circles (only when polyline_count > 0), remove those too
-        if polyline_count > 0:
-            for poly, points, path_idx in polygons[1:]:
-                if path_idx in circle_to_path_map:
-                    circles_to_remove.add(circle_to_path_map[path_idx])
-
-        # Remove circles in reverse order to avoid index issues
-        if circles_to_remove:
-            self.circles = [c for i, c in enumerate(self.circles) if i not in circles_to_remove]
-            print(f"  Removed {len(circles_to_remove)} circle(s) that were identified as perimeter/pockets")
+            perimeter_circle_idx = circle_to_path_map[perimeter_path_idx]
+            self.circles = [c for i, c in enumerate(self.circles) if i != perimeter_circle_idx]
+            print(f"  Removed 1 circle that was identified as the perimeter")
 
         print(f"\nIdentified perimeter and {len(self.pockets)} pockets")
 
@@ -3390,20 +3379,15 @@ class FRCPostProcessor:
         gcode = []
 
         stepover = self.tool_diameter * self.stepover_percentage
+        spiral_constant = stepover / (2 * math.pi)
+        angle_increment = math.radians(10)
 
         # Entry point: use representative_point which lands in the solid ring
         rep_point = offset_poly.representative_point()
-        entry_x = rep_point.x
-        entry_y = rep_point.y
-
-        # Entry radius = distance from ring center to entry point
-        entry_radius = math.sqrt((entry_x - cx) ** 2 + (entry_y - cy) ** 2)
-
-        # Clamp entry radius to stay within the ring
+        entry_radius = math.sqrt((rep_point.x - cx) ** 2 + (rep_point.y - cy) ** 2)
         entry_radius = max(inner_radius, min(outer_radius, entry_radius))
 
-        # Recalculate entry point on the ring center axis at entry_radius
-        # Place at 0 degrees (positive X from center) for clean arc commands
+        # Place the entry on the +X axis (angle 0) for a clean helical ramp.
         entry_x = cx + entry_radius
         entry_y = cy
 
@@ -3418,85 +3402,70 @@ class FRCPostProcessor:
         gcode.append(f"G1 X{entry_x:.4f} Y{entry_y:.4f} F{self.traverse_rate}  ; Position at ring entry")
         gcode.extend(self._approach_ramp_start(ramp_start_height))
 
-        # Ring-centered helical ramp: helix around ring center at entry_radius
-        # I,J are offsets from current position to arc center
+        # Ring-centered helical ramp: helix around ring center at entry_radius.
         i_offset = cx - entry_x  # = -entry_radius (since entry_x = cx + entry_radius)
         j_offset = cy - entry_y  # = 0 (since entry_y = cy)
-
         gcode.append(f"(Helical ramp: {num_helical_passes} passes at entry radius {entry_radius:.4f})")
         for pass_num in range(num_helical_passes):
             target_z = ramp_start_height - (pass_num + 1) * depth_per_pass
             gcode.append(f"G3 X{entry_x:.4f} Y{entry_y:.4f} I{i_offset:.4f} J{j_offset:.4f} "
                          f"Z{target_z:.4f} F{self.ramp_feed_rate}  ; Helical pass {pass_num + 1}/{num_helical_passes}")
-
-        # Cleanup circle at entry radius to ensure full ring at this radius is cleared
         gcode.append(f"G3 X{entry_x:.4f} Y{entry_y:.4f} I{i_offset:.4f} J{j_offset:.4f} "
                      f"F{self.feed_rate}  ; Cleanup pass at entry radius")
 
-        # Archimedean spiral outward from entry_radius to outer_radius
-        radius_delta_out = outer_radius - entry_radius
-        if radius_delta_out > 0.001:
-            spiral_constant = stepover / (2 * math.pi)
-            total_angle = radius_delta_out / spiral_constant if spiral_constant > 0 else 0
-            angle_increment = math.radians(10)
-            num_points = int(math.ceil(total_angle / angle_increment))
+        # Archimedean spiral helper. Spirals from (start_radius, start_angle) to
+        # end_radius, emitting a G1 point every angle_increment, and returns the
+        # tool's final (angle, radius). CRITICAL: each phase continues from where
+        # the previous one ended - we never emit a straight move between two
+        # different angles, because that cuts a CHORD across the ring interior and
+        # gouges the central island (the class of bug this rewrite fixes).
+        def spiral_to(start_radius, start_angle, end_radius):
+            angle, radius = start_angle, start_radius
+            if abs(end_radius - start_radius) > 0.001 and spiral_constant > 0:
+                direction = 1.0 if end_radius > start_radius else -1.0
+                total_angle = abs(end_radius - start_radius) / spiral_constant
+                num_points = int(math.ceil(total_angle / angle_increment))
+                for k in range(1, num_points + 1):
+                    angle = start_angle + k * angle_increment
+                    radius = start_radius + direction * spiral_constant * (k * angle_increment)
+                    radius = min(radius, end_radius) if direction > 0 else max(radius, end_radius)
+                    x = cx + radius * math.cos(angle)
+                    y = cy + radius * math.sin(angle)
+                    gcode.append(f"G1 X{x:.4f} Y{y:.4f} F{self.feed_rate}")
+            return angle, radius
 
-            gcode.append(f"(Spiral outward: {num_points} points from r={entry_radius:.4f} to r={outer_radius:.4f})")
-            for i in range(num_points):
-                current_angle = i * angle_increment
-                current_radius = entry_radius + spiral_constant * current_angle
-                current_radius = min(current_radius, outer_radius)
-                x = cx + current_radius * math.cos(current_angle)
-                y = cy + current_radius * math.sin(current_angle)
-                gcode.append(f"G1 X{x:.4f} Y{y:.4f} F{self.feed_rate}")
+        def point_on(radius, angle):
+            return cx + radius * math.cos(angle), cy + radius * math.sin(angle)
 
-        # Cleanup circle at outer radius - G3/CCW for climb milling on inner groove wall
-        outer_x = cx + outer_radius
-        outer_y = cy
-        gcode.append(f"G1 X{outer_x:.4f} Y{outer_y:.4f} F{self.feed_rate}  ; Move to outer radius")
-        gcode.append(f"G3 X{outer_x:.4f} Y{outer_y:.4f} I{-outer_radius:.4f} J0 "
+        # Spiral outward to the outer wall, then a full cleanup circle FROM THE
+        # CURRENT position (a G2/G3 full circle traces the whole ring from any start
+        # point, so no reposition-to-angle-0 chord is needed).
+        angle, radius = spiral_to(entry_radius, 0.0, outer_radius)
+        if abs(radius - outer_radius) > 1e-4:
+            ox, oy = point_on(outer_radius, angle)  # radial nudge, constant angle
+            gcode.append(f"G1 X{ox:.4f} Y{oy:.4f} F{self.feed_rate}  ; Radial to outer radius")
+        ox, oy = point_on(outer_radius, angle)
+        gcode.append(f"G3 X{ox:.4f} Y{oy:.4f} I{cx - ox:.4f} J{cy - oy:.4f} "
                      f"F{self.feed_rate}  ; Outer cleanup circle, CCW climb milling")
-
-        # Spring pass on outer wall: re-trace at zero stepover to relieve tool deflection.
         gcode.append(f"(Spring pass - compensate for tool deflection)")
-        gcode.append(f"G3 X{outer_x:.4f} Y{outer_y:.4f} I{-outer_radius:.4f} J0 "
+        gcode.append(f"G3 X{ox:.4f} Y{oy:.4f} I{cx - ox:.4f} J{cy - oy:.4f} "
                      f"F{self.feed_rate}  ; Outer wall spring pass")
 
-        # Return to entry radius for inward spiral
-        entry_on_ring_x = cx + entry_radius
-        entry_on_ring_y = cy
-        gcode.append(f"G1 X{entry_on_ring_x:.4f} Y{entry_on_ring_y:.4f} F{self.feed_rate}  ; Return to entry radius")
-
-        # Archimedean spiral inward from entry_radius to inner_radius
-        radius_delta_in = entry_radius - inner_radius
-        if radius_delta_in > 0.001:
-            spiral_constant = stepover / (2 * math.pi)
-            total_angle = radius_delta_in / spiral_constant if spiral_constant > 0 else 0
-            angle_increment = math.radians(10)
-            num_points = int(math.ceil(total_angle / angle_increment))
-
-            gcode.append(f"(Spiral inward: {num_points} points from r={entry_radius:.4f} to r={inner_radius:.4f})")
-            for i in range(num_points):
-                current_angle = i * angle_increment
-                current_radius = entry_radius - spiral_constant * current_angle
-                current_radius = max(current_radius, inner_radius)
-                x = cx + current_radius * math.cos(current_angle)
-                y = cy + current_radius * math.sin(current_angle)
-                gcode.append(f"G1 X{x:.4f} Y{y:.4f} F{self.feed_rate}")
-
-        # Cleanup circle at inner radius - G2/CW for climb milling on outer island wall
-        inner_x = cx + inner_radius
-        inner_y = cy
-        gcode.append(f"G1 X{inner_x:.4f} Y{inner_y:.4f} F{self.feed_rate}  ; Move to inner radius")
-        gcode.append(f"G2 X{inner_x:.4f} Y{inner_y:.4f} I{-inner_radius:.4f} J0 "
+        # Radial move (constant angle) back in to entry radius, then spiral inward
+        # to the inner wall and a full cleanup circle from the current position.
+        ex, ey = point_on(entry_radius, angle)
+        gcode.append(f"G1 X{ex:.4f} Y{ey:.4f} F{self.feed_rate}  ; Radial to entry radius")
+        angle, radius = spiral_to(entry_radius, angle, inner_radius)
+        if abs(radius - inner_radius) > 1e-4:
+            ix, iy = point_on(inner_radius, angle)  # radial nudge, constant angle
+            gcode.append(f"G1 X{ix:.4f} Y{iy:.4f} F{self.feed_rate}  ; Radial to inner radius")
+        ix, iy = point_on(inner_radius, angle)
+        gcode.append(f"G2 X{ix:.4f} Y{iy:.4f} I{cx - ix:.4f} J{cy - iy:.4f} "
                      f"F{self.feed_rate}  ; Inner cleanup circle, CW climb milling")
-
-        # Spring pass on inner wall: re-trace at zero stepover to relieve tool deflection.
         gcode.append(f"(Spring pass - compensate for tool deflection)")
-        gcode.append(f"G2 X{inner_x:.4f} Y{inner_y:.4f} I{-inner_radius:.4f} J0 "
+        gcode.append(f"G2 X{ix:.4f} Y{iy:.4f} I{cx - ix:.4f} J{cy - iy:.4f} "
                      f"F{self.feed_rate}  ; Inner wall spring pass")
 
-        # Retract
         gcode.append(f"G0 Z{self.retract_height:.4f}  ; Retract")
 
         return gcode

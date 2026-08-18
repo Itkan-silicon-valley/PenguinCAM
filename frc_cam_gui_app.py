@@ -57,7 +57,7 @@ except ImportError:
 
 # Import Onshape integration (optional - will work without it)
 try:
-    from onshape_integration import get_onshape_client, session_manager
+    from onshape_integration import get_onshape_client, session_manager, build_multilayer_dxf
     ONSHAPE_AVAILABLE = True
 except ImportError:
     ONSHAPE_AVAILABLE = False
@@ -1578,66 +1578,6 @@ def onshape_authed():
     which cross-origin OAuth navigation often severs."""
     authed = bool(ONSHAPE_AVAILABLE and session_manager.get_client(get_current_user_id()))
     return jsonify({'authenticated': authed})
-
-
-def build_multilayer_dxf(client, did, wid, eid, face_id, body_id, face_normal,
-                         cached_faces_data=None, version_id=None, microversion_id=None):
-    """Build a single multi-layer (2.5D) DXF for the selected reference face.
-
-    Resolves the reference face's normal (if not already known) and origin, then
-    asks the Onshape client to bin all parallel faces by depth and merge them into
-    one depth-layered DXF. Returns (dxf_bytes, detected_thickness).
-
-    This is the sole home of the 2.5D DXF construction. The G-code path derives
-    the actual stock thickness from the DXF layers themselves (see the
-    postprocessor's load_dxf), so detected_thickness here is informational.
-    Raises RuntimeError with a user-facing message on failure.
-    """
-    faces_data = cached_faces_data or client.list_faces(
-        did, wid, eid, version_id=version_id, microversion_id=microversion_id)
-    if not faces_data:
-        raise RuntimeError("Failed to retrieve face data from Onshape. Your "
-                           "authentication token may have expired. Please "
-                           "re-authenticate with Onshape.")
-
-    # Locate the selected reference face (for the normal fallback + origin).
-    reference_face = None
-    for body in faces_data.get('bodies', []):
-        if body_id and body.get('id') != body_id:
-            continue
-        for face in body.get('faces', []):
-            if face.get('id') == face_id:
-                reference_face = face
-                break
-        if reference_face:
-            break
-
-    if reference_face is None:
-        raise RuntimeError("Could not find the selected face for multi-layer "
-                           "export. Please select a flat top face.")
-
-    surface = reference_face.get('surface', {}) or {}
-    if not face_normal:
-        face_normal = surface.get('normal', {'x': 0, 'y': 0, 'z': 1})
-    reference_origin = surface.get('origin', {'x': 0, 'y': 0, 'z': 0})
-
-    result = client.export_multilayer_dxf(
-        did, wid, eid,
-        face_id, body_id, face_normal, reference_origin,
-        body_id=body_id, cached_faces_data=faces_data,
-        version_id=version_id, microversion_id=microversion_id
-    )
-    # Backwards-compatible unpack if the client doesn't return thickness.
-    if isinstance(result, tuple):
-        dxf_bytes, detected_thickness = result
-    else:
-        dxf_bytes, detected_thickness = result, None
-
-    if not dxf_bytes:
-        raise RuntimeError("Onshape returned no multi-layer DXF for that face. "
-                           "Make sure the selected face is a flat top face of a "
-                           "2.5D part.")
-    return dxf_bytes, detected_thickness
 
 
 @app.route('/onshape/export-face', methods=['POST'])

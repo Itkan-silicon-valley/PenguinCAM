@@ -1668,46 +1668,50 @@ class TestPerimeterWithArcs(unittest.TestCase):
         self.assertTrue(result.success, "G-code generation should succeed")
 
     def test_circle_bounds_with_polyline_perimeter(self):
-        """Test that circle radius is properly included in bounds calculation."""
+        """Test that a hole circle's radius is included in the bounds calculation.
+
+        The polyline rectangle is the (largest) perimeter; the circle is a hole
+        whose radius pokes past the rectangle's left edge, so it must extend the
+        transformed bounds. (This used to use a 6" hole inside a 2" rectangle -
+        a hole larger than the part, which is physically impossible; the perimeter
+        picker now correctly treats the largest boundary of EITHER kind as the
+        perimeter, so the geometry here is realistic: rectangle >> hole.)
+        """
         pp = FRCPostProcessor(0.25, 0.157)
         pp.apply_material_preset('plywood')  # Sets required material parameters
 
-        # Small rectangle with large hole offset to one side
-        # This tests that hole radius extends bounds correctly
+        # 6x6 rectangular perimeter with a hole on the left edge that pokes out to
+        # x=-1, so the circle radius extends the bounds leftward.
         pp.circles = [
-            {'center': (1.0, 1.0), 'radius': 3.0, 'diameter': 6.0},  # Large hole extends beyond polyline
+            {'center': (0.0, 3.0), 'radius': 1.0, 'diameter': 2.0},
         ]
         pp.polylines = [
-            [(0, 0), (2, 0), (2, 2), (0, 2)]  # Small 2x2 rectangle
+            [(0, 0), (6, 0), (6, 6), (0, 6)]  # 6x6 rectangle (clearly the perimeter)
         ]
         pp.lines = []
         pp.arcs = []
         pp.splines = []
 
-        # Transform first (matches backend order)
-        # The hole extends from (1-3, 1-3) to (1+3, 1+3) = (-2, -2) to (4, 4)
-        # Combined with rectangle (0,0) to (2,2), overall bounds are (-2, -2) to (4, 4)
-        # After bottom-left translation by (+2, +2), bounds become (0, 0) to (6, 6)
+        # Bounds including circle radius: x=[-1, 6], y=[0, 6].
+        # bottom-left translation shifts by (+1, 0).
         pp.transform_coordinates('bottom-left', 0)
 
         pp.identify_perimeter_and_pockets()
         pp.classify_holes()
 
-        # After translation, check that geometry is properly positioned
+        # The circle stays a hole (rectangle is the perimeter), translated by (+1,0).
         hole = pp.holes[0]
         cx, cy = hole['center']
-
-        # Hole center should be translated from (1,1) by (+2,+2) = (3,3)
-        self.assertAlmostEqual(cx, 3.0, places=1, msg="Hole X center after translation")
+        self.assertAlmostEqual(cx, 1.0, places=1, msg="Hole X center after translation")
         self.assertAlmostEqual(cy, 3.0, places=1, msg="Hole Y center after translation")
 
-        # Perimeter min should be at X=2, Y=2 (rectangle was 0-2, offset by +2)
+        # Perimeter is the rectangle: min corner (0,0) shifted by (+1,0) -> (1,0).
         perimeter_xs = [p[0] for p in pp.perimeter]
         perimeter_ys = [p[1] for p in pp.perimeter]
-        self.assertAlmostEqual(min(perimeter_xs), 2.0, places=1,
-                              msg="Perimeter should start at X=2 (rectangle was 0-2, offset by +2)")
-        self.assertAlmostEqual(min(perimeter_ys), 2.0, places=1,
-                              msg="Perimeter should start at Y=2 (rectangle was 0-2, offset by +2)")
+        self.assertAlmostEqual(min(perimeter_xs), 1.0, places=1,
+                              msg="Perimeter min X (rectangle 0..6 shifted by +1)")
+        self.assertAlmostEqual(min(perimeter_ys), 0.0, places=1,
+                              msg="Perimeter min Y (rectangle 0..6, no Y shift)")
 
 
 class TestMultilayerGeometrySubtraction(unittest.TestCase):
