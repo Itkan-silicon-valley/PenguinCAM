@@ -104,6 +104,49 @@ html, body {
 
 .step h2 { margin: 0 0 12px; font-size: 18px; }
 
+/* ---- Full-page grid mode (upload only): all four steps at once, 2x2 ----
+   Setup upper-left, Parts lower-left, Layout upper-right, Preview lower-right.
+   The current step is highlighted; transitions still fire per-step side effects
+   (JS gotoStep), so a quadrant stays incomplete until you navigate to it. The
+   narrow Onshape panel never gets the .grid class, so it keeps the single-step
+   wizard. The running decisions summary is redundant here (all steps visible). */
+#wizard.grid #wiz-summary { display: none; }
+#wizard.grid #wiz-body {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  grid-template-rows: 1fr 1fr;
+  gap: 12px;
+  overflow: hidden;          /* each quadrant scrolls itself */
+  min-height: 0;
+}
+#wizard.grid .step {
+  margin: 0;
+  min-height: 0;
+  overflow: auto;            /* quadrant content scrolls within its cell */
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel);
+}
+#wizard.grid .step[data-step="setup"]   { grid-column: 1; grid-row: 1; }
+#wizard.grid .step[data-step="parts"]   { grid-column: 1; grid-row: 2; }
+#wizard.grid .step[data-step="layout"]  { grid-column: 2; grid-row: 1; }
+#wizard.grid .step[data-step="preview"] { grid-column: 2; grid-row: 2; }
+#wizard.grid .step.current {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent) inset;
+}
+/* Narrow full-page widths: fall back to a single column, all steps still shown. */
+@media (max-width: 900px) {
+  #wizard.grid #wiz-body {
+    grid-template-columns: 1fr;
+    grid-template-rows: none;
+    grid-auto-rows: minmax(220px, auto);
+    overflow-y: auto;
+  }
+  #wizard.grid .step[data-step] { grid-column: 1; grid-row: auto; }
+}
+
 .field { display: block; margin: 0 0 14px; }
 .field > span, .field > legend { display: block; color: var(--muted); margin-bottom: 4px; font-size: 12px; }
 .field.inline { display: flex; align-items: center; gap: 8px; }

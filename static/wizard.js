@@ -350,7 +350,17 @@
   function gotoStep(name) {
     state.step = name;
     renderStepbar();
-    $all('.step').forEach(function (s) { s.hidden = s.getAttribute('data-step') !== name; });
+    // Full-page grid mode shows all four steps at once (2x2) and just HIGHLIGHTS
+    // the current one; the narrow single-step mode (Onshape panel) hides the rest.
+    // Either way the per-step side effects below still fire on transition, so a
+    // quadrant stays "incomplete until you get there" (e.g. Preview generates only
+    // when you actually reach it).
+    var gridMode = $('#wizard').classList.contains('grid');
+    $all('.step').forEach(function (s) {
+      var isCurrent = s.getAttribute('data-step') === name;
+      if (gridMode) { s.hidden = false; s.classList.toggle('current', isCurrent); }
+      else { s.hidden = !isCurrent; s.classList.remove('current'); }
+    });
     var order = steps();
     $all('#stepbar li').forEach(function (li) {
       var s = li.getAttribute('data-step');
@@ -1349,6 +1359,9 @@
       var d = e.data;
       if (d && typeof d === 'object' && (d.theme === 'light' || d.theme === 'dark')) applyTheme(d.theme);
     });
+    // Full-page (upload) mode shows all steps at once in a 2x2 grid; the narrow
+    // Onshape panel iframe keeps the one-step-at-a-time wizard.
+    if (state.source === 'upload') $('#wizard').classList.add('grid');
     gotoStep('setup');
     dbg('init', { source: state.source, authed: CFG.authenticated, theme: CFG.theme });
     if (state.source === 'onshape' && !CFG.authenticated) {
