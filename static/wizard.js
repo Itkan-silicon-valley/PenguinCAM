@@ -1361,7 +1361,13 @@
     });
     // Full-page (upload) mode shows all steps at once in a 2x2 grid; the narrow
     // Onshape panel iframe keeps the one-step-at-a-time wizard.
-    if (state.source === 'upload') $('#wizard').classList.add('grid');
+    if (state.source === 'upload') {
+      $('#wizard').classList.add('grid');
+      // 2.5D derives thickness/layers from Onshape's geometry APIs (build_multilayer_dxf)
+      // and can't be produced from a plain DXF upload — offer only 2D and Tubing here.
+      var opt25 = $('#opt-mode-25d'); if (opt25) opt25.hidden = true;
+      var r25 = $('input[name="mode"][value="2.5d"]'); if (r25) r25.disabled = true;
+    }
     gotoStep('setup');
     dbg('init', { source: state.source, authed: CFG.authenticated, theme: CFG.theme });
     if (state.source === 'onshape' && !CFG.authenticated) {
