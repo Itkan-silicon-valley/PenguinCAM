@@ -166,6 +166,9 @@ input.invalid { border-color: var(--danger); }
 
 fieldset.field { border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; }
 .radio { display: block; color: var(--ink); margin: 4px 0; font-size: 13px; }
+/* The explicit display above beats the UA [hidden] rule, so hiding a .radio via
+   the hidden attribute needs this (e.g. 2.5D mode is hidden in upload mode). */
+.radio[hidden] { display: none; }
 
 .hint { color: var(--muted); font-size: 12px; }
 
