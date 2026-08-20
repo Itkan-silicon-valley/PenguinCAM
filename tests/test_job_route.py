@@ -43,6 +43,10 @@ class TestProcessJobRoute(unittest.TestCase):
     def setUp(self):
         app.config['TESTING'] = True
         self.client = app.test_client()
+        # Compute endpoints now require a verified session (Turnstile bot-gate for the
+        # upload flow). Tests run with Turnstile unconfigured; mark the session verified.
+        with self.client.session_transaction() as sess:
+            sess['app_verified'] = True
 
     def _post_job(self, parts, stock=None, files=None):
         stock = stock or {'width': 24, 'height': 24}
@@ -119,6 +123,8 @@ class TestPartOutlineRoute(unittest.TestCase):
     def setUp(self):
         app.config['TESTING'] = True
         self.client = app.test_client()
+        with self.client.session_transaction() as sess:
+            sess['app_verified'] = True
 
     def _square_with_hole_bytes(self, size, hole_r):
         doc = ezdxf.new('R2010')
@@ -154,6 +160,39 @@ class TestPartOutlineRoute(unittest.TestCase):
         resp = self.client.post('/part-outline',
                                 data={'file': (io.BytesIO(b'nope'), 'x.txt')},
                                 content_type='multipart/form-data')
+        self.assertEqual(resp.status_code, 400)
+
+
+class TestSessionGate(unittest.TestCase):
+    """The compute endpoints require a verified (or Onshape) session — the upload
+    flow's Turnstile bot-gate. These run WITHOUT a pre-set session."""
+
+    def setUp(self):
+        app.config['TESTING'] = True
+        self.client = app.test_client()
+
+    def test_process_job_requires_session(self):
+        resp = self.client.post('/process-job', data={}, content_type='multipart/form-data')
+        self.assertEqual(resp.status_code, 401)
+        self.assertTrue(resp.get_json().get('need_verification'))
+
+    def test_part_outline_requires_session(self):
+        resp = self.client.post('/part-outline', data={}, content_type='multipart/form-data')
+        self.assertEqual(resp.status_code, 401)
+
+    def test_process_requires_session(self):
+        resp = self.client.post('/process', data={}, content_type='multipart/form-data')
+        self.assertEqual(resp.status_code, 401)
+
+    def test_verify_then_allowed(self):
+        # Turnstile is unconfigured in tests, so /session/verify bypasses the captcha
+        # check and mints the anonymous session.
+        v = self.client.post('/session/verify', json={'token': None})
+        self.assertEqual(v.status_code, 200)
+        self.assertTrue(v.get_json()['ok'])
+        # Gate now passes: /process-job reaches its own validation (400 missing job),
+        # not the 401 session gate.
+        resp = self.client.post('/process-job', data={}, content_type='multipart/form-data')
         self.assertEqual(resp.status_code, 400)
 
 

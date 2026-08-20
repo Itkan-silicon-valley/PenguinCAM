@@ -1001,6 +1001,34 @@
     $('#gen-status').textContent = '';
   }
 
+  // Establish the anonymous upload session that the compute endpoints require.
+  // With a Turnstile site key we wait for the widget's token (the token bridge in
+  // the template buffers it so ordering with the async widget doesn't matter);
+  // without a key (local dev / an unkeyed host) we mint the session directly — the
+  // backend bypasses verification when Turnstile isn't configured.
+  function establishUploadSession() {
+    if (CFG.turnstileSiteKey) {
+      window.__ptOnToken = verifyUploadSession;
+      if (window.__ptToken) verifyUploadSession(window.__ptToken);  // token already arrived
+    } else {
+      verifyUploadSession(null);
+    }
+  }
+
+  function verifyUploadSession(token) {
+    fetch('/session/verify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: token })
+    }).then(function (r) { return r.json(); })
+      .then(function (j) {
+        state.verified = !!(j && j.ok);
+        if (state.verified) { var s = $('#turnstile-slot'); if (s) s.hidden = true; }
+        dbg('session', { verified: state.verified });
+      })
+      .catch(function (e) { dbg('session:err', String(e)); });
+  }
+
   function generate() {
     $('#preview-errors').textContent = '';
     $('#gen-status').textContent = 'Generating…';
@@ -1367,6 +1395,7 @@
       // and can't be produced from a plain DXF upload — offer only 2D and Tubing here.
       var opt25 = $('#opt-mode-25d'); if (opt25) opt25.hidden = true;
       var r25 = $('input[name="mode"][value="2.5d"]'); if (r25) r25.disabled = true;
+      establishUploadSession();
     }
     gotoStep('setup');
     dbg('init', { source: state.source, authed: CFG.authenticated, theme: CFG.theme });

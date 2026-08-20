@@ -9,6 +9,7 @@ from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from werkzeug.middleware.proxy_fix import ProxyFix
 import os
+import requests
 import subprocess
 import tempfile
 import shutil
@@ -263,6 +264,54 @@ limiter = Limiter(
 )
 log("✅ Rate limiting enabled (200 requests/hour default)")
 
+# ============================================================================
+# Cloudflare Turnstile — bot-gate for the anonymous DXF-upload flow
+# ============================================================================
+# The full-page upload flow has NO Onshape OAuth. Instead the frontend solves a
+# Turnstile challenge and POSTs the token to /session/verify, which we verify
+# server-side and use to mint an anonymous session (`session['app_verified']`)
+# that the compute endpoints require. The Onshape-panel flow is unaffected — its
+# OAuth session is its gate. When the secret key is unset (local dev / tests /
+# an unkeyed run), verification is BYPASSED with a loud warning so nothing
+# breaks; set both keys on any public host.
+TURNSTILE_SITE_KEY = os.environ.get('TURNSTILE_SITE_KEY', '')
+TURNSTILE_SECRET_KEY = os.environ.get('TURNSTILE_SECRET_KEY', '')
+TURNSTILE_VERIFY_URL = 'https://challenges.cloudflare.com/turnstile/v0/siteverify'
+if TURNSTILE_SITE_KEY and TURNSTILE_SECRET_KEY:
+    log("🛡️  Turnstile bot-gate ENABLED for the upload flow")
+else:
+    log("⚠️  Turnstile keys not set — upload-flow bot-gate DISABLED "
+        "(set TURNSTILE_SITE_KEY / TURNSTILE_SECRET_KEY on any public host)")
+
+
+def _client_ip():
+    """Real client IP. Behind Cloudflare the true client is in CF-Connecting-IP;
+    fall back to the proxied remote address otherwise."""
+    return request.headers.get('CF-Connecting-IP') or get_remote_address()
+
+
+def _turnstile_enabled():
+    return bool(TURNSTILE_SITE_KEY and TURNSTILE_SECRET_KEY)
+
+
+def _verify_turnstile_token(token):
+    """Verify a Turnstile token with Cloudflare. Returns True on success — or when
+    Turnstile isn't configured (dev/test bypass). Never raises."""
+    if not _turnstile_enabled():
+        return True  # unconfigured: dev/test bypass (warned at startup)
+    if not token:
+        return False
+    try:
+        resp = requests.post(TURNSTILE_VERIFY_URL, data={
+            'secret': TURNSTILE_SECRET_KEY,
+            'response': token,
+            'remoteip': _client_ip(),
+        }, timeout=10)
+        return bool(resp.ok and resp.json().get('success'))
+    except Exception as e:
+        log(f"Turnstile verification error: {e}")
+        return False
+
 # Directory for temporary files
 # Serverless platforms (Vercel, Lambda) have /tmp as only writable location
 # Traditional servers get isolated temp directory
@@ -377,14 +426,20 @@ def _maybe_refresh_team_config():
         session['team_config_fetched_at'] = time.time()
 
 
-def _app_template_context():
+def _app_template_context(force_defaults=False):
     """Build the shared template context (machines, materials, tool, bed size) used by
-    both the legacy single-part page and the multi-part wizard."""
-    _maybe_refresh_team_config()  # opportunistic TTL refresh before we read the cached copy
-    user_name = session.get('user_name')
-    team_name = session.get('team_name')
+    both the legacy single-part page and the multi-part wizard.
 
-    team_config_data = session.get('team_config_data', {})
+    force_defaults=True (the anonymous upload flow) skips the Onshape config
+    refresh entirely and uses the built-in Team 6238 defaults, ignoring any config
+    cached in the session from a prior Onshape login in the same browser. This
+    guarantees the upload flow makes NO Onshape calls."""
+    if not force_defaults:
+        _maybe_refresh_team_config()  # opportunistic TTL refresh before we read the cached copy
+    user_name = None if force_defaults else session.get('user_name')
+    team_name = None if force_defaults else session.get('team_name')
+
+    team_config_data = {} if force_defaults else session.get('team_config_data', {})
     team_config = TeamConfig(team_config_data)
 
     machines = team_config.get_available_machines()
@@ -436,7 +491,7 @@ def _app_template_context():
         'default_tool_diameter_text': default_tool_diameter_text,
         'machine_x_max': machine_x_max,
         'machine_y_max': machine_y_max,
-        'using_default_config': session.get('using_default_config', False),
+        'using_default_config': True if force_defaults else session.get('using_default_config', False),
         'machines': machines,
         'machines_info': machines_info,
         'current_machine_id': current_machine_id,
@@ -456,6 +511,27 @@ def _require_onshape_auth():
             log("⛔ Access denied: No Onshape authentication, redirecting to /onshape/auth")
             return redirect('/onshape/auth')
     return None
+
+
+def _has_onshape_session():
+    """True when the current browser has an authenticated Onshape client (the
+    Onshape-panel flow). Its OAuth is its gate — unchanged by the upload flow."""
+    return bool(ONSHAPE_AVAILABLE and session_manager.get_client(get_current_user_id()))
+
+
+def _require_app_session():
+    """Gate for the shared compute endpoints (/process, /process-job, /part-outline).
+
+    Authorized when EITHER the browser has an Onshape session (Onshape-panel flow,
+    behavior unchanged) OR it has passed the Turnstile bot-gate for the anonymous
+    upload flow (`session['app_verified']`). Returns a (response, 401) tuple when
+    neither holds, else None. Note: when Turnstile is unconfigured the upload flow
+    marks itself verified on /session/verify, so this still passes in dev."""
+    if _has_onshape_session():
+        return None
+    if session.get('app_verified'):
+        return None
+    return jsonify({'error': 'Session verification required.', 'need_verification': True}), 401
 
 
 def _compute_dxf_outline(path):
@@ -540,33 +616,34 @@ def _compute_dxf_outline(path):
             'outline': outline, 'holes': holes, 'inner': inner}
 
 
+@app.route('/session/verify', methods=['POST'])
+@limiter.limit("30 per minute")
+def session_verify():
+    """Establish an anonymous upload session by verifying a Cloudflare Turnstile
+    token. Only the non-Onshape upload flow uses this. When Turnstile is
+    unconfigured (dev/test) verification passes and the session is still minted,
+    so the compute-endpoint gate keeps working locally."""
+    data = request.get_json(silent=True) or {}
+    token = data.get('token') or request.form.get('cf-turnstile-response')
+    if _verify_turnstile_token(token):
+        session['app_verified'] = True
+        return jsonify({'ok': True})
+    return jsonify({'ok': False, 'error': 'Verification failed.'}), 403
+
+
 def _serve_wizard_upload():
     """Render the multi-part wizard full-screen in DXF-upload (non-Onshape) mode.
 
-    Shared by the root route and the `/app` alias. Requires Onshape OAuth as a
-    bot-gate even for upload users (see `_require_onshape_auth`); the wizard's
-    upload source then forces DXF imports rather than relying on Onshape face
-    selection. Returns the OAuth redirect response when unauthenticated.
+    Shared by the root route and the `/app` alias. NO Onshape OAuth: the anonymous
+    upload flow is bot-gated by Cloudflare Turnstile (see /session/verify) and
+    always uses DEFAULT team config — it never calls an Onshape API (no
+    permissions in this scenario). The Onshape-panel flow is served separately by
+    `_serve_onshape_panel` and is unchanged.
     """
-    # ========================================================================
-    # AUTHENTICATION GATE: Require Onshape OAuth to access app
-    # ========================================================================
-    # This restricts access to authenticated Onshape users only, providing:
-    # - Natural security gate (no anonymous internet users)
-    # - Known user/team identity for configs and tracking
-    # - Better protection from abuse and cost control
-    #
-    # TO MAKE APP WIDE OPEN (allow anonymous browser access):
-    # Simply comment out or remove the code block below (lines until "End gate")
-    # ========================================================================
-    gate = _require_onshape_auth()
-    if gate:
-        return gate
-    # ========================================================================
-    # End authentication gate
-    # ========================================================================
     return render_template('wizard.html', source='upload', authenticated=True,
-                           onshape_ctx={}, theme='dark', **_app_template_context())
+                           onshape_ctx={}, theme='dark',
+                           turnstile_sitekey=TURNSTILE_SITE_KEY,
+                           **_app_template_context(force_defaults=True))
 
 
 @app.route('/')
@@ -698,6 +775,9 @@ def _detect_tube_dims(dxf_path, rotation):
 @limiter.limit("10 per minute")  # Strict limit - CPU intensive operation
 def process_file():
     """Process uploaded DXF file and generate G-code"""
+    gate = _require_app_session()
+    if gate:
+        return gate
     try:
         # Get uploaded file
         if 'file' not in request.files:
@@ -958,6 +1038,9 @@ def process_job():
     Response: {success, filename(token), gcode, cycle_time, stock, parts:[...]}
               or {success:false, part_errors:[{part_index, name, error}]}.
     """
+    gate = _require_app_session()
+    if gate:
+        return gate
     job_dir = None
     try:
         job_raw = request.form.get('job')
@@ -1130,6 +1213,9 @@ def part_outline():
     canvas and parts-list thumbnail. Stateless: the browser keeps the DXF bytes and
     re-submits them at /process-job time (serverless-safe). Coordinates are normalized
     so the part's bounding-box minimum sits at (0,0)."""
+    gate = _require_app_session()
+    if gate:
+        return gate
     path = None
     try:
         if 'file' not in request.files:

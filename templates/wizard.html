@@ -27,6 +27,14 @@
                 <p class="config-status config-status-default">Using default configuration</p>
                 {% endif %}
             </div>
+            {% if source == 'upload' and turnstile_sitekey %}
+            <!-- Bot-gate for the anonymous upload flow: solving this mints the session
+                 the compute endpoints require. Managed widget usually passes silently. -->
+            <div id="turnstile-slot" class="turnstile-slot">
+                <div class="cf-turnstile" data-sitekey="{{ turnstile_sitekey }}"
+                     data-callback="onTurnstileToken" data-theme="auto" data-size="flexible"></div>
+            </div>
+            {% endif %}
             <ol id="stepbar" aria-label="Steps">
                 <li data-step="setup" data-num="1" class="active" role="button" tabindex="0">Setup</li>
                 <li data-step="parts" data-num="2" role="button" tabindex="0">Parts</li>
@@ -219,8 +227,20 @@
         defaultTool: {{ default_tool_diameter|tojson }},
         defaultToolText: {{ (default_tool_diameter_text if default_tool_diameter_text is defined else '4mm')|tojson }},
         driveEnabled: {{ (drive_enabled if drive_enabled is defined else False)|tojson }},
+        turnstileSiteKey: {{ (turnstile_sitekey if turnstile_sitekey is defined else '')|tojson }},
+      };
+      // Turnstile bot-gate token bridge (upload flow). Cloudflare's async widget may
+      // fire its callback before OR after wizard.js loads, so buffer the token and
+      // let wizard.js register a handler that also drains any token already received.
+      window.__ptToken = null;
+      window.onTurnstileToken = function (t) {
+        window.__ptToken = t;
+        if (window.__ptOnToken) window.__ptOnToken(t);
       };
     </script>
+    {% if source == 'upload' and turnstile_sitekey %}
+    <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
+    {% endif %}
     <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
     <script src="{{ url_for('static', filename='gcode_viewer.js') }}"></script>
