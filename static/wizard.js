@@ -1339,6 +1339,10 @@
     if (!btn) return;
     var watching = false;
     function setStatus(msg) { $('#connect-status').textContent = msg; }
+    // Most common cause of a failed connect in the iframe/OAuth-popup flow: a pop-up
+    // blocker stops the popup, or tracking/cookie prevention blocks the iframe from
+    // seeing the session after sign-in. Append this to the failure messages.
+    var BLOCKER_HINT = ' If it keeps failing, allow pop-ups and disable ad/tracking blockers for onshape.com and popcornpenguins.com, then retry.';
 
     // Confirm the iframe's own session is authenticated, then reload once to re-render
     // with the now-authenticated server context (config banner, material/tool options).
@@ -1348,15 +1352,15 @@
         .then(function (j) {
           dbg('authed-check', j);
           if (j && j.authenticated) location.reload();
-          else { watching = false; setStatus('Sign-in didn’t complete. Click Connect to try again.'); }
+          else { watching = false; setStatus('Sign-in did not complete.' + BLOCKER_HINT); }
         })
-        .catch(function (e) { watching = false; dbg('authed-check:err', String(e)); setStatus('Could not verify sign-in — try again.'); });
+        .catch(function (e) { watching = false; dbg('authed-check:err', String(e)); setStatus('Could not verify sign-in.' + BLOCKER_HINT); });
     }
 
     btn.addEventListener('click', function () {
       if (watching) return;
       var popup = window.open('/onshape/auth?popup=1', 'penguincam_oauth', 'width=520,height=720');
-      if (!popup) { setStatus('Popup blocked — allow popups for this site, then click Connect.'); return; }
+      if (!popup) { setStatus('Pop-up blocked — allow pop-ups for onshape.com and popcornpenguins.com, then click Connect.'); return; }
       watching = true;
       setStatus('Complete sign-in in the popup window…');
       // Watch the popup close locally (no server polling); cross-origin OAuth navigation
