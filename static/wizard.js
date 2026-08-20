@@ -1001,19 +1001,34 @@
     $('#gen-status').textContent = '';
   }
 
-  // Establish the anonymous upload session that the compute endpoints require.
-  // With a Turnstile site key we wait for the widget's token (the token bridge in
-  // the template buffers it so ordering with the async widget doesn't matter);
-  // without a key (local dev / an unkeyed host) we mint the session directly — the
-  // backend bypasses verification when Turnstile isn't configured.
+  // Establish the anonymous upload session that the compute endpoints require. A
+  // blocking #verify-overlay (rendered visible in the template) covers the wizard
+  // until this succeeds, so a failed/incomplete check is obvious rather than a
+  // mysterious 401 later. With a Turnstile site key we wait for the widget's token
+  // (the template's token bridge buffers it, so ordering with the async widget
+  // doesn't matter); without a key (local dev / unkeyed host) there's no overlay
+  // and we mint the session directly — the backend bypasses verification then.
   function establishUploadSession() {
-    if (CFG.turnstileSiteKey) {
-      window.__ptOnToken = verifyUploadSession;
-      if (window.__ptToken) verifyUploadSession(window.__ptToken);  // token already arrived
-    } else {
+    if (!CFG.turnstileSiteKey) {
       verifyUploadSession(null);
+      return;
     }
+    window.__ptOnToken = verifyUploadSession;                 // token bridge
+    // Error/expiry fire only after the widget renders (well after this script
+    // loads), so plain globals are safe — no buffering needed.
+    window.onTurnstileError = function () {
+      setVerifyStatus('The check could not load. Disable ad/tracking blockers for this site, then reload.');
+    };
+    window.onTurnstileExpired = function () {
+      setVerifyStatus('The check expired — completing it again…');
+      resetTurnstile();
+    };
+    if (window.__ptToken) verifyUploadSession(window.__ptToken);  // token already arrived
   }
+
+  function setVerifyStatus(msg) { var s = $('#verify-status'); if (s) s.textContent = msg; }
+
+  function resetTurnstile() { try { if (window.turnstile) window.turnstile.reset(); } catch (e) {} }
 
   function verifyUploadSession(token) {
     fetch('/session/verify', {
@@ -1023,10 +1038,19 @@
     }).then(function (r) { return r.json(); })
       .then(function (j) {
         state.verified = !!(j && j.ok);
-        if (state.verified) { var s = $('#turnstile-slot'); if (s) s.hidden = true; }
         dbg('session', { verified: state.verified });
+        if (state.verified) {
+          var o = $('#verify-overlay'); if (o) o.hidden = true;   // unblock the wizard
+        } else {
+          setVerifyStatus('Verification failed — please try again.');
+          resetTurnstile();
+        }
       })
-      .catch(function (e) { dbg('session:err', String(e)); });
+      .catch(function (e) {
+        dbg('session:err', String(e));
+        setVerifyStatus('Could not reach the server — please retry.');
+        resetTurnstile();
+      });
   }
 
   function generate() {

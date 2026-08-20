@@ -27,14 +27,6 @@
                 <p class="config-status config-status-default">Using default configuration</p>
                 {% endif %}
             </div>
-            {% if source == 'upload' and turnstile_sitekey %}
-            <!-- Bot-gate for the anonymous upload flow: solving this mints the session
-                 the compute endpoints require. Managed widget usually passes silently. -->
-            <div id="turnstile-slot" class="turnstile-slot">
-                <div class="cf-turnstile" data-sitekey="{{ turnstile_sitekey }}"
-                     data-callback="onTurnstileToken" data-theme="auto" data-size="flexible"></div>
-            </div>
-            {% endif %}
             <ol id="stepbar" aria-label="Steps">
                 <li data-step="setup" data-num="1" class="active" role="button" tabindex="0">Setup</li>
                 <li data-step="parts" data-num="2" role="button" tabindex="0">Parts</li>
@@ -200,6 +192,24 @@
             </div>
         </footer>
     </div>
+
+    {% if source == 'upload' and turnstile_sitekey %}
+    <!-- Blocking bot-gate for the anonymous upload flow. Rendered VISIBLE (no hidden
+         attribute) so it blocks the wizard from first paint; JS hides it once the
+         Turnstile check verifies and the session is minted. Only present when
+         Turnstile is configured (otherwise the upload flow is open, e.g. local dev). -->
+    <div id="verify-overlay">
+        <div class="connect-card">
+            <h2>Quick check</h2>
+            <p>Confirming you're human before we start.</p>
+            <div class="cf-turnstile" data-sitekey="{{ turnstile_sitekey }}"
+                 data-callback="onTurnstileToken" data-error-callback="onTurnstileError"
+                 data-expired-callback="onTurnstileExpired" data-theme="auto"></div>
+            <p class="hint" id="verify-status"></p>
+            <p class="hint">If this doesn't load, allow this site and disable ad/tracking blockers, then reload.</p>
+        </div>
+    </div>
+    {% endif %}
 
     <div id="connect-overlay" hidden>
         <div class="connect-card">
