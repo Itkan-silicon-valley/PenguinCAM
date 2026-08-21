@@ -25,8 +25,10 @@
         <h1>Team Configuration</h1>
 
         <p class="lead">
-            Customize PenguinCAM for your team's specific CNC machines by uploading a
-            <code>PenguinCAM-config.yaml</code> file to your Onshape documents.
+            Customize PenguinCAM for your team's specific CNC machines with a
+            <code>PenguinCAM-config.yaml</code> file. The same file works two ways: Onshape users
+            keep it in their Onshape documents, and everyone else hosts it at a URL and points
+            PenguinCAM at it. The format is identical &mdash; only how PenguinCAM finds it differs.
         </p>
 
         <div class="info-box">
@@ -37,7 +39,22 @@
             </div>
         </div>
 
-        <h2>Quick Setup</h2>
+        <h2>How PenguinCAM Finds Your Config</h2>
+        <p>
+            The config format is the same everywhere; only how PenguinCAM loads it depends on how
+            you use the app:
+        </p>
+        <ul>
+            <li><strong>In Onshape:</strong> keep <code>PenguinCAM-config.yaml</code> in your
+                Onshape documents. When you authenticate, PenguinCAM loads it automatically. (See
+                <a href="#onshape-setup">Onshape Setup</a>.)</li>
+            <li><strong>Direct upload (no Onshape):</strong> host the file at a public URL and point
+                PenguinCAM at it &mdash; either by pasting the URL into the Setup screen or by adding
+                a <code>?config=</code> parameter to the app link. (See
+                <a href="#url-setup">Hosting Your Config at a URL</a>.)</li>
+        </ul>
+
+        <h2 id="onshape-setup">Onshape Setup</h2>
 
         <div class="step-list">
             <div class="step">
@@ -81,6 +98,93 @@
                         Everyone who authenticates with PenguinCAM from your organization will load and use your custom settings.
                     </p>
                 </div>
+            </div>
+        </div>
+
+        <h2 id="url-setup">Hosting Your Config at a URL</h2>
+
+        <p>
+            If you don't use Onshape (you upload DXF files directly), host your
+            <code>PenguinCAM-config.yaml</code> somewhere your browser can fetch it, then point
+            PenguinCAM at that URL. Your whole team can then share a single link.
+        </p>
+
+        <div class="warning-box info-box">
+            <div class="info-icon">⚠️</div>
+            <div>
+                <strong>Host it on GitHub or a gist &mdash; not Google Drive or Dropbox.</strong>
+                Your browser fetches the file directly, so the host has to allow cross-origin
+                requests (CORS). GitHub's raw file URLs and gists do; Google Drive and Dropbox
+                share links do not, so those won't load. (This browser-side fetch is also why your
+                config URL never touches our server.)
+            </div>
+        </div>
+
+        <div class="step-list">
+            <div class="step">
+                <div class="step-number">1</div>
+                <div class="step-content">
+                    <h3>Host the File</h3>
+                    <p>
+                        Commit <code>PenguinCAM-config.yaml</code> to a public GitHub repository, or
+                        put it in a <a href="https://gist.github.com" target="_blank" rel="noopener">gist</a>
+                        if it's just the one file. Keeping it in Git also gives you edit history and
+                        an easy way to share updates with your team.
+                    </p>
+                </div>
+            </div>
+
+            <div class="step">
+                <div class="step-number">2</div>
+                <div class="step-content">
+                    <h3>Copy the Raw URL</h3>
+                    <p>
+                        Open the file on GitHub and click <strong>Raw</strong>, then copy the
+                        address. It looks like:
+                    </p>
+                    <pre><code>https://raw.githubusercontent.com/YOUR-TEAM/YOUR-REPO/main/PenguinCAM-config.yaml</code></pre>
+                    <p>
+                        The <code>raw.githubusercontent.com</code> host is the important part &mdash;
+                        a normal <code>github.com/.../blob/...</code> page URL is an HTML page, not
+                        the file itself, and won't load.
+                    </p>
+                </div>
+            </div>
+
+            <div class="step">
+                <div class="step-number">3</div>
+                <div class="step-content">
+                    <h3>Load It in PenguinCAM</h3>
+                    <p>
+                        On the Setup screen, paste the URL into the <strong>Team configuration</strong>
+                        field and click <strong>Load</strong>. PenguinCAM fetches and validates it,
+                        shows the team it parsed (e.g. <em>Loaded config for team 1234</em>), and
+                        remembers it in your browser for next time.
+                    </p>
+                </div>
+            </div>
+
+            <div class="step">
+                <div class="step-number">4</div>
+                <div class="step-content">
+                    <h3>Share the Link with Your Team</h3>
+                    <p>
+                        Once you load a URL, PenguinCAM adds it to the page address as a
+                        <code>?config=</code> parameter (properly encoded). Bookmark or share that
+                        address and anyone who opens it loads the same config automatically:
+                    </p>
+                    <pre><code>https://penguincam.popcornpenguins.com/?config=https://raw.githubusercontent.com/YOUR-TEAM/YOUR-REPO/main/PenguinCAM-config.yaml</code></pre>
+                </div>
+            </div>
+        </div>
+
+        <div class="info-box">
+            <div class="info-icon">ℹ️</div>
+            <div>
+                <strong>Editing later:</strong> PenguinCAM re-fetches the file from the URL each
+                visit, so you (or a teammate) can update the hosted config and everyone picks up the
+                change next time they open the app &mdash; nothing to re-enter. To go back to the
+                built-in defaults, click <strong>Use defaults</strong> on the Setup screen.
             </div>
         </div>
 
@@ -478,6 +582,13 @@ machines:
             Check the browser console (F12) after authenticating to see which config was loaded:
         </p>
         <pre><code>✅ Team config loaded: Your Team Name (#1234)</code></pre>
+        <p>
+            The same checks run whether the config comes from Onshape or a URL. Text values (names
+            and descriptions) are also sanitized to be CNC-safe &mdash; parentheses and non-ASCII
+            characters (curly quotes, arrows, the degree symbol, etc.) are removed, because they can
+            end up in G-code comments and break some controllers. If PenguinCAM adjusts anything, it
+            tells you what it changed; your machine settings themselves are unaffected.
+        </p>
 
         <h2>Troubleshooting</h2>
 
@@ -491,6 +602,21 @@ machines:
             <li>Verify the document is shared with the PenguinCAM app (use "Share with applications" tab in Onshape sharing dialog)</li>
             <li>Ensure you're authenticated with Onshape (click the login button)</li>
             <li>Verify the file is valid YAML (use a YAML validator online)</li>
+        </ul>
+
+        <h3>Config URL won't load</h3>
+        <p>
+            If pasting a URL (or opening a <code>?config=</code> link) shows a fetch or CORS error:
+        </p>
+        <ul>
+            <li>Make sure you're using a <strong>raw</strong> URL
+                (<code>raw.githubusercontent.com/...</code>), not a github.com page URL.</li>
+            <li><strong>Google Drive and Dropbox links won't work</strong> &mdash; they don't let
+                the browser fetch the file directly (CORS). Host it on GitHub or a gist instead.</li>
+            <li>Confirm the URL is public and opens the raw YAML directly when you paste it into a
+                browser tab.</li>
+            <li>A "rejected" message means the file loaded but failed validation &mdash; check that
+                it's valid YAML and that values are in range (the message says what's wrong).</li>
         </ul>
 
         <h3>Material shows warning</h3>
