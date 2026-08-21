@@ -145,7 +145,7 @@ machines:
 
       aluminum:
         name: "Aluminum"
-        description: "Aluminum - 18K RPM, 50 IPM cutting, 4° ramp"
+        description: "Aluminum - 18K RPM, 50 IPM cutting, 4 deg ramp"
 
         spindle_speed: 18000
         feed_rate: 50.0

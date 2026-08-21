@@ -152,7 +152,7 @@ html, body {
 .field.inline { display: flex; align-items: center; gap: 8px; }
 .field.inline > span { margin: 0; }
 
-input[type="number"], input[type="text"], select {
+input[type="number"], input[type="text"], input[type="url"], select {
   width: 100%;
   padding: 8px;
   background: var(--panel-2);
@@ -313,13 +313,19 @@ fieldset.field { border: 1px solid var(--line); border-radius: 6px; padding: 8px
 
 /* Team-config source (upload flow, Setup step). */
 .config-source .field-label { display: block; color: var(--muted); margin-bottom: 4px; font-size: 12px; }
-.config-source-row { display: flex; gap: 8px; align-items: stretch; }
+.config-source-row { display: flex; gap: 6px; align-items: stretch; }
 .config-source-row input { flex: 1 1 auto; min-width: 0; }
-.config-source-row .btn { flex: 0 0 auto; white-space: nowrap; }
+/* Understated, like the Onshape reload glyph: muted until hovered, not a call-to-action. */
+.config-source-row .btn { flex: 0 0 auto; white-space: nowrap; background: transparent; color: var(--muted); opacity: 0.7; transition: opacity 0.15s ease, color 0.15s ease; }
+.config-source-row .btn:hover { opacity: 1; color: var(--ink); border-color: var(--accent); }
+.config-source-row .btn.config-reset { border-color: transparent; }
 .config-source-status { margin: 6px 0 0; font-size: 12px; min-height: 1em; color: var(--muted); }
 .config-source-status.error { color: var(--danger); }
 .config-source-status.ok { color: var(--muted); }
 .config-source-status.warn { color: #d29922; }
+/* Loaded-config confirmation (team name/number) next to the field, for parse confidence. */
+.config-source-loaded { margin: 6px 0 0; font-size: 12px; color: var(--muted); }
+.config-source-loaded strong { color: var(--ink); font-weight: 600; }
 
 #viewer-container {
   position: relative;

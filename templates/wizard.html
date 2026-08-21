@@ -60,9 +60,10 @@
                     <div class="config-source-row">
                         <input type="url" id="f-config-url" inputmode="url" autocomplete="off"
                                spellcheck="false" placeholder="https://raw.githubusercontent.com/.../PenguinCAM-config.yaml">
-                        <button type="button" id="config-load-btn" class="btn">Load</button>
-                        <button type="button" id="config-reset-btn" class="btn" hidden>Use defaults</button>
+                        <button type="button" id="config-load-btn" class="btn small">Load</button>
+                        <button type="button" id="config-reset-btn" class="btn small config-reset" hidden>Use defaults</button>
                     </div>
+                    <p id="config-source-loaded" class="config-source-loaded" hidden></p>
                     <p id="config-source-status" class="config-source-status" role="status" aria-live="polite"></p>
                 </div>
                 {% endif %}
@@ -267,6 +268,8 @@
         // applied the ?config= URL (and skip a redundant fetch+reload -- see wizard.js).
         usingDefault: {{ (using_default_config if using_default_config is defined else True)|tojson }},
         configUrl: {{ (config_url if config_url is defined else None)|tojson }},
+        configTeamNumber: {{ (config_team_number if config_team_number is defined else None)|tojson }},
+        configTeamName: {{ (config_team_name if config_team_name is defined else None)|tojson }},
       };
       // Turnstile bot-gate token bridge (upload flow). Cloudflare's async widget may
       // fire its callback before OR after wizard.js loads, so buffer the token and

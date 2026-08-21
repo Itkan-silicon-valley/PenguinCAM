@@ -1197,17 +1197,31 @@
     });
     if (resetBtn) resetBtn.addEventListener('click', resetConfig);
 
-    // Show any sanitization warnings stashed before the last reload.
+    renderLoadedConfig();
+    // Surface any sanitization warnings stashed before the last reload.
     try {
       var w = sessionStorage.getItem('penguincam_config_warnings');
       if (w) {
         sessionStorage.removeItem('penguincam_config_warnings');
         var list = JSON.parse(w);
-        if (list && list.length) setConfigStatus('Configuration loaded. ' + list.join(' '), 'warn');
-      } else if (!CFG.usingDefault) {
-        setConfigStatus('Configuration loaded.', 'ok');
+        if (list && list.length) setConfigStatus(list.join(' '), 'warn');
       }
     } catch (e) {}
+  }
+
+  // Confidence signal (mirrors the Onshape header banner): once a config is applied, show
+  // the team it parsed to, right by the field, without cluttering the box.
+  function renderLoadedConfig() {
+    var el = $('#config-source-loaded');
+    if (!el) return;
+    if (CFG.usingDefault || !CFG.configTeamNumber) { el.hidden = true; el.textContent = ''; return; }
+    el.hidden = false;
+    el.textContent = '';
+    el.appendChild(document.createTextNode('Loaded config for team '));
+    var strong = document.createElement('strong');
+    strong.textContent = String(CFG.configTeamNumber);   // textContent: server-sanitized, but stay safe
+    el.appendChild(strong);
+    el.appendChild(document.createTextNode(' — ' + (CFG.configTeamName || 'Unknown')));
   }
 
   function generate() {
