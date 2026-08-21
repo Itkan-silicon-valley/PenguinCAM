@@ -71,6 +71,7 @@ from frc_cam_postprocessor import (
 
 # Import team config management
 from team_config import TeamConfig, DEFAULT_TOOL_DIAMETER_IN
+from config_validation import validate_and_sanitize_config, ConfigValidationError
 
 # ============================================================================
 # File Token Manager - Secure file access with random tokens
@@ -383,8 +384,17 @@ def _load_team_config_into_session(client):
     session. Single source of truth for how config lands in the session - used by the OAuth
     callback (initial load), the /config/refresh route, and the TTL auto-refresh below."""
     config_yaml = client.fetch_config_file() if client else None
+    # Validate/sanitize even the Onshape-hosted config: a mentor can commit crappy YAML to
+    # their classroom just as easily as an upload user can host it. Lenient mode never raises
+    # -- it drops out-of-range values (reverting them to defaults) and sanitizes strings for
+    # G-code safety, so a bad config degrades instead of breaking the page.
+    config_data = None
     if config_yaml:
-        team_config = TeamConfig.from_yaml(config_yaml)
+        config_data, warnings = validate_and_sanitize_config(config_yaml, strict=False)
+        for w in warnings:
+            log(f"⚠️  Team config: {w}")
+    if config_data:
+        team_config = TeamConfig.from_dict(config_data)
         log(f"✅ Team config loaded: {team_config.team_name} (#{team_config.team_number})")
         session['team_config_data'] = team_config._data
         session['team_config'] = team_config.to_dict()
@@ -426,20 +436,38 @@ def _maybe_refresh_team_config():
         session['team_config_fetched_at'] = time.time()
 
 
+def _active_team_config():
+    """The TeamConfig that applies to the current COMPUTE request (/process, /process-job,
+    /part-outline). Upload-supplied config (from the anonymous flow's POST /session/config)
+    takes precedence when present; otherwise the Onshape classroom config cached in the
+    session; otherwise Team 6238 defaults. Single resolver so the compute endpoints agree
+    with what the page rendered. Note: only the upload flow ever sets `upload_config_data`,
+    so an Onshape user (who never hits /session/config) transparently keeps their config."""
+    if session.get('upload_config_data'):
+        return TeamConfig.from_dict(session['upload_config_data'])
+    return TeamConfig.from_dict(session.get('team_config_data', {}))
+
+
 def _app_template_context(force_defaults=False):
     """Build the shared template context (machines, materials, tool, bed size) used by
     both the legacy single-part page and the multi-part wizard.
 
-    force_defaults=True (the anonymous upload flow) skips the Onshape config
-    refresh entirely and uses the built-in Team 6238 defaults, ignoring any config
-    cached in the session from a prior Onshape login in the same browser. This
-    guarantees the upload flow makes NO Onshape calls."""
+    force_defaults=True (the anonymous upload flow) skips the Onshape config refresh
+    entirely and NEVER reads the Onshape `team_config_data` (so a prior Onshape login in the
+    same browser can't leak in). It instead uses the upload flow's own `upload_config_data`
+    -- the team config that flow supplied via POST /session/config -- or the built-in Team
+    6238 defaults when none has been supplied. Either way it makes NO Onshape calls."""
     if not force_defaults:
         _maybe_refresh_team_config()  # opportunistic TTL refresh before we read the cached copy
     user_name = None if force_defaults else session.get('user_name')
     team_name = None if force_defaults else session.get('team_name')
 
-    team_config_data = {} if force_defaults else session.get('team_config_data', {})
+    if force_defaults:
+        team_config_data = session.get('upload_config_data', {})
+        using_default = not bool(team_config_data)
+    else:
+        team_config_data = session.get('team_config_data', {})
+        using_default = session.get('using_default_config', False)
     team_config = TeamConfig(team_config_data)
 
     machines = team_config.get_available_machines()
@@ -491,7 +519,14 @@ def _app_template_context(force_defaults=False):
         'default_tool_diameter_text': default_tool_diameter_text,
         'machine_x_max': machine_x_max,
         'machine_y_max': machine_y_max,
-        'using_default_config': True if force_defaults else session.get('using_default_config', False),
+        'using_default_config': using_default,
+        # Display fields for the header "Config: N (name)" banner, sourced per-flow so both
+        # the upload flow (upload_config_url) and the Onshape flow (team_config_url) render
+        # correctly server-side (before JS runs / on reload).
+        'config_team_number': team_config.team_number,
+        'config_team_name': team_config.team_name,
+        'config_url': (session.get('upload_config_url') if force_defaults
+                       else session.get('team_config_url')),
         'machines': machines,
         'machines_info': machines_info,
         'current_machine_id': current_machine_id,
@@ -538,7 +573,7 @@ def _compute_dxf_outline(path):
     """Load a DXF and return its perimeter outline + dims + holes for the wizard layout
     canvas/thumbnail. Coordinates normalized so the bounding-box minimum is (0,0).
     Returns a dict (width, height, outline, holes) or None if there is no geometry."""
-    team_config = TeamConfig.from_dict(session.get('team_config_data', {}))
+    team_config = _active_team_config()
     pp = FRCPostProcessor(material_thickness=0.25, tool_diameter=0.125,
                           units='inch', config=team_config)
     pp.load_dxf(path)
@@ -629,6 +664,60 @@ def session_verify():
         session['app_verified'] = True
         return jsonify({'ok': True})
     return jsonify({'ok': False, 'error': 'Verification failed.'}), 403
+
+
+def _config_status_payload():
+    """JSON-safe snapshot of the upload flow's current config (team name, machine/material/
+    tool/bed context) so the client can apply a newly-loaded config in place without a full
+    page reload. Mirrors the template context used on initial render."""
+    ctx = dict(_app_template_context(force_defaults=True))
+    # incomplete_materials is a set (not JSON-serializable); the rest is plain data.
+    ctx['incomplete_materials'] = sorted(ctx.get('incomplete_materials', []))
+    team_config = _active_team_config()
+    ctx['team_name'] = team_config.team_name
+    ctx['team_number'] = team_config.team_number
+    ctx['config_url'] = session.get('upload_config_url')
+    return ctx
+
+
+@app.route('/session/config', methods=['POST'])
+@limiter.limit("30 per minute")
+def session_config():
+    """Set (or clear) the team config for the anonymous UPLOAD flow.
+
+    The browser fetches a team-hosted YAML config client-side (from a CORS-friendly host)
+    and POSTs its text here; we validate/sanitize it STRICTLY (rejecting bad input with a
+    user-facing message) and store the result under `upload_config_data` -- kept separate
+    from the Onshape `team_config_data` so the two flows never cross-contaminate. An empty or
+    absent `yaml` clears back to Team 6238 defaults. Gated like the compute endpoints, so
+    only a verified session can set it."""
+    gate = _require_app_session()
+    if gate:
+        return gate
+    data = request.get_json(silent=True) or {}
+    yaml_text = data.get('yaml')
+    source_url = (data.get('url') or '').strip() or None
+
+    # Empty content -> clear the upload config, revert to defaults.
+    if not yaml_text or not yaml_text.strip():
+        session.pop('upload_config_data', None)
+        session.pop('upload_config_url', None)
+        log("🧹 Upload team config cleared - using defaults")
+        return jsonify({'ok': True, 'cleared': True, **_config_status_payload()})
+
+    try:
+        config_dict, warnings = validate_and_sanitize_config(yaml_text, strict=True)
+    except ConfigValidationError as e:
+        return jsonify({'ok': False, 'error': e.message}), 400
+
+    team_config = TeamConfig.from_dict(config_dict)
+    session['upload_config_data'] = team_config._data
+    session['upload_config_url'] = source_url
+    # Newline-strip the URL before logging (avoid log-forging via the user-supplied value).
+    safe_url = (source_url or '').replace('\n', ' ').replace('\r', ' ')[:200]
+    log(f"✅ Upload team config set: {team_config.team_name} (#{team_config.team_number})"
+        + (f" from {safe_url}" if safe_url else ""))
+    return jsonify({'ok': True, 'warnings': warnings, **_config_status_payload()})
 
 
 def _serve_wizard_upload():
@@ -841,11 +930,9 @@ def process_file():
 
         log(f"🚀 Running post-processor API...")
 
-        # Get team config from session (if available)
-        config_data = session.get('team_config_data', {})
-        log(f"🔍 DEBUG: Session team_config_data keys: {list(config_data.keys()) if config_data else 'EMPTY'}")
-        log(f"🔍 DEBUG: Session has {len(config_data)} top-level keys in team_config_data")
-        team_config = TeamConfig.from_dict(config_data)
+        # Get the team config that applies to this request (upload-supplied, Onshape, or
+        # defaults). Single resolver so /process matches what the page rendered.
+        team_config = _active_team_config()
         log(f"📋 Using team config: {team_config}")
         log(f"🔍 DEBUG: TeamConfig internals: team={team_config.team_number}, name={team_config.team_name}")
 
@@ -1084,7 +1171,7 @@ def process_job():
             f.save(p)
             saved_paths[idx] = p
 
-        team_config = TeamConfig.from_dict(session.get('team_config_data', {}))
+        team_config = _active_team_config()
         user_name = session.get('user_name')
         machine_x = team_config.machine_x_max
         machine_y = team_config.machine_y_max

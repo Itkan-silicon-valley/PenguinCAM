@@ -1041,6 +1041,7 @@
         dbg('session', { verified: state.verified });
         if (state.verified) {
           var o = $('#verify-overlay'); if (o) o.hidden = true;   // unblock the wizard
+          autoLoadConfig();  // /session/config is gated, so load only after we're verified
         } else {
           setVerifyStatus('Verification failed — please try again.');
           resetTurnstile();
@@ -1051,6 +1052,162 @@
         setVerifyStatus('Could not reach the server — please retry.');
         resetTurnstile();
       });
+  }
+
+  // ==========================================================================
+  // Team-config source (upload flow). The team's YAML config lives at a URL the
+  // BROWSER fetches (client-side, so there's no SSRF surface); we then POST the text
+  // to /session/config for strict validation. The URL is remembered in localStorage
+  // and reflected into the ?config= query param so a shared bookmark auto-loads it.
+  // A successful load/clear reloads the page so the server re-renders the whole body
+  // (bed size, tool default, machine + material lists) from the new config.
+  // ==========================================================================
+  var CONFIG_URL_KEY = 'penguincam_config_url';
+  // Hosts that serve files but DON'T send permissive CORS headers, so a client-side
+  // fetch always fails. We can't confirm CORS from JS (the browser only says "Failed
+  // to fetch"), but for these known hosts we can give a confident, specific message.
+  var NON_CORS_HOSTS = ['drive.google.com', 'docs.google.com', 'dropbox.com',
+    'www.dropbox.com', 'onedrive.live.com', '1drv.ms'];
+  var CONFIG_FETCH_TIMEOUT_MS = 15000;
+
+  function getStoredConfigUrl() { try { return localStorage.getItem(CONFIG_URL_KEY); } catch (e) { return null; } }
+  function setStoredConfigUrl(u) { try { localStorage.setItem(CONFIG_URL_KEY, u); } catch (e) {} }
+  function clearStoredConfigUrl() { try { localStorage.removeItem(CONFIG_URL_KEY); } catch (e) {} }
+
+  function getUrlParam(name) {
+    try { return new URL(window.location.href).searchParams.get(name); } catch (e) { return null; }
+  }
+  function setConfigParam(url) {
+    try {
+      var u = new URL(window.location.href);
+      if (url) u.searchParams.set('config', url); else u.searchParams.delete('config');
+      history.replaceState(null, '', u.toString());
+    } catch (e) {}
+  }
+
+  function setConfigStatus(msg, kind) {
+    var el = $('#config-source-status');
+    if (!el) return;
+    el.textContent = msg || '';
+    el.className = 'config-source-status' + (kind ? ' ' + kind : '');
+  }
+
+  function hostOf(url) { try { return new URL(url).hostname.toLowerCase(); } catch (e) { return ''; } }
+
+  function showConfigError(url, err) {
+    if (err && err.kind === 'http') {
+      setConfigStatus('The file could not be loaded (HTTP ' + err.status + '). Make sure the URL is public and correct.', 'error');
+      return;
+    }
+    // Opaque fetch rejection: almost always CORS or an unreachable/typo'd URL.
+    var host = hostOf(url);
+    if (NON_CORS_HOSTS.indexOf(host) !== -1) {
+      setConfigStatus(host + ' blocks direct fetching (CORS), so its links can’t be used here. Host the file on GitHub (raw) or a gist instead.', 'error');
+    } else {
+      setConfigStatus('Could not fetch the file. This is usually a CORS restriction (the host must allow cross-origin fetch — GitHub raw and gists do) or a wrong/unreachable URL.', 'error');
+    }
+  }
+
+  // Fetch the YAML client-side, POST it to /session/config, and (on success) reload so the
+  // page re-renders from the applied config. opts.reload defaults to true.
+  function loadConfigFromUrl(url, opts) {
+    opts = opts || {};
+    url = (url || '').trim();
+    if (!url) return;
+    if (!/^https?:\/\//i.test(url)) { setConfigStatus('Enter a full URL starting with https://', 'error'); return; }
+    if (!state.verified) { setConfigStatus('Please complete the verification check first.', 'error'); return; }
+
+    setConfigStatus('Loading configuration…');
+    var controller = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+    var timer = controller ? setTimeout(function () { controller.abort(); }, CONFIG_FETCH_TIMEOUT_MS) : null;
+
+    fetch(url, { signal: controller ? controller.signal : undefined, redirect: 'follow' })
+      .then(function (r) {
+        if (!r.ok) throw { kind: 'http', status: r.status };
+        return r.text();
+      })
+      .then(function (text) { return postConfig(text, url, opts); })
+      .catch(function (err) {
+        if (err && err.name === 'AbortError') { setConfigStatus('Timed out fetching the file. Check the URL and try again.', 'error'); return; }
+        showConfigError(url, err);
+      })
+      .then(function () { if (timer) clearTimeout(timer); });
+  }
+
+  function postConfig(text, url, opts) {
+    return fetch('/session/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ yaml: text, url: url })
+    }).then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j }; }); })
+      .then(function (res) {
+        if (!res.ok || !res.j || !res.j.ok) {
+          setConfigStatus((res.j && res.j.error) || 'The configuration was rejected.', 'error');
+          return;
+        }
+        setStoredConfigUrl(url);
+        setConfigParam(url);
+        // Surface sanitization notes across the reload.
+        if (res.j.warnings && res.j.warnings.length) {
+          try { sessionStorage.setItem('penguincam_config_warnings', JSON.stringify(res.j.warnings)); } catch (e) {}
+        }
+        if (opts.reload === false) { setConfigStatus('Configuration loaded.', 'ok'); return; }
+        window.location.reload();
+      });
+  }
+
+  function resetConfig() {
+    setConfigStatus('Resetting to defaults…');
+    fetch('/session/config', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ yaml: '' })
+    }).then(function (r) { return r.json(); })
+      .then(function () { clearStoredConfigUrl(); setConfigParam(null); window.location.reload(); })
+      .catch(function () { setConfigStatus('Could not reach the server — please retry.', 'error'); });
+  }
+
+  // Auto-load once verified: ?config= param wins over a saved URL. If the server has
+  // ALREADY applied this URL (not using defaults and the URL matches), do nothing -- this
+  // is what stops the reload from re-fetching in an endless loop.
+  function autoLoadConfig() {
+    var param = getUrlParam('config');
+    var url = param || getStoredConfigUrl();
+    if (!url) return;
+    var alreadyApplied = !CFG.usingDefault && CFG.configUrl && CFG.configUrl === url;
+    if (alreadyApplied) {
+      // Keep localStorage and the address bar in sync (e.g. arrived via a shared link).
+      setStoredConfigUrl(url);
+      if (!param) setConfigParam(url);
+      return;
+    }
+    loadConfigFromUrl(url, { reload: true });
+  }
+
+  function bindConfigSource() {
+    var input = $('#f-config-url');
+    if (!input) return;  // not the upload flow
+    // Prefill with whatever is applied/saved so the field reflects reality.
+    input.value = CFG.configUrl || getUrlParam('config') || getStoredConfigUrl() || '';
+    var resetBtn = $('#config-reset-btn');
+    if (resetBtn && !CFG.usingDefault) resetBtn.hidden = false;
+
+    var loadBtn = $('#config-load-btn');
+    if (loadBtn) loadBtn.addEventListener('click', function () { loadConfigFromUrl(input.value, { reload: true }); });
+    input.addEventListener('keydown', function (e) {
+      if (e.key === 'Enter') { e.preventDefault(); loadConfigFromUrl(input.value, { reload: true }); }
+    });
+    if (resetBtn) resetBtn.addEventListener('click', resetConfig);
+
+    // Show any sanitization warnings stashed before the last reload.
+    try {
+      var w = sessionStorage.getItem('penguincam_config_warnings');
+      if (w) {
+        sessionStorage.removeItem('penguincam_config_warnings');
+        var list = JSON.parse(w);
+        if (list && list.length) setConfigStatus('Configuration loaded. ' + list.join(' '), 'warn');
+      } else if (!CFG.usingDefault) {
+        setConfigStatus('Configuration loaded.', 'ok');
+      }
+    } catch (e) {}
   }
 
   function generate() {
@@ -1423,6 +1580,7 @@
       // and can't be produced from a plain DXF upload — offer only 2D and Tubing here.
       var opt25 = $('#opt-mode-25d'); if (opt25) opt25.hidden = true;
       var r25 = $('input[name="mode"][value="2.5d"]'); if (r25) r25.disabled = true;
+      bindConfigSource();
       establishUploadSession();
     }
     gotoStep('setup');

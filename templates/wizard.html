@@ -13,15 +13,16 @@
             <!-- Loaded team configuration (so the user can confirm it resolved correctly,
                  even in the Onshape panel). Clickable when we know the config file URL. -->
             <div class="config-info">
-                {% if not session.get('using_default_config') and session.get('team_config') and session.get('team_config').get('team_number') %}
-                {% set _config_url = session.get('team_config_url') %}
+                {% if not using_default_config and config_team_number %}
                 <p class="config-status">Config:
-                    {% if _config_url %}
-                    <a href="{{ _config_url }}" target="_blank" rel="noopener">{{ session.get('team_config').get('team_number') }} ({{ session.get('team_config').get('team_name', 'Unknown') }})</a>
+                    {% if config_url %}
+                    <a href="{{ config_url }}" target="_blank" rel="noopener">{{ config_team_number }} ({{ config_team_name or 'Unknown' }})</a>
                     {% else %}
-                    {{ session.get('team_config').get('team_number') }} ({{ session.get('team_config').get('team_name', 'Unknown') }})
+                    {{ config_team_number }} ({{ config_team_name or 'Unknown' }})
                     {% endif %}
+                    {% if source != 'upload' %}
                     <a href="/config/refresh" class="config-refresh" title="Reload team configuration from Onshape" aria-label="Reload team configuration">&#8635;</a>
+                    {% endif %}
                 </p>
                 {% else %}
                 <p class="config-status config-status-default">Using default configuration</p>
@@ -42,6 +43,29 @@
             <!-- ===== SETUP ===== -->
             <section class="step" data-step="setup">
                 <h2>Setup</h2>
+
+                {% if source == 'upload' %}
+                <!-- Team configuration source (upload flow only). The browser fetches the
+                     YAML client-side from a CORS-friendly host and posts it to /session/config;
+                     the URL is remembered (localStorage + ?config= param) so a shared bookmark
+                     auto-loads it. See wizard.js bindConfigSource/autoLoadConfig. -->
+                <div class="field config-source" id="config-source">
+                    <span class="field-label">Team configuration</span>
+                    <p class="hint">
+                        Optional — point PenguinCAM at your team's config file (machines,
+                        materials, feeds &amp; speeds). Host it on <strong>GitHub (raw)</strong>
+                        or a gist; Google&nbsp;Drive and Dropbox links won't work. Leave blank
+                        to use the built-in defaults.
+                    </p>
+                    <div class="config-source-row">
+                        <input type="url" id="f-config-url" inputmode="url" autocomplete="off"
+                               spellcheck="false" placeholder="https://raw.githubusercontent.com/.../PenguinCAM-config.yaml">
+                        <button type="button" id="config-load-btn" class="btn">Load</button>
+                        <button type="button" id="config-reset-btn" class="btn" hidden>Use defaults</button>
+                    </div>
+                    <p id="config-source-status" class="config-source-status" role="status" aria-live="polite"></p>
+                </div>
+                {% endif %}
 
                 {% if machines and machines|length > 1 %}
                 <label class="field">
@@ -239,6 +263,10 @@
         defaultToolText: {{ (default_tool_diameter_text if default_tool_diameter_text is defined else '4mm')|tojson }},
         driveEnabled: {{ (drive_enabled if drive_enabled is defined else False)|tojson }},
         turnstileSiteKey: {{ (turnstile_sitekey if turnstile_sitekey is defined else '')|tojson }},
+        // Upload-flow config state, so the client can tell whether the server has already
+        // applied the ?config= URL (and skip a redundant fetch+reload -- see wizard.js).
+        usingDefault: {{ (using_default_config if using_default_config is defined else True)|tojson }},
+        configUrl: {{ (config_url if config_url is defined else None)|tojson }},
       };
       // Turnstile bot-gate token bridge (upload flow). Cloudflare's async widget may
       // fire its callback before OR after wizard.js loads, so buffer the token and

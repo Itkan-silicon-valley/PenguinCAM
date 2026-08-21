@@ -971,7 +971,7 @@ materials:
 
   aluminum:
     name: "Aluminum"
-    description: "Aluminum box tubing - 18K RPM, 55 IPM cutting, 4° ramp"
+    description: "Aluminum box tubing - 18K RPM, 55 IPM cutting, 4 deg ramp"
 
     # Speeds and feeds
     spindle_speed: 18000
