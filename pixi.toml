@@ -22,6 +22,8 @@ google-auth-httplib2 = "==0.1.1"
 google-api-python-client = "==2.100.0"
 pygcode = ">=0.2.0"
 termcolor = ">=2.0.0"
+numpy = ">=1.24.0"
+Pillow = ">=10.0.0"
 
 [tasks.server]
 cmd = "python frc_cam_gui_app.py"
