@@ -10,20 +10,22 @@ Generates G-code from DXF files with predefined operations for:
 # Standard library
 import argparse
 import datetime
-import json
 import math
 import os
 import re
-from collections import defaultdict
+import sys
 from dataclasses import dataclass, field
 from typing import List, Tuple, Optional, Dict, Any
 
 # Third-party
 import ezdxf
+from shapely import affinity
+from shapely.geometry import Point, Polygon, LinearRing, MultiPolygon, LineString
+from shapely.geometry.polygon import orient
+from shapely.ops import unary_union
 
 # Local modules
-from shapely.geometry import Point, Polygon, LineString, MultiPolygon
-from shapely.ops import unary_union, linemerge
+from dxf_geometry import entities_to_closed_paths, sample_spline
 from team_config import TeamConfig
 
 
@@ -62,6 +64,7 @@ MATERIAL_PRESETS = {
         'stepover_percentage': 0.65,    # Radial stepover as fraction of tool diameter (65% for plywood)
         'helix_radius_multiplier': 0.75, # Helix entry radius as fraction of tool radius
         'max_slotting_depth': 0.4,      # Maximum depth per pass for perimeter slotting (inches)
+        'corner_min_feed_scale': 0.7,   # Corner-slowdown feed floor (softer/heat-limited material)
         'tab_width': 0.25,        # Tab width (inches)
         'tab_height': 0.15,        # Tab height (inches)
         'description': 'Standard plywood settings - 18K RPM, 75 IPM cutting'
@@ -77,6 +80,7 @@ MATERIAL_PRESETS = {
         'stepover_percentage': 0.25,    # Radial stepover as fraction of tool diameter (25% conservative for aluminum)
         'helix_radius_multiplier': 0.5,  # Helix entry radius as fraction of tool radius (conservative for aluminum)
         'max_slotting_depth': 0.2,      # Maximum depth per pass for perimeter slotting (inches)
+        'corner_min_feed_scale': 0.4,   # Corner-slowdown feed floor (aggressive; aluminum is force-limited)
         'tab_width': 0.25,        # Tab width (inches) - same as plywood
         'tab_height': 0.15,       # Tab height (inches) - same as plywood
         'description': 'Aluminum box tubing - 18K RPM, 55 IPM cutting, 4° ramp'
@@ -92,11 +96,38 @@ MATERIAL_PRESETS = {
         'stepover_percentage': 0.55,    # Radial stepover as fraction of tool diameter (55% moderate for polycarbonate)
         'helix_radius_multiplier': 0.75, # Helix entry radius as fraction of tool radius
         'max_slotting_depth': 0.25,     # Maximum depth per pass for perimeter slotting (inches)
+        'corner_min_feed_scale': 0.7,   # Corner-slowdown feed floor (softer/heat-limited material)
         'tab_width': 0.25,        # Tab width (inches) - same as plywood
         'tab_height': 0.15,        # Tab height (inches) - same as plywood
         'description': 'Polycarbonate - same as plywood settings'
     }
 }
+
+
+def sanitize_filename_base(name: str, fallback: str = "output") -> str:
+    """Make an arbitrary Onshape part / job name safe to use as a filename base.
+
+    Onshape names can contain path separators and characters that are illegal in filenames
+    or in the download's Content-Disposition header - e.g. a part named '1/4" plate', where
+    the '/' otherwise makes os.path.join write into a nonexistent '1/' subdirectory (the
+    write fails, silently to the UI) and the '"' breaks the Content-Disposition quoting.
+    Replaces [/ \\ : * ? " < > |] with '-', collapses whitespace, trims stray leading/
+    trailing dots and dashes, and falls back to `fallback` if nothing usable remains."""
+    if not name:
+        return fallback
+    cleaned = re.sub(r'[/\\:*?"<>|]+', '-', name)   # path separators + filename/header-illegal chars
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip()  # collapse whitespace runs
+    cleaned = cleaned.strip('.-').strip()           # no leading/trailing dots or dashes
+    return cleaned if cleaned else fallback
+
+
+def build_output_filename(suggested_filename: str, timestamp: str, fallback: str = "output") -> str:
+    """Build the '<name>_<timestamp>.nc' output filename, sanitizing the (possibly CAD- or
+    user-supplied) name so it is safe to write to disk and serve. Single chokepoint shared
+    by every generator and the multi-part job assembler."""
+    base_name = sanitize_filename_base(suggested_filename, fallback)
+    timestamp_for_file = timestamp.replace('-', '').replace(' ', '_').replace(':', '')
+    return f"{base_name}_{timestamp_for_file}.nc"
 
 
 class FRCPostProcessor:
@@ -122,12 +153,28 @@ class FRCPostProcessor:
         self.tool_radius = tool_diameter / 2
         self.units = units
 
+        # Corner slowdown for contour-parallel pocket clearing. At a sharp interior corner the
+        # cutter wraps around two edges at once, so its engagement (and cutting force) spikes
+        # well above the straight-edge stepover. We keep the toolpath geometry identical but
+        # reduce the feed within `corner_slowdown_zone` of a sharp corner, down to
+        # `corner_min_feed_scale` x feed at the sharpest corners, easing back to full feed on
+        # the straights. Only collinear waypoints are added, so the path is unchanged.
+        self.corner_slowdown_zone = tool_diameter        # reduced-feed distance on each side of a corner
+        self.corner_min_feed_scale = 0.4                 # default; set per-material in apply_material_preset
+
         # Hole detection tolerance from config
         self.tolerance = config.hole_detection_tolerance
 
         # Minimum hole diameter that can be milled (must be > tool diameter for chip evacuation)
         # Holes smaller than this are skipped
         self.min_millable_hole = tool_diameter * config.min_millable_hole_multiplier
+
+        # Tolerance for the "hole at least tool-sized" gate. Absorbs unit-conversion / DXF
+        # rounding (e.g. a "4mm" -> 0.15748" tool vs a 0.157" hole) so an essentially
+        # tool-sized hole is peck-drilled rather than rejected as "too small", and doubles
+        # as the threshold below which a peck hole is a pure straight plunge with no lateral
+        # clearing (which would otherwise emit a degenerate zero-radius arc).
+        self.hole_size_tolerance = 0.002 if units == "inch" else 0.05
 
         # Multi-layer support
         self.layer_data = None  # Set by load_dxf for multi-layer DXFs
@@ -141,6 +188,11 @@ class FRCPostProcessor:
         self.retract_height = material_thickness + self.clearance_height  # Retract above material for operations
         self.material_top = material_thickness  # Top surface of material
         self.cut_depth = -self.sacrifice_board_depth  # Cut slightly into sacrifice board
+
+        # True when the tool is parked at safe height (above the clearance plane) and the
+        # next feature must first rapid down to the clearance plane before its slow plunge
+        # feed. Set at job start and after any pause/park; consumed by _approach_ramp_start.
+        self._pending_clearance_rapid = False
 
         # Cutting parameters (defaults - can be overridden by material presets)
         self.spindle_speed = 18000  # RPM
@@ -168,10 +220,15 @@ class FRCPostProcessor:
         # Tube facing operation constants from config
         self.tube_facing_params = config.get_tube_facing_params()
 
-        # Machine-specific constants from config
-        self.machine_park_x = config.machine_park_x  # X position for machine park (machine coordinates)
-        self.machine_park_y = config.machine_park_y  # Y position for machine park (machine coordinates)
-        self.machine_park_z = config.machine_park_z  # Z position for safe clearance (machine coordinates)
+        # Machine-specific constants from config. park_position is optional (a machine
+        # coordinate tuple or None); when None, no G53 is emitted and the output is
+        # portable across controllers.
+        self.park_position = config.park_position  # (x, y, z) machine coords, or None
+        self.safe_clearance_height = config.safe_clearance_height  # configured G54 ceiling, or None
+        # Work coordinate system for tube ops. 'G54' (default) = operator zeros G54 to the
+        # tube per job (portable); an alternate fixed WCS (e.g. 'G55') is opt-in for a
+        # permanently-fixtured jig so its zero persists alongside the flat-work G54 zero.
+        self.tube_wcs = config.tube_work_coordinate_system
 
         # Team information from config
         self.team_number = config.team_number  # FRC team number
@@ -244,6 +301,11 @@ class FRCPostProcessor:
         else:
             self.peck_drill_depth = preset['peck_drill_depth']
 
+        # Corner-slowdown floor (material-aware, dimensionless). Aluminum is force-limited and
+        # wants an aggressive slowdown (0.4); softer, heat-limited materials keep more feed to
+        # preserve chip load and avoid rubbing (0.7). Falls back to the __init__ default.
+        self.corner_min_feed_scale = preset.get('corner_min_feed_scale', self.corner_min_feed_scale)
+
         print(f"\nApplied material preset: {preset.get('name', material.capitalize())}")
         if 'description' in preset:
             print(f"  {preset['description']}")
@@ -290,7 +352,8 @@ class FRCPostProcessor:
         print(f"  ❌ ERROR: {error_msg}")
         self.errors.append(error_msg)
 
-    def _generate_pause_and_park_gcode(self, title: str, instructions: List[str]) -> List[str]:
+    def _generate_pause_and_park_gcode(self, title: str, instructions: List[str],
+                                       safe_z: float = None) -> List[str]:
         """
         Generate G-code for a safe pause-and-restart sequence with operator instructions.
 
@@ -313,9 +376,14 @@ class FRCPostProcessor:
         gcode = []
         gcode.append('')
         gcode.append(f'( === {title} === )')
-        gcode.append(f'G53 G0 Z{self.machine_park_z:.4f}  ; Move to safe machine Z clearance')
-        gcode.append(f'G53 G0 X{self.machine_park_x} Y{self.machine_park_y}  ; Park at back of machine')
-        gcode.append('M9  ; Air blast off')
+        # Callers with a taller safe height (e.g. tube facing must clear the full tube)
+        # pass safe_z; otherwise the material-based work clearance is used.
+        z = safe_z if safe_z is not None else self._safe_z()
+        gcode.append(f'G0 Z{z:.4f}  ; Safe Z clearance')
+        gcode.extend(self._park_gcode('Park'))  # G53 park only if configured
+        coolant_off = self._coolant_off_gcode()
+        if coolant_off:
+            gcode.append(coolant_off)
         gcode.append('M5  ; Spindle off')
         gcode.append('G4 P5.0  ; 5 second dwell')
         gcode.append('')
@@ -328,9 +396,14 @@ class FRCPostProcessor:
         gcode.append('( === RESTART AFTER PAUSE === )')
         gcode.append('G90  ; Ensure absolute positioning mode')
         gcode.append(f'S{self.spindle_speed} M3  ; Spindle on')
-        gcode.append('M7  ; Air blast on')
+        coolant_on = self._coolant_on_gcode()
+        if coolant_on:
+            gcode.append(coolant_on)
         gcode.append('G4 P3.0  ; 3 second spindle spin-up')
         gcode.append('')
+        # Tool resumes at safe height after the pause; the next feature must rapid down to
+        # the clearance plane before its slow plunge feed (see _approach_ramp_start).
+        self._pending_clearance_rapid = True
         return gcode
 
     def _parse_layer_depth(self, layer_name: str) -> Optional[float]:
@@ -338,7 +411,6 @@ class FRCPostProcessor:
         Parse Z depth from layer name (e.g., "Z_-0p250" -> -0.25, "Z_0p000" -> 0)
         Returns None if layer name doesn't match the expected format
         """
-        import re
         match = re.match(r'^Z_(-?\d+)p(\d+)$', layer_name)
         if not match:
             return None
@@ -410,6 +482,10 @@ class FRCPostProcessor:
         lines = list(msp.query('LINE'))
         arcs = list(msp.query('ARC'))
         splines = list(msp.query('SPLINE'))
+        # Onshape uses ELLIPSE entities for curved perimeter transitions/fillets. The
+        # shared stitcher handles both arcs (chained into a boundary) and full ellipses
+        # (standalone closed loops), so pass them all through.
+        ellipses = list(msp.query('ELLIPSE'))
 
         # Also collect unclosed LWPOLYLINEs - they may be part of a perimeter that needs stitching
         unclosed_lwpolylines = []
@@ -417,12 +493,46 @@ class FRCPostProcessor:
             if not entity.closed and len(list(entity.get_points('xy'))) > 1:
                 unclosed_lwpolylines.append(entity)
 
-        if lines or arcs or splines or unclosed_lwpolylines:
-            print(f"Found {len(lines)} lines, {len(arcs)} arcs, {len(splines)} splines, {len(unclosed_lwpolylines)} unclosed polylines - attempting to form closed paths...")
-            closed_paths = self._chain_entities_to_paths(lines, arcs, splines, unclosed_lwpolylines)
+        if lines or arcs or splines or unclosed_lwpolylines or ellipses:
+            print(f"Found {len(lines)} lines, {len(arcs)} arcs, {len(splines)} splines, {len(ellipses)} ellipses, {len(unclosed_lwpolylines)} unclosed polylines - attempting to form closed paths...")
+            closed_paths = self._chain_entities_to_paths(lines, arcs, splines, unclosed_lwpolylines, ellipses)
             self.polylines.extend(closed_paths)
         
         print(f"Found {len(self.circles)} circles and {len(self.polylines)} closed paths")
+
+    def _path_as_circle(self, coords):
+        """If a closed boundary path is circular, return its circle dict, else None.
+
+        The Onshape 2.5D export represents everything as HATCH solid regions, so a
+        drilled hole arrives as a many-sided circular boundary path, not a CIRCLE
+        entity. Left as a polyline it gets machined as a pocket, which fails when the
+        hole is barely larger than the tool (no room to spiral-clear). Recognizing it
+        as a circle routes it through the hole classifier, which already picks the
+        right strategy by size: peck-drill (tiny), helical+spiral (medium), or
+        contour (large through-holes). Only the bottom-face/through path consumes
+        these circles; blind pockets at depth layers are machined from `polygons`,
+        which are built from circles+polylines identically, so this reclassification
+        does not change how depth-layer pockets are cut.
+
+        Returns a circle dict ({'center','radius','diameter'}) or None.
+        """
+        if len(coords) < 8:  # too few points to be a tessellated circle
+            return None
+        try:
+            poly = Polygon(coords)
+        except Exception:
+            return None
+        if not poly.is_valid or poly.is_empty or poly.length == 0:
+            return None
+        # Isoperimetric quotient: 1.0 for a circle, ~0.95 octagon, ~0.79 square.
+        # 0.97 admits tessellated circles (~0.998) while excluding octagons/rounded rects.
+        circularity = 4 * math.pi * poly.area / (poly.length ** 2)
+        if circularity < 0.97:
+            return None
+        diameter = 2 * math.sqrt(poly.area / math.pi)
+        centroid = poly.centroid
+        return {'center': (centroid.x, centroid.y),
+                'radius': diameter / 2, 'diameter': diameter}
 
     def _load_multilayer_dxf(self, doc, msp, layers_with_depths):
         """Load geometry from multi-layer DXF, organized by depth"""
@@ -444,25 +554,55 @@ class FRCPostProcessor:
             layer_circles = []
             layer_polylines = []
 
-            # Extract circles from this layer
-            for entity in msp.query('CIRCLE'):
+            # PRIORITY 1: Extract HATCH entities (solid regions from new format)
+            hatch_count = 0
+            for entity in msp.query('HATCH'):
                 if entity.dxf.layer == layer_name:
-                    center = (entity.dxf.center.x, entity.dxf.center.y)
-                    radius = entity.dxf.radius
-                    layer_circles.append({'center': center, 'radius': radius, 'diameter': radius * 2})
+                    try:
+                        # Each HATCH has multiple boundary paths
+                        for path in entity.paths:
+                            if hasattr(path, 'vertices') and path.vertices:
+                                # Polyline path
+                                coords = [(v[0], v[1]) for v in path.vertices]
+                                if len(coords) >= 3:
+                                    # Circular boundaries are holes, not pockets -
+                                    # recover them as circles so the hole classifier
+                                    # (peck/helical/contour by size) handles them
+                                    # (see _path_as_circle).
+                                    circle = self._path_as_circle(coords)
+                                    if circle:
+                                        layer_circles.append(circle)
+                                    else:
+                                        layer_polylines.append(coords)
+                                    hatch_count += 1
+                    except Exception as e:
+                        print(f"      Warning: Could not parse HATCH entity: {e}")
 
-            # Extract polylines from this layer (same logic as single-layer)
-            for entity in msp.query('LWPOLYLINE'):
-                if entity.dxf.layer == layer_name:
-                    points = [(p[0], p[1]) for p in entity.get_points('xy')]
-                    if entity.closed and len(points) > 2:
-                        layer_polylines.append(points)
+            if hatch_count > 0:
+                print(f"    Extracted {hatch_count} regions from HATCH entities (solid format)")
 
-            for entity in msp.query('POLYLINE'):
-                if entity.is_2d_polyline and entity.dxf.layer == layer_name:
-                    points = [(v.dxf.location.x, v.dxf.location.y) for v in entity.vertices]
-                    if entity.is_closed and len(points) > 2:
-                        layer_polylines.append(points)
+            # FALLBACK: Extract circles and polylines (old stroke format)
+            # Only process if no HATCH entities found
+            if hatch_count == 0:
+                # Extract circles from this layer
+                for entity in msp.query('CIRCLE'):
+                    if entity.dxf.layer == layer_name:
+                        center = (entity.dxf.center.x, entity.dxf.center.y)
+                        radius = entity.dxf.radius
+                        layer_circles.append({'center': center, 'radius': radius, 'diameter': radius * 2})
+
+                # Extract polylines from this layer (same logic as single-layer)
+                for entity in msp.query('LWPOLYLINE'):
+                    if entity.dxf.layer == layer_name:
+                        points = [(p[0], p[1]) for p in entity.get_points('xy')]
+                        if entity.closed and len(points) > 2:
+                            layer_polylines.append(points)
+
+                for entity in msp.query('POLYLINE'):
+                    if entity.is_2d_polyline and entity.dxf.layer == layer_name:
+                        points = [(v.dxf.location.x, v.dxf.location.y) for v in entity.vertices]
+                        if entity.is_closed and len(points) > 2:
+                            layer_polylines.append(points)
 
             # Collect individual entities for path stitching
             lines = [e for e in msp.query('LINE') if e.dxf.layer == layer_name]
@@ -471,18 +611,25 @@ class FRCPostProcessor:
             unclosed_lwpolylines = [e for e in msp.query('LWPOLYLINE')
                                    if e.dxf.layer == layer_name and not e.closed
                                    and len(list(e.get_points('xy'))) > 1]
+            ellipses = [e for e in msp.query('ELLIPSE') if e.dxf.layer == layer_name]
 
-            if lines or arcs or splines or unclosed_lwpolylines:
-                closed_paths = self._chain_entities_to_paths(lines, arcs, splines, unclosed_lwpolylines)
+            if lines or arcs or splines or unclosed_lwpolylines or ellipses:
+                closed_paths = self._chain_entities_to_paths(lines, arcs, splines, unclosed_lwpolylines, ellipses)
                 layer_polylines.extend(closed_paths)
+
+            # Convert geometry to Shapely Polygons for unified representation
+            polygons = self._convert_to_shapely_polygons(layer_circles, layer_polylines)
 
             self.layer_data[layer_name] = {
                 'depth': depth,
+                'polygons': polygons,
+                # Keep old format temporarily for compatibility during migration
                 'circles': layer_circles,
                 'polylines': layer_polylines
             }
 
             print(f"    Found {len(layer_circles)} circles and {len(layer_polylines)} closed paths at this depth")
+            print(f"    Converted to {len(polygons)} Shapely Polygon(s)")
 
         # For compatibility, set top-level circles/polylines to COPIES of the shallowest layer
         # (This allows classify_loops to work as-is for single-layer operations)
@@ -492,277 +639,73 @@ class FRCPostProcessor:
             self.circles = [circle.copy() for circle in self.layer_data[top_layer]['circles']]
             self.polylines = [polyline[:] for polyline in self.layer_data[top_layer]['polylines']]
 
-    def _chain_entities_to_paths(self, lines, arcs, splines, unclosed_polylines=None):
-        """
-        Chain individual LINE, ARC, SPLINE, and unclosed LWPOLYLINE entities into closed paths.
-        This handles DXF exports from Onshape and other CAD programs that don't use polylines.
-        """
-        if unclosed_polylines is None:
-            unclosed_polylines = []
+            # Derive stock thickness from the CAD layers themselves. In the Z convention
+            # (Z=0 sacrifice board, top face at Z=thickness), the deepest layer depth IS
+            # the material thickness. This makes 2.5D authoritative from geometry, so the
+            # wizard doesn't ask the user for thickness in 2.5D mode. Also refresh the
+            # thickness-derived heights that __init__ computed from the (placeholder) arg.
+            max_depth = max((info['depth'] for info in self.layer_data.values()), default=0.0)
+            if max_depth > 0:
+                self.material_thickness = max_depth
+                self.material_top = max_depth
+                self.retract_height = max_depth + self.clearance_height
+                print(f"  Derived stock thickness from CAD layers: {max_depth:.4f}\"")
 
-        # First, try the graph-based approach for exact geometry
-        print("  Attempting to connect segments into exact paths...")
-        exact_paths = self._connect_segments_graph_based(lines, arcs, splines, unclosed_polylines)
-        if exact_paths:
-            return exact_paths
+    def _chain_entities_to_paths(self, lines, arcs, splines, unclosed_polylines=None, ellipses=None):
+        """Stitch individual LINE/ARC/ELLIPSE/SPLINE and unclosed LWPOLYLINE entities into
+        closed boundary paths. Delegates to the shared dxf_geometry stitcher (also used by
+        the 2.5D DXF reconstruction) so sampling + stitching live in exactly one place."""
+        return entities_to_closed_paths(
+            lines=lines, arcs=arcs, ellipses=ellipses or [],
+            splines=splines, polylines=unclosed_polylines or [])
 
-        # Fallback: Convert all entities to linestrings and try merge
-        print("  Falling back to linestring merge...")
-        all_linestrings = []
+    def _mirror_geometry_x(self):
+        """Mirror all loaded geometry across the X axis (x -> -x), for a part 'flipped
+        over' to machine its reverse side. Applied before rotate/normalize so toolpaths
+        are regenerated fresh from the mirrored geometry (preserving helical/spiral/climb
+        safety) rather than mangling generated G-code. Splines/arcs are sampled into
+        polylines at load, so mirroring the point geometry is exact for the output."""
+        for c in self.circles:
+            c['center'] = (-c['center'][0], c['center'][1])
+        for ln in self.lines:
+            ln['start'] = (-ln['start'][0], ln['start'][1])
+            ln['end'] = (-ln['end'][0], ln['end'][1])
+        for a in self.arcs:
+            a['center'] = (-a['center'][0], a['center'][1])
+        self.polylines = [[(-x, y) for (x, y) in pl] for pl in self.polylines]
+        if self.layer_data:
+            for info in self.layer_data.values():
+                for c in info.get('circles', []):
+                    c['center'] = (-c['center'][0], c['center'][1])
+                info['polylines'] = [[(-x, y) for (x, y) in pl] for pl in info.get('polylines', [])]
+                if 'polygons' in info:
+                    info['polygons'] = [affinity.scale(p, xfact=-1, yfact=1, origin=(0, 0))
+                                        for p in info['polygons']]
 
-        # Add unclosed LWPOLYLINE entities
-        for lwpoly in unclosed_polylines:
-            points = [(p[0], p[1]) for p in lwpoly.get_points('xy')]
-            if len(points) >= 2:
-                all_linestrings.append(LineString(points))
-
-        # Add LINE entities
-        for line in lines:
-            start = (line.dxf.start.x, line.dxf.start.y)
-            end = (line.dxf.end.x, line.dxf.end.y)
-            all_linestrings.append(LineString([start, end]))
-        
-        # Add ARC entities (sample them into line segments)
-        for arc in arcs:
-            points = self._sample_arc(arc, num_points=20)
-            if len(points) >= 2:
-                all_linestrings.append(LineString(points))
-        
-        # Add SPLINE entities (sample them into line segments)
-        for spline in splines:
-            points = self._sample_spline(spline, num_points=30)
-            if len(points) >= 2:
-                all_linestrings.append(LineString(points))
-        
-        if not all_linestrings:
-            return []
-        
-        try:
-            # Merge connected line segments
-            merged = linemerge(all_linestrings)
-            
-            # Extract closed paths
-            closed_paths = []
-            tolerance = 0.1  # 0.1" tolerance for "almost closed"
-            
-            # Check if we got a single geometry or multiple
-            geoms_to_check = []
-            if hasattr(merged, 'geoms'):
-                geoms_to_check = list(merged.geoms)
-            else:
-                geoms_to_check = [merged]
-            
-            for geom in geoms_to_check:
-                coords = list(geom.coords)
-                if len(coords) < 3:
-                    continue
-                
-                # Check if path is closed or nearly closed
-                start = Point(coords[0])
-                end = Point(coords[-1])
-                distance = start.distance(end)
-                
-                is_closed = (coords[0] == coords[-1]) or distance < tolerance
-                
-                if is_closed:
-                    # Remove duplicate closing point if present
-                    if coords[0] == coords[-1]:
-                        coords = coords[:-1]
-                    
-                    if len(coords) > 2:
-                        closed_paths.append(coords)
-                        print(f"  Found closed path with {len(coords)} points (gap: {distance:.4f}\")")
-            
-            # If we still didn't find closed paths, try creating convex hull (last resort)
-            if not closed_paths and all_linestrings:
-                print("  Attempting to form polygon from all segments (APPROXIMATE)...")
-                try:
-                    union = unary_union(all_linestrings)
-                    if hasattr(union, 'convex_hull'):
-                        hull = union.convex_hull
-                        if isinstance(hull, Polygon) and len(hull.exterior.coords) > 3:
-                            coords = list(hull.exterior.coords)[:-1]
-                            closed_paths.append(coords)
-                            print(f"  ⚠️  Created convex hull with {len(coords)} points (LOSES DETAIL!)")
-                            print(f"  ⚠️  This is approximate - concave features will be lost!")
-                except Exception as e:
-                    print(f"  Could not create polygon: {e}")
-            
-            return closed_paths
-            
-        except Exception as e:
-            print(f"Warning: Could not automatically chain entities into paths: {e}")
-            return []
-    
-    def _connect_segments_graph_based(self, lines, arcs, splines, unclosed_polylines=None):
-        """
-        Build a connectivity graph and find closed cycles.
-        This preserves exact geometry including curves.
-        """
-        if unclosed_polylines is None:
-            unclosed_polylines = []
-
-        # Build list of all segments with their endpoints
-        segments = []
-
-        # Add unclosed LWPOLYLINE entities (treat as multi-point path segment)
-        for lwpoly in unclosed_polylines:
-            points = [(p[0], p[1]) for p in lwpoly.get_points('xy')]
-            if len(points) >= 2:
-                segments.append({'type': 'polyline', 'points': points, 'start': points[0], 'end': points[-1]})
-
-        # Add lines
-        for line in lines:
-            start = (line.dxf.start.x, line.dxf.start.y)
-            end = (line.dxf.end.x, line.dxf.end.y)
-            points = [start, end]
-            segments.append({'type': 'line', 'points': points, 'start': start, 'end': end})
-
-        # Add arcs (sampled)
-        for arc in arcs:
-            points = self._sample_arc(arc, num_points=20)
-            if len(points) >= 2:
-                segments.append({'type': 'arc', 'points': points, 'start': points[0], 'end': points[-1]})
-
-        # Add splines (sampled)
-        for spline in splines:
-            points = self._sample_spline(spline, num_points=30)
-            if len(points) >= 2:
-                segments.append({'type': 'spline', 'points': points, 'start': points[0], 'end': points[-1]})
-        
-        if not segments:
-            return []
-        
-        # Build adjacency graph
-        tolerance = 0.01  # 0.01" tolerance for matching endpoints
-
-        def points_match(p1, p2, tol=tolerance):
-            return self._distance_2d(p1, p2) < tol
-        
-        # Find which segments connect to which
-        graph = defaultdict(list)  # endpoint -> list of (segment_idx, is_start)
-        
-        for idx, seg in enumerate(segments):
-            # Add connections for start point
-            start_key = self._round_point(seg['start'], 3)
-            graph[start_key].append((idx, True))
-            
-            # Add connections for end point
-            end_key = self._round_point(seg['end'], 3)
-            graph[end_key].append((idx, False))
-        
-        # Find closed cycles
-        visited = set()
-        closed_paths = []
-        
-        for start_idx in range(len(segments)):
-            if start_idx in visited:
-                continue
-            
-            # Try to build a path starting from this segment
-            path_segments = []
-            path_points = []
-            current_idx = start_idx
-            current_end = segments[start_idx]['end']
-            
-            # Add first segment
-            path_segments.append(current_idx)
-            path_points.extend(segments[current_idx]['points'][:-1])  # Don't duplicate endpoints
-            visited.add(current_idx)
-            
-            # Try to find next segments
-            max_iterations = len(segments)
-            for _ in range(max_iterations):
-                # Look for a segment that starts where we ended
-                end_key = self._round_point(current_end, 3)
-                
-                next_found = False
-                for next_idx, is_start in graph[end_key]:
-                    if next_idx == current_idx or next_idx in path_segments:
-                        continue
-                    
-                    # Found a connection!
-                    seg = segments[next_idx]
-                    
-                    if is_start:
-                        # Segment starts where we ended - add it forward
-                        path_segments.append(next_idx)
-                        path_points.extend(seg['points'][:-1])
-                        current_end = seg['end']
-                    else:
-                        # Segment ends where we ended - add it reversed
-                        path_segments.append(next_idx)
-                        reversed_points = list(reversed(seg['points']))
-                        path_points.extend(reversed_points[:-1])
-                        current_end = seg['start']
-                    
-                    visited.add(next_idx)
-                    next_found = True
-                    break
-                
-                if not next_found:
-                    break
-                
-                # Check if we've closed the loop
-                start_point = segments[start_idx]['start']
-                if points_match(current_end, start_point):
-                    # Closed path found!
-                    if len(path_points) > 3:
-                        closed_paths.append(path_points)
-                        print(f"  Found exact closed path with {len(path_points)} points using {len(path_segments)} segments")
-                    break
-        
-        return closed_paths
-    
-    def _round_point(self, point, decimals=3):
-        """Round a point to create a hashable key for graph"""
-        return (round(point[0], decimals), round(point[1], decimals))
-    
-    def _sample_arc(self, arc, num_points=20):
-        """Sample an ARC entity into a series of points"""
-        center = (arc.dxf.center.x, arc.dxf.center.y)
-        radius = arc.dxf.radius
-        start_angle = math.radians(arc.dxf.start_angle)
-        end_angle = math.radians(arc.dxf.end_angle)
-        
-        # Handle angle wrapping
-        if end_angle < start_angle:
-            end_angle += 2 * math.pi
-        
-        points = []
-        for i in range(num_points + 1):
-            t = i / num_points
-            angle = start_angle + t * (end_angle - start_angle)
-            x = center[0] + radius * math.cos(angle)
-            y = center[1] + radius * math.sin(angle)
-            points.append((x, y))
-        
-        return points
-    
-    def _sample_spline(self, spline, num_points=30):
-        """Sample a SPLINE entity into a series of points"""
-        try:
-            # Use ezdxf's built-in spline sampling
-            points = []
-            for point in spline.flattening(distance=0.01):
-                points.append((point[0], point[1]))
-            return points if points else []
-        except:
-            # Fallback: use control points
-            try:
-                control_points = [(p[0], p[1]) for p in spline.control_points]
-                return control_points if len(control_points) > 1 else []
-            except:
-                return []
-        
-    def transform_coordinates(self, origin_corner: str, rotation_angle: int):
+    def transform_coordinates(self, origin_corner: str, rotation_angle: int,
+                              placement_offset: Tuple[float, float] = (0.0, 0.0),
+                              enforce_bounds: bool = True, mirror: bool = False):
         """
         Transform all coordinates based on origin corner and rotation.
-        
+
         Args:
             origin_corner: 'bottom-left', 'bottom-right', 'top-left', 'top-right'
             rotation_angle: 0, 90, 180, 270 degrees clockwise
+            placement_offset: (dx, dy) added after the corner is normalized to (0,0).
+                Used by multi-part job layout to place this part on a shared sheet.
+                Defaults to (0,0), which leaves single-part output unchanged.
+            enforce_bounds: when True (default, single-part), error if the part is
+                larger than the machine envelope. Multi-part jobs pass False and rely
+                on job-level validation (validate_job_layout) against the stock sheet.
+            mirror: when True, mirror the part across X (flip it over) before rotating
+                and normalizing. The corner-normalize step re-places it into positive
+                space, so it composes with rotation and placement_offset.
         """
+        # Flip-over mirror is applied first, then rotate/normalize proceed on the
+        # mirrored geometry.
+        if mirror:
+            self._mirror_geometry_x()
+
         # First, find bounding box of ALL entities
         all_x = []
         all_y = []
@@ -788,7 +731,7 @@ class FRCPostProcessor:
             all_y.extend([arc['center'][1] - radius, arc['center'][1] + radius])
         
         for spline in self.splines:
-            points = self._sample_spline(spline)
+            points = sample_spline(spline)
             for x, y in points:
                 all_x.append(x)
                 all_y.append(y)
@@ -877,6 +820,20 @@ class FRCPostProcessor:
                     for i, polyline in enumerate(layer_info['polylines']):
                         layer_info['polylines'][i] = [rotate_point(x, y) for x, y in polyline]
 
+                    # Rotate Shapely Polygons. NOTE: rotation_angle is degrees CLOCKWISE
+                    # (matching rotate_point above, which uses -radians(rotation_angle)), but
+                    # shapely's affinity.rotate treats a positive angle as COUNTER-clockwise.
+                    # Negate so polygons rotate the SAME direction as circles/polylines -
+                    # otherwise a partial-depth pocket ends up mirrored 180deg from the rest
+                    # of the part (overlapping other features).
+                    if 'polygons' in layer_info:
+                        rotated_polygons = []
+                        for poly in layer_info['polygons']:
+                            # Rotate around center point (clockwise, to match rotate_point)
+                            rotated = affinity.rotate(poly, -rotation_angle, origin=(centerX, centerY), use_radians=False)
+                            rotated_polygons.append(rotated)
+                        layer_info['polygons'] = rotated_polygons
+
             # Recalculate bounds after rotation
             all_x = []
             all_y = []
@@ -926,7 +883,13 @@ class FRCPostProcessor:
             offsetX, offsetY = -minX, -maxY
         elif origin_corner == 'top-right':
             offsetX, offsetY = -maxX, -maxY
-        
+
+        # Apply caller-supplied placement offset (multi-part job layout). After the
+        # selected corner is normalized to (0,0), shift the whole part to its sheet
+        # position. Translation does not affect arc IJK (incremental, G91.1).
+        offsetX += placement_offset[0]
+        offsetY += placement_offset[1]
+
         def translate_point(x, y):
             return x + offsetX, y + offsetY
         
@@ -954,6 +917,14 @@ class FRCPostProcessor:
                 # Translate polylines
                 for i, polyline in enumerate(layer_info['polylines']):
                     layer_info['polylines'][i] = [translate_point(x, y) for x, y in polyline]
+
+                # Translate Shapely Polygons
+                if 'polygons' in layer_info:
+                    translated_polygons = []
+                    for poly in layer_info['polygons']:
+                        translated = affinity.translate(poly, xoff=offsetX, yoff=offsetY)
+                        translated_polygons.append(translated)
+                    layer_info['polygons'] = translated_polygons
 
         # Calculate new bounds
         all_x = []
@@ -996,13 +967,68 @@ class FRCPostProcessor:
         machine_x_max = self.config.machine_x_max
         machine_y_max = self.config.machine_y_max
 
-        if part_width > machine_x_max or part_height > machine_y_max:
+        if enforce_bounds and (part_width > machine_x_max or part_height > machine_y_max):
             error_msg = (f"Part dimensions ({part_width:.2f}\" × {part_height:.2f}\") exceed machine bounds "
                         f"({machine_x_max:.1f}\" × {machine_y_max:.1f}\"). "
                         f"Try rotating 90° or reduce part size.")
             self._add_error(error_msg)
             print(f"  ❌ {error_msg}")
-    
+
+    def bounding_box(self) -> Optional[Tuple[float, float, float, float]]:
+        """Return (minX, minY, maxX, maxY) of all current geometry, or None if empty.
+        Reflects the current (already-transformed) coordinates, so multi-part job
+        layout can read each placed part's footprint for validation and rendering."""
+        all_x = []
+        all_y = []
+        for circle in self.circles:
+            cx, cy = circle['center']
+            r = circle.get('radius') or (circle.get('diameter', 0) / 2)
+            all_x.extend([cx - r, cx + r])
+            all_y.extend([cy - r, cy + r])
+        for line in self.lines:
+            all_x.extend([line['start'][0], line['end'][0]])
+            all_y.extend([line['start'][1], line['end'][1]])
+        for arc in self.arcs:
+            r = arc['radius']
+            all_x.extend([arc['center'][0] - r, arc['center'][0] + r])
+            all_y.extend([arc['center'][1] - r, arc['center'][1] + r])
+        for polyline in self.polylines:
+            for x, y in polyline:
+                all_x.append(x)
+                all_y.append(y)
+        if self.layer_data:
+            for layer_info in self.layer_data.values():
+                for circle in layer_info['circles']:
+                    cx, cy = circle['center']
+                    r = circle.get('radius') or (circle.get('diameter', 0) / 2)
+                    all_x.extend([cx - r, cx + r])
+                    all_y.extend([cy - r, cy + r])
+                for polyline in layer_info['polylines']:
+                    for x, y in polyline:
+                        all_x.append(x)
+                        all_y.append(y)
+        if not all_x or not all_y:
+            return None
+        return (min(all_x), min(all_y), max(all_x), max(all_y))
+
+    def placed_polygon(self):
+        """Return a Shapely Polygon of this part's outer perimeter in current
+        (already-transformed) coordinates, for multi-part overlap tests. Uses the
+        identified perimeter when available; otherwise falls back to the bounding
+        rectangle so disjoint parts still get a real-geometry distance check."""
+        if self.perimeter and len(self.perimeter) >= 3:
+            try:
+                poly = Polygon(self.perimeter)
+                if poly.is_valid and not poly.is_empty:
+                    return poly
+            except Exception:
+                pass
+        bbox = self.bounding_box()
+        if not bbox:
+            return None
+        minx, miny, maxx, maxy = bbox
+        return Polygon([(minx, miny), (maxx, miny), (maxx, maxy), (minx, maxy)])
+
     def classify_holes(self):
         """Classify holes by diameter"""
         # Classify all circles as holes (apply size check)
@@ -1012,22 +1038,24 @@ class FRCPostProcessor:
             diameter = circle['diameter']
             center = circle['center']
 
-            # Check if hole is too small to mill with this tool
-            if diameter < self.tool_diameter:
+            # Reject only holes genuinely smaller than the tool (with a tolerance so a hole
+            # that is essentially the tool diameter - within unit-conversion/DXF rounding -
+            # is drilled, not rejected). A hole at the tool size is made by plunging straight
+            # down (peck drill), not milling.
+            if diameter < self.tool_diameter - self.hole_size_tolerance:
                 error_msg = f"Hole at ({center[0]:.3f}, {center[1]:.3f}) has diameter {diameter:.3f}\" which is too small for {self.tool_diameter:.3f}\" tool"
                 self._add_error(error_msg)
                 continue
 
             # Determine machining strategy based on hole size
             if diameter < self.min_millable_hole:
-                # Hole is larger than tool but too small to helical entry
-                # Use peck drilling to get down, then spiral clear at bottom
-                strategy = 'peck+spiral'
+                # Hole is tool-sized up to (but not big enough for) helical entry: peck drill
+                # straight down, then spiral-clear at the bottom if there is material to clear
+                # (a hole exactly the tool size is a pure plunge with no clearing).
                 self.holes.append({'center': center, 'diameter': diameter, 'needs_peck_drill': True})
                 print(f"  Hole (d={diameter:.3f}\") at ({center[0]:.3f}, {center[1]:.3f}) - using peck drill + spiral")
             else:
                 # Hole is large enough for helical entry
-                strategy = 'helical+spiral'
                 self.holes.append({'center': center, 'diameter': diameter, 'needs_peck_drill': False})
                 print(f"  Hole (d={diameter:.3f}\") at ({center[0]:.3f}, {center[1]:.3f}) - using helical + spiral")
 
@@ -1166,10 +1194,16 @@ class FRCPostProcessor:
 
     def identify_perimeter_and_pockets(self):
         """Identify the outer perimeter and any inner pockets"""
-        # Collect all closed paths: polylines OR circles (converted to polylines)
-        # Only use circles as perimeter candidates if there are NO polylines
+        # Collect all closed paths as perimeter candidates: polylines AND circles.
+        # Circles must be candidates even when polylines are present, because a
+        # round part's OUTER boundary is a circle while its interior features
+        # (bore, slots, lightening cuts) are polylines - the perimeter is the
+        # largest boundary of EITHER kind. (Non-perimeter circles still stay holes,
+        # not pockets; see the pocket assignment below.) Previously circles were
+        # only considered when NO polylines existed, so a round part with any
+        # interior polyline had its circular perimeter ignored and mis-detected.
         all_paths = []
-        circle_to_path_map = {}  # Track which circles were converted to paths
+        circle_to_path_map = {}  # Track which paths came from circles (path idx -> circle idx)
 
         # Add existing polylines
         polyline_count = 0
@@ -1177,9 +1211,8 @@ class FRCPostProcessor:
             all_paths.extend(self.polylines)
             polyline_count = len(self.polylines)
 
-        # Convert circles to polylines ONLY if there are no existing polylines
-        # (e.g., for a washer with just two concentric circles)
-        if not self.polylines and hasattr(self, 'circles') and self.circles:
+        # Add circles as candidates too (tessellated to polylines)
+        if hasattr(self, 'circles') and self.circles:
             for i, circle in enumerate(self.circles):
                 try:
                     cx, cy = circle['center']
@@ -1187,16 +1220,9 @@ class FRCPostProcessor:
                     if r <= 0:
                         continue
                     # Create polyline from circle (50 points)
-                    points = []
-                    for j in range(50):
-                        angle = (j / 50) * 2 * math.pi
-                        x = cx + r * math.cos(angle)
-                        y = cy + r * math.sin(angle)
-                        points.append((x, y))
-                    path_idx = len(all_paths)
+                    points = self._tessellate_circle(cx, cy, r)
+                    circle_to_path_map[len(all_paths)] = i
                     all_paths.append(points)
-                    # Map path index to circle index
-                    circle_to_path_map[path_idx] = i
                 except (KeyError, TypeError):
                     # Skip circles with missing/invalid data
                     continue
@@ -1213,7 +1239,7 @@ class FRCPostProcessor:
                 poly = Polygon(points)
                 if poly.is_valid:
                     polygons.append((poly, points, path_idx))
-            except:
+            except Exception:
                 pass
 
         if not polygons:
@@ -1251,44 +1277,178 @@ class FRCPostProcessor:
 
         self.perimeter = candidate_perimeter
 
-        # For circles-as-perimeter (no polylines), don't treat other circles as pockets
-        # They should remain as holes. Only actual polylines can be pockets.
-        if polyline_count > 0:
-            # Normal case: we have polylines, add remaining ones as pockets
-            self.pockets = [p[1] for p in polygons[1:]]
-        else:
-            # Circles-only case (like a washer): no pockets, keep inner circles as holes
-            self.pockets = []
+        # Pockets are polyline-derived regions only (excluding whichever one is the
+        # perimeter). Circles that aren't the perimeter remain holes, never pockets -
+        # so a washer's inner circle and a round part's bolt holes stay holes.
+        self.pockets = [points for (poly, points, path_idx) in polygons[1:]
+                        if path_idx not in circle_to_path_map]
 
-        # Remove circles that were used as perimeter from self.circles
-        circles_to_remove = set()
-
-        # Check if perimeter came from a circle - if so, remove it
+        # If the perimeter itself came from a circle (round part / washer), drop that
+        # circle from self.circles so it isn't also machined as a hole.
         if perimeter_path_idx in circle_to_path_map:
-            circles_to_remove.add(circle_to_path_map[perimeter_path_idx])
-
-        # If we created pockets from circles (only when polyline_count > 0), remove those too
-        if polyline_count > 0:
-            for poly, points, path_idx in polygons[1:]:
-                if path_idx in circle_to_path_map:
-                    circles_to_remove.add(circle_to_path_map[path_idx])
-
-        # Remove circles in reverse order to avoid index issues
-        if circles_to_remove:
-            self.circles = [c for i, c in enumerate(self.circles) if i not in circles_to_remove]
-            print(f"  Removed {len(circles_to_remove)} circle(s) that were identified as perimeter/pockets")
+            perimeter_circle_idx = circle_to_path_map[perimeter_path_idx]
+            self.circles = [c for i, c in enumerate(self.circles) if i != perimeter_circle_idx]
+            print(f"  Removed 1 circle that was identified as the perimeter")
 
         print(f"\nIdentified perimeter and {len(self.pockets)} pockets")
 
         # Sort pockets to minimize travel time
         self._sort_pockets()
-    
-    def generate_gcode(self, suggested_filename: str = None, timestamp: str = None) -> PostProcessorResult:
+
+    def _generate_interior_gcode(self, emit_contour_pauses: bool) -> List[str]:
+        """Generate the interior-feature toolpath (holes + pockets) for this part.
+
+        This is phase "A" of a part: all circular holes (helical/peck + spiral clearing,
+        or contouring for large through-holes) followed by all pockets (fully cleared or
+        contoured). Returns only the toolpath lines - no header/footer/perimeter.
+
+        Args:
+            emit_contour_pauses: when True, emit the standalone "PAUSE FOR FIXTURING"
+                sequence before contoured holes/pockets (single-part behavior, gated by
+                pause_before_perimeter). The multi-part job assembler passes False because
+                it emits a single shared pause between all interiors and all perimeters.
+        """
+        gcode = []
+
+        # Holes (all circular features - helical entry + spiral clearing, or contouring for large holes)
+        if self.holes:
+            gcode.append("(===== HOLES =====)")
+
+            # Check if this is a through-cut (to sacrifice board)
+            # Only contour through-cuts; partial-depth features must be fully cleared
+            is_through_cut = self.cut_depth <= 0  # At or below Z=0 means cutting into sacrifice board
+
+            # Separate holes into contoured and cleared based on size
+            contoured_holes = []
+            cleared_holes = []
+
+            for i, hole in enumerate(self.holes, 1):
+                center = hole['center']
+                diameter = hole['diameter']
+                needs_peck = hole.get('needs_peck_drill', False)
+
+                # Calculate hole area: π × r²
+                hole_area = math.pi * (diameter / 2) ** 2
+
+                threshold_area = self._contour_threshold_area()
+
+                # Only contour if it's a through-cut AND exceeds size threshold
+                if is_through_cut and hole_area > threshold_area:
+                    contoured_holes.append((i, hole, hole_area))
+                    gcode.append(f"(Hole {i} - {diameter:.3f}\" diameter, {hole_area:.3f} sq in > {threshold_area:.3f} sq in threshold - will contour through-cut)")
+                else:
+                    cleared_holes.append((i, hole, needs_peck))
+                    strategy = "peck + spiral" if needs_peck else "helical + spiral"
+                    reason = "(partial depth)" if not is_through_cut else ""
+                    gcode.append(f"(Hole {i} - {diameter:.3f}\" diameter, {hole_area:.3f} sq in - {strategy} {reason})")
+
+            # Process cleared holes first
+            if cleared_holes:
+                gcode.append("")
+                gcode.append("(--- Cleared holes ---)")
+                for i, hole, needs_peck in cleared_holes:
+                    center = hole['center']
+                    diameter = hole['diameter']
+                    gcode.extend(self._generate_hole_gcode(center[0], center[1], diameter, needs_peck_drill=needs_peck))
+                    gcode.append("")
+
+            # Process contoured holes (with optional pause for fixturing)
+            if contoured_holes:
+                # Optional pause before contoured holes for teams using screw fixturing
+                # Same logic as perimeter/pockets - any operation with tabs needs secure fixturing
+                if emit_contour_pauses:
+                    gcode.extend(self._generate_pause_and_park_gcode(
+                        'PAUSE FOR FIXTURING',
+                        [
+                            'Cleared holes complete',
+                            'Install screws through holes into sacrifice board',
+                            'Fixture part securely before contouring large holes'
+                        ]
+                    ))
+
+                gcode.append("")
+                gcode.append("(--- Contoured holes - manual removal required ---)")
+                for i, hole, area in contoured_holes:
+                    center = hole['center']
+                    diameter = hole['diameter']
+
+                    # Generate circular points for contouring (50-segment tessellation)
+                    circle_points = self._tessellate_circle(center[0], center[1], diameter / 2)
+
+                    gcode.append(f"(Hole {i} - {diameter:.3f}\" dia, {area:.3f} sq in - CONTOUR ONLY)")
+                    gcode.extend(self._generate_pocket_contour_gcode(circle_points))
+                    gcode.append("")
+
+        # Pockets
+        if self.pockets:
+            gcode.append("(===== POCKETS =====)")
+
+            # Check if this is a through-cut (to sacrifice board)
+            # Only contour through-cuts; partial-depth features must be fully cleared
+            is_through_cut = self.cut_depth <= 0  # At or below Z=0 means cutting into sacrifice board
+
+            # Separate pockets into contoured and fully cleared based on size
+            contoured_pockets = []
+            cleared_pockets = []
+
+            for i, pocket in enumerate(self.pockets, 1):
+                pocket_poly = Polygon(pocket)
+                pocket_area = pocket_poly.area
+
+                threshold_area = self._contour_threshold_area()
+
+                # Only contour if it's a through-cut AND exceeds size threshold
+                if is_through_cut and pocket_area > threshold_area:
+                    contoured_pockets.append((i, pocket, pocket_area))
+                    gcode.append(f"(Pocket {i}: {pocket_area:.3f} sq in > {threshold_area:.3f} sq in threshold - will contour through-cut)")
+                else:
+                    cleared_pockets.append((i, pocket, pocket_area))
+                    reason = "- partial depth" if not is_through_cut else "- below threshold"
+                    gcode.append(f"(Pocket {i}: {pocket_area:.3f} sq in - will fully clear {reason})")
+
+            # Process fully cleared pockets first
+            if cleared_pockets:
+                gcode.append("")
+                gcode.append("(--- Fully cleared pockets ---)")
+                for i, pocket, area in cleared_pockets:
+                    gcode.append(f"(Pocket {i} - {area:.3f} sq in)")
+                    gcode.extend(self._generate_pocket_gcode(pocket))
+                    gcode.append("")
+
+            # Process contoured pockets (with optional pause for fixturing)
+            if contoured_pockets:
+                # Optional pause before pocket contours for teams using screw fixturing
+                # Same logic as perimeter - any operation with tabs needs secure fixturing
+                if emit_contour_pauses:
+                    gcode.extend(self._generate_pause_and_park_gcode(
+                        'PAUSE FOR FIXTURING',
+                        [
+                            'Cleared pockets complete',
+                            'Install screws through holes into sacrifice board',
+                            'Fixture part securely before contouring large pockets'
+                        ]
+                    ))
+
+                gcode.append("")
+                gcode.append("(--- Contoured pockets - manual removal required ---)")
+                for i, pocket, area in contoured_pockets:
+                    gcode.append(f"(Pocket {i} - {area:.3f} sq in - CONTOUR ONLY)")
+                    gcode.extend(self._generate_pocket_contour_gcode(pocket))
+                    gcode.append("")
+
+        return gcode
+
+    def generate_gcode(self, suggested_filename: str = None, timestamp: str = None,
+                       include_header_footer: bool = True) -> PostProcessorResult:
         """
         Generate complete G-code for standard plate operations (single or multi-layer)
 
         Args:
             suggested_filename: Optional filename (without timestamp, will be added)
+            include_header_footer: when False, return only the feature toolpath body
+                (no header/footer). Defaults to True (normal single-part output).
+                (Multi-part jobs no longer use this - they call generate_part_phases and
+                assemble_job_gcode collates the phases across parts.)
 
         Returns:
             PostProcessorResult with gcode string and stats
@@ -1311,30 +1471,16 @@ class FRCPostProcessor:
         if not timestamp:
             timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        # Generate header
-        gcode = self._generate_gcode_header(timestamp, is_multilayer=False)
+        # Generate header (skipped for job-body mode; assemble_job_gcode adds one shared header)
+        gcode = self._generate_gcode_header(timestamp, is_multilayer=False) if include_header_footer else []
         warnings = []
 
-        # Holes (all circular features - helical entry + spiral clearing)
-        if self.holes:
-            gcode.append("(===== HOLES =====)")
-            for i, hole in enumerate(self.holes, 1):
-                center = hole['center']
-                diameter = hole['diameter']
-                needs_peck = hole.get('needs_peck_drill', False)
-                strategy = "peck + spiral" if needs_peck else "helical + spiral"
-                gcode.append(f"(Hole {i} - {diameter:.3f}\" diameter - {strategy})")
-                gcode.extend(self._generate_hole_gcode(center[0], center[1], diameter, needs_peck_drill=needs_peck))
-                gcode.append("")
-        
-        # Pockets
-        if self.pockets:
-            gcode.append("(===== POCKETS =====)")
-            for i, pocket in enumerate(self.pockets, 1):
-                gcode.append(f"(Pocket {i})")
-                gcode.extend(self._generate_pocket_gcode(pocket))
-                gcode.append("")
-        
+        # Interior features (holes + pockets). Extracted to a shared helper so the
+        # multi-part job assembler can collate interiors across parts. In single-part
+        # output the contoured-feature fixturing pauses still fire when
+        # pause_before_perimeter is set (unchanged behavior).
+        gcode.extend(self._generate_interior_gcode(emit_contour_pauses=self.pause_before_perimeter))
+
         # Perimeter (with optional pause for screw fixturing)
         if self.perimeter:
             # Optional pause before perimeter for teams using screw fixturing
@@ -1357,32 +1503,18 @@ class FRCPostProcessor:
             gcode.extend(self._generate_perimeter_gcode(self.perimeter))
             gcode.append("")
 
-        # Footer
-        gcode.extend(self._generate_gcode_footer())
+        # Footer (skipped for job-body mode; assemble_job_gcode adds one shared footer)
+        if include_header_footer:
+            gcode.extend(self._generate_gcode_footer())
 
         # Calculate estimated cycle time
         time_estimate = self._estimate_cycle_time(gcode)
 
         # Add cycle time to header (insert after the operations section)
-        for i, line in enumerate(gcode):
-            if line.startswith("(Operations:"):
-                # Find where to insert (after "No straight plunges")
-                insert_idx = i + 3  # After Operations, Helical angle, No straight plunges
-                time_lines = [
-                    "",
-                    f"(Estimated cycle time: {self._format_time(time_estimate['total'])})",
-                    f"(  Cutting: {self._format_time(time_estimate['cutting'])}, Rapids: {self._format_time(time_estimate['rapid'])}, Spindle: {self._format_time(time_estimate['dwell'])})",
-                    "(  Note: Estimate does not include acceleration/deceleration)"
-                ]
-                for j, time_line in enumerate(time_lines):
-                    gcode.insert(insert_idx + j, time_line)
-                break
+        self._insert_cycle_time_comment(gcode, time_estimate)
 
-        # Generate filename with timestamp
-        base_name = suggested_filename if suggested_filename else "output"
-        # Format timestamp for filename: YYYYMMDD_HHMMSS
-        timestamp_for_file = timestamp.replace('-', '').replace(' ', '_').replace(':', '')
-        filename = f"{base_name}_{timestamp_for_file}.nc"
+        # Generate filename with timestamp (name sanitized for safe disk write + download)
+        filename = build_output_filename(suggested_filename, timestamp, "output")
 
         # Return result
         return PostProcessorResult(
@@ -1403,8 +1535,149 @@ class FRCPostProcessor:
             }
         )
 
-    def _generate_gcode_header(self, timestamp: str = None, is_multilayer: bool = False) -> List[str]:
-        """Generate common G-code header (comments + initialization)"""
+    def generate_part_phases(self) -> dict:
+        """Produce this part's toolpath split into the three job phases.
+
+        Used by the multi-part job assembler (assemble_job_gcode) so it can collate
+        phases across all parts: all interiors, then one shared refixturing pause, then
+        all perimeters, then all tab removals. For a single-part job this reproduces the
+        normal single-part order.
+
+        No per-feature fixturing pauses are emitted here - the job assembler emits a
+        single shared pause between the interior and perimeter phases. Assumes a
+        single-layer part (multi-part jobs are 2D standard mode; 2.5D is single-part).
+
+        Returns a dict:
+            {'interior': [str], 'perimeter': [str], 'tab_removal': [str], 'errors': [str]}
+        Coordinates are already in absolute job space (transform_coordinates applied the
+        placement offset), so phases from different parts can be freely interleaved.
+        """
+        # Fail fast on pre-existing validation errors (same guard as generate_gcode).
+        if self.errors:
+            return {'interior': [], 'perimeter': [], 'tab_removal': [],
+                    'errors': self.errors.copy()}
+
+        if self.layer_data:
+            return {'interior': [], 'perimeter': [], 'tab_removal': [],
+                    'errors': ['Multi-part jobs support single-layer (2D) parts only; '
+                               'this part has multiple depth layers (2.5D).']}
+
+        self._deferred_tab_positions = []
+
+        # Each phase is assembled under its own "Safe Z between parts" move (see
+        # _emit_phase), so the tool starts each phase up at safe height: flag the first
+        # feature of each to rapid down to the clearance plane before its plunge feed.
+
+        # Phase A: interiors (holes + pockets), no per-feature pauses.
+        self._pending_clearance_rapid = True
+        interior = self._generate_interior_gcode(emit_contour_pauses=False)
+
+        # Phase C: perimeter cut, deferring tab removal to phase D.
+        perimeter = []
+        if self.perimeter:
+            self._pending_clearance_rapid = True
+            if self.tabs_enabled:
+                perimeter.append("(===== PERIMETER WITH TABS =====)")
+            else:
+                perimeter.append("(===== PERIMETER (NO TABS) =====)")
+            perimeter.extend(self._generate_perimeter_gcode(self.perimeter, defer_tab_removal=True))
+
+        # Phase D: tab removal, using the positions captured during the perimeter pass.
+        tab_removal = []
+        if self.config.remove_tabs and self._deferred_tab_positions:
+            tab_removal = self._generate_tab_removal_gcode(self._deferred_tab_positions)
+
+        return {'interior': interior, 'perimeter': perimeter,
+                'tab_removal': tab_removal, 'errors': list(self.errors)}
+
+    # ---- Portability helpers: work-coordinate safe moves + optional coolant/park -------
+    # Everything below emits G54 work-coordinate G-code by default. Machine-coordinate
+    # (G53) motion appears ONLY when a park_position is configured, and coolant M-codes
+    # ONLY when a coolant type is configured - so the default output runs on GRBL, Easel,
+    # WinCNC, Mach, etc.
+
+    def _safe_z(self) -> float:
+        """Work-coordinate (G54) safe retract height above Z=0 (sacrifice board). Uses the
+        configured machine ceiling when set, but never below the material + clearance so a
+        thick part can't collide on the retract."""
+        floor = self.retract_height  # material_thickness + clearance (or max_depth + clearance in 2.5D)
+        return max(floor, self.safe_clearance_height or 0.0)
+
+    def _coolant_on_gcode(self):
+        """Coolant-start line for the configured coolant type, or None if no coolant is set.
+        Air/Mist -> M7 (mist output, e.g. air blast), Flood -> M8."""
+        coolant = (self.machine_coolant or '').strip().lower()
+        code = 'M7' if coolant in ('air', 'mist') else ('M8' if coolant == 'flood' else None)
+        return f'{code}  ; Coolant on ({self.machine_coolant})' if code else None
+
+    def _coolant_off_gcode(self):
+        """Coolant-stop line (M9), or None if no coolant is configured."""
+        coolant = (self.machine_coolant or '').strip().lower()
+        return 'M9  ; Coolant off' if coolant in ('air', 'mist', 'flood') else None
+
+    def _park_gcode(self, comment: str = 'Park'):
+        """G53 machine-coordinate park (raise Z, then move the gantry to the fixed park
+        spot) - ONLY when park_position is configured. Returns [] otherwise, keeping the
+        program G54-only and portable. Callers should already be at a safe work Z."""
+        if not self.park_position:
+            return []
+        px, py, pz = self.park_position
+        return [
+            f'G53 G0 Z{pz:.4f}  ; {comment}: raise to safe machine Z',
+            f'G53 G0 X{px} Y{py}  ; {comment}: move gantry to park position',
+        ]
+
+    def _tube_wcs_activate_gcode(self) -> str:
+        """The work-coordinate-system line that opens a tube program. Default G54 (the
+        operator zeros it to the tube for this job); an alternate fixed WCS (e.g. G55) is
+        opt-in for a permanently-fixtured jig whose zero persists in its own system."""
+        if self.tube_wcs == 'G54':
+            return f'{self.tube_wcs}  ; Work coordinate system, zeroed at the tube origin'
+        return f'{self.tube_wcs}  ; Use fixed jig work coordinate system'
+
+    def _tube_wcs_reset_gcode(self):
+        """Reset back to the standard G54 WCS at program end - only needed when the tube job
+        actually switched to an alternate fixed WCS. Returns None for the G54 default (there
+        was nothing to switch away from), keeping that output minimal."""
+        if self.tube_wcs == 'G54':
+            return None
+        return 'G54  ; Reset to standard work coordinate system'
+
+    def _tube_wcs_setup_instruction(self) -> str:
+        """Plain-text instruction for how the operator establishes the tube origin, matched
+        to the configured WCS. Shared by the G-code header comment and the UI setup list."""
+        if self.tube_wcs == 'G54':
+            return 'Zero G54 at the tube origin for this job'
+        return f'Verify {self.tube_wcs} is set to the fixed jig origin'
+
+    def _tube_wcs_setup_comment(self) -> str:
+        """The numbered G-code header comment wrapping the WCS setup instruction."""
+        return f'( 2. {self._tube_wcs_setup_instruction()} )'
+
+    def _approach_ramp_start(self, ramp_start_height: float) -> List[str]:
+        """Emit the Z approach down to the ramp-start height (just above the stock), where
+        the helical/ramp entry begins.
+
+        Between features the tool is already parked at the clearance plane
+        (retract_height), so this is a single slow feed covering only the small air gap
+        down to ramp start. But at job start (and after any pause/park) the tool sits up at
+        safe height, potentially several inches up; feeding that whole gap at approach_rate
+        wastes time. In that case, first rapid (G0) down to the clearance plane so the slow
+        feed only covers the last bit of air above the stock."""
+        lines = []
+        if self._pending_clearance_rapid:
+            lines.append(f"G0 Z{self.retract_height:.4f}  ; Rapid down to clearance plane")
+            self._pending_clearance_rapid = False
+        lines.append(f"G1 Z{ramp_start_height:.4f} F{self.approach_rate}  ; Approach to ramp start height")
+        return lines
+
+    def _generate_gcode_header(self, timestamp: str = None, is_multilayer: bool = False,
+                               is_job: bool = False, job_part_count: int = None) -> List[str]:
+        """Generate common G-code header (comments + initialization).
+
+        is_job: emit a single shared header for a multi-part job (one spindle start,
+        one WCS, one safe-Z) instead of a per-part header. job_part_count is shown
+        in the comments. Multi-part jobs are single-layer (2.5D is single-part)."""
         gcode = []
 
         # Use provided timestamp or generate one
@@ -1416,6 +1689,8 @@ class FRCPostProcessor:
         gcode.append(f"({self.team_name.upper()} - Team {self.team_number})")
         if is_multilayer:
             gcode.append("(PenguinCAM CNC Post-Processor - MULTI-LAYER)")
+        elif is_job:
+            gcode.append("(PenguinCAM CNC Post-Processor - MULTI-PART JOB)")
         else:
             gcode.append("(PenguinCAM CNC Post-Processor)")
 
@@ -1456,6 +1731,9 @@ class FRCPostProcessor:
         gcode.append(f"(Tool: {self.tool_diameter}\" diam Flat End Mill)")
         gcode.append(f"(Spindle: {self.spindle_speed} RPM)")
 
+        if is_job and job_part_count is not None:
+            gcode.append(f"(Parts in job: {job_part_count})")
+
         if is_multilayer:
             if hasattr(self, 'layer_data'):
                 gcode.append(f"(Layers: {len(self.layer_data)} depths)")
@@ -1471,14 +1749,20 @@ class FRCPostProcessor:
             gcode.append("")
 
             # Operations
-            operations = []
-            if self.holes:
-                operations.append("Holes")
-            if self.pockets:
-                operations.append("Pockets")
-            if self.perimeter:
-                operations.append("Profile")
-            operations_str = ", ".join(operations) if operations else "None"
+            if is_job:
+                # Per-part operations are listed in each PART section; the job-level
+                # header just records that this is a multi-part program. No nested parens
+                # in the comment (CNC controllers choke on them).
+                operations_str = f"Multi-part job - {job_part_count} parts"
+            else:
+                operations = []
+                if self.holes:
+                    operations.append("Holes")
+                if self.pockets:
+                    operations.append("Pockets")
+                if self.perimeter:
+                    operations.append("Profile")
+                operations_str = ", ".join(operations) if operations else "None"
 
             helical_angle = f"~{int(self.ramp_angle)} deg"
 
@@ -1512,7 +1796,9 @@ class FRCPostProcessor:
 
         # Spindle on
         gcode.append(f"S{self.spindle_speed} M3  ; Spindle on" + ("" if is_multilayer else f" at {self.spindle_speed} RPM"))
-        gcode.append("M7  ; Air blast on")
+        coolant_on = self._coolant_on_gcode()
+        if coolant_on:
+            gcode.append(coolant_on)
         gcode.append("G4 P2  ; Wait" + (" for spindle" if is_multilayer else " 2 seconds for spindle to reach speed"))
         gcode.append("")
 
@@ -1520,10 +1806,16 @@ class FRCPostProcessor:
         gcode.append("G54  ; " + ("Work coordinate system" if is_multilayer else "Use work coordinate system 1"))
         gcode.append("")
 
-        # Initial positioning (stay high to avoid fixture collisions during XY moves)
-        gcode.append(f"G53 G0 Z{self.machine_park_z:.4f}  ; " + ("Safe Z clearance" if is_multilayer else "Move to safe machine Z clearance"))
+        # Initial positioning: retract to a safe height in WORK coordinates (G54) so this
+        # is portable across controllers - no G53 machine move (which assumes machine Z=0
+        # is a safe high position, an assumption that breaks on GRBL/Easel/WinCNC).
+        gcode.append(f"G0 Z{self._safe_z():.4f}  ; Safe Z clearance")
         gcode.append("G0 X0 Y0  ; " + ("Origin" if is_multilayer else "Rapid to work origin"))
         gcode.append("")
+
+        # Tool is parked at safe height; the first feature must rapid down to the
+        # clearance plane before its slow plunge feed (see _approach_ramp_start).
+        self._pending_clearance_rapid = True
 
         return gcode
 
@@ -1531,55 +1823,206 @@ class FRCPostProcessor:
         """Generate common G-code footer (safe moves + shutdown)"""
         gcode = []
         gcode.append("(===== FINISH =====)")
-        gcode.append(f"G53 G0 Z{self.machine_park_z:.4f}  ; Move to safe machine Z clearance")
-        gcode.append("M9  ; Air blast off")
+        gcode.append(f"G0 Z{self._safe_z():.4f}  ; Safe Z clearance")
+        coolant_off = self._coolant_off_gcode()
+        if coolant_off:
+            gcode.append(coolant_off)
         gcode.append("M5  ; Spindle off")
-        gcode.append(f"G53 G0 X{self.machine_park_x} Y{self.machine_park_y}  ; Move gantry to back of machine for easy access")
+        gcode.extend(self._park_gcode('Park for part access'))  # G53 park only if configured
         gcode.append("M30  ; Program end")
         gcode.append("")
         return gcode
 
-    def _geometries_to_shapely(self, circles, polylines):
-        """Convert circles and polylines to shapely geometries"""
-        from shapely.geometry import Polygon, Point
-        from shapely.ops import unary_union
+    def _convert_to_shapely_polygons(self, circles, polylines):
+        """
+        Convert circles and polylines to Shapely Polygon objects.
+        Handles HATCH entities (multiple boundaries = polygon with holes).
+        Detects concentric circles and creates ring polygons.
 
-        geoms = []
+        Args:
+            circles: List of circle dicts with 'center' and 'radius'
+            polylines: List of polyline coordinate lists
 
-        # Convert circles to polygons (buffered points)
-        for circle in circles:
-            center = circle['center']
-            radius = circle['radius']
-            geoms.append(Point(center).buffer(radius))
+        Returns:
+            List of Shapely Polygon objects (may have interior holes)
+        """
+        polygons = []
+        # Simple (single-loop) shapes that still need containment/nesting resolution.
+        # Concentric-circle rings are resolved directly into `polygons` below.
+        simple_polys = []
 
-        # Convert polylines to polygons
+        # Detect concentric circles (same center, different radii)
+        # These should become ring polygons (donut shapes with holes)
+        used_circles = set()
+
+        for i, circle1 in enumerate(circles):
+            if i in used_circles:
+                continue
+
+            center1 = circle1['center']
+            radius1 = circle1['radius']
+
+            # Look for concentric circles
+            concentric_group = [circle1]
+            for j, circle2 in enumerate(circles):
+                if i == j or j in used_circles:
+                    continue
+
+                center2 = circle2['center']
+                radius2 = circle2['radius']
+
+                # Check if centers are the same (within tolerance)
+                dx = abs(center1[0] - center2[0])
+                dy = abs(center1[1] - center2[1])
+                if dx < 0.001 and dy < 0.001:
+                    # Concentric!
+                    concentric_group.append(circle2)
+                    used_circles.add(j)
+
+            used_circles.add(i)
+
+            # Create polygon(s) from this group
+            if len(concentric_group) == 1:
+                # Single circle - simple filled polygon.
+                # Defer to nesting so a circle that sits inside a polygonal pocket
+                # (or vice versa) becomes an island/hole rather than an overlapping solid.
+                poly = Point(center1).buffer(radius1)
+                simple_polys.append(poly)
+            else:
+                # Multiple concentric circles - create ring with holes
+                # Sort by radius (largest first)
+                concentric_group.sort(key=lambda c: c['radius'], reverse=True)
+
+                # Outer boundary is the largest circle
+                outer_circle = concentric_group[0]
+                outer_poly = Point(outer_circle['center']).buffer(outer_circle['radius'])
+
+                # Interior holes are the other circles
+                holes = []
+                for inner_circle in concentric_group[1:]:
+                    inner_poly = Point(inner_circle['center']).buffer(inner_circle['radius'])
+                    # Get exterior coords as hole
+                    hole_coords = list(inner_poly.exterior.coords)
+                    holes.append(hole_coords)
+
+                # Create polygon with holes
+                outer_coords = list(outer_poly.exterior.coords)
+                ring_poly = Polygon(outer_coords, holes=holes)
+                if ring_poly.is_valid:
+                    polygons.append(ring_poly)
+                    print(f"      Detected concentric circles: outer r={outer_circle['radius']:.3f}\", {len(holes)} inner hole(s)")
+
+        # Add polyline loops to the simple-shape pool.
         for polyline in polylines:
             if len(polyline) >= 3:
                 try:
                     poly = Polygon(polyline)
-                    if poly.is_valid:
-                        geoms.append(poly)
-                except:
+                    if poly.is_valid and not poly.is_empty:
+                        simple_polys.append(poly)
+                except Exception:
                     pass
 
-        if geoms:
-            return unary_union(geoms)
-        return None
+        # Resolve containment across all simple loops at once: an enclosed loop
+        # becomes an interior hole of its parent, and a loop enclosed by a hole
+        # becomes a solid island. Handles HATCH faces with any number of boundaries
+        # (e.g. a pocket containing two raised bosses), which the old 2-loop
+        # special case flattened into overlapping solids.
+        polygons.extend(self._nest_polygons(simple_polys))
+
+        return polygons
+
+    def _nest_polygons(self, polys):
+        """Resolve a flat list of single-loop polygons into solids-with-holes using
+        even/odd containment depth.
+
+        Loops at even nesting depth (0, 2, ...) are solid regions; loops at odd
+        depth are holes in their enclosing solid. A solid's holes are its direct
+        children; grandchildren (islands within a hole) are emitted as their own
+        solids. Falls back to treating a loop as a separate solid if its nested
+        construction is invalid.
+
+        Args:
+            polys: list of valid Shapely Polygons (exterior loops only)
+
+        Returns:
+            List of Shapely Polygons, some carrying interior holes.
+        """
+        candidates = [p for p in polys if p is not None and p.is_valid and not p.is_empty]
+        if not candidates:
+            return []
+
+        # Largest first so a polygon's potential parents are already indexed.
+        candidates.sort(key=lambda p: p.area, reverse=True)
+
+        n = len(candidates)
+        parent = [None] * n  # index of immediate (smallest) enclosing polygon
+        for i in range(n):
+            inner = candidates[i]
+            # representative_point is guaranteed inside the polygon, robust for containment
+            probe = inner.representative_point()
+            best_parent = None
+            best_area = None
+            for j in range(n):
+                if j == i:
+                    continue
+                outer = candidates[j]
+                if outer.area <= inner.area:
+                    continue
+                if outer.contains(probe):
+                    if best_area is None or outer.area < best_area:
+                        best_area = outer.area
+                        best_parent = j
+            parent[i] = best_parent
+
+        # Nesting depth = number of ancestors.
+        def depth_of(idx):
+            d = 0
+            cur = parent[idx]
+            while cur is not None:
+                d += 1
+                cur = parent[cur]
+            return d
+
+        depth = [depth_of(i) for i in range(n)]
+
+        results = []
+        for i in range(n):
+            if depth[i] % 2 != 0:
+                # Odd depth -> this loop is a hole, consumed by its even-depth parent.
+                continue
+            # Even depth -> solid. Its holes are direct children (odd depth).
+            hole_rings = [
+                list(candidates[c].exterior.coords)
+                for c in range(n)
+                if parent[c] == i
+            ]
+            exterior = list(candidates[i].exterior.coords)
+            if hole_rings:
+                try:
+                    solid = Polygon(exterior, holes=hole_rings)
+                    if solid.is_valid and not solid.is_empty:
+                        results.append(solid)
+                        continue
+                except Exception:
+                    pass
+                # Fallback: emit the exterior solid without holes rather than lose it.
+                results.append(Polygon(exterior))
+            else:
+                results.append(candidates[i])
+
+        return results
 
     def _subtract_geometry(self, circles, polylines, cut_geometry):
         """
-        Subtract already-cut geometry from circles and polylines.
+        Subtract geometry from circles and polylines.
+        Used to remove areas that will be (or have been) cut by other operations.
         Returns new lists with subtracted geometry.
         """
         if cut_geometry is None or cut_geometry.is_empty:
             return circles, polylines
 
-        from shapely.geometry import Polygon, Point, MultiPolygon
-
         new_circles = []
         new_polylines = []
-
-        print(f"  Subtracting already-cut geometry from deeper layers...")
 
         # Process circles
         for circle in circles:
@@ -1590,9 +2033,9 @@ class FRCPostProcessor:
             # Subtract already cut areas
             result = circle_geom.difference(cut_geometry)
 
-            # If circle is completely cut, skip it
+            # If circle is completely covered by cut geometry, skip it
             if result.is_empty or result.area < 0.0001:
-                print(f"    Circle at {center} already cut - skipping")
+                print(f"    Circle at {center} fully removed by subtraction - skipping")
                 continue
 
             # If circle remains mostly intact (>90% area), keep it as-is
@@ -1624,9 +2067,9 @@ class FRCPostProcessor:
                 # Subtract already cut areas
                 result = poly.difference(cut_geometry)
 
-                # If completely cut, skip
+                # If completely covered by cut geometry, skip
                 if result.is_empty or result.area < 0.0001:
-                    print(f"    Polyline already cut - skipping")
+                    print(f"    Polyline fully removed by subtraction - skipping")
                     continue
 
                 # Extract remaining geometry
@@ -1657,6 +2100,43 @@ class FRCPostProcessor:
         print(f"    After:  {len(new_circles)} circles, {len(new_polylines)} polylines")
 
         return new_circles, new_polylines
+
+    def _dissolve_thin_islands(self, polygon, min_wall, deeper_geom):
+        """Drop interior islands that leave a too-thin wall AND are removed by a deeper pass.
+
+        An island in a sliced layer is one of two things:
+        (a) a region carved out by subtracting a DEEPER layer - that material is
+            removed by the deeper pass regardless, so keeping the island is purely an
+            efficiency choice (avoid re-cutting what a deeper pass clears); or
+        (b) a native designed hole at THIS depth (e.g. a real ring groove) whose
+            interior is kept material.
+        Only (a) is safe to dissolve. When keeping an (a) island would leave a wall
+        too thin for the tool, dissolve it: the shallow pass mills across it and the
+        deeper pass still removes it, so the finished part is unchanged. A too-thin
+        (b) island is a genuine "groove too narrow" error and must be preserved.
+        `deeper_geom` is the deeper-cut region actually subtracted during slicing (or
+        None); an island counts as (a) only if it lies within that region.
+        """
+        if not polygon.interiors or deeper_geom is None:
+            return polygon
+        interiors = list(polygon.interiors)
+        kept = []
+        for i, ring in enumerate(interiors):
+            wall = polygon.exterior.distance(ring)
+            for j, other in enumerate(interiors):
+                if i != j:
+                    wall = min(wall, ring.distance(other))
+            island = Polygon(ring)
+            removed_deeper = (island.area > 0 and
+                              deeper_geom.intersection(island).area >= 0.99 * island.area)
+            if wall < min_wall and removed_deeper:
+                print(f"    Dissolving island (area={island.area:.3f} sq in): wall {wall:.4f}\" "
+                      f"< tool {min_wall:.4f}\" and removed by a deeper pass anyway")
+            else:
+                kept.append(ring)
+        if len(kept) == len(interiors):
+            return polygon
+        return Polygon(polygon.exterior.coords, [list(r.coords) for r in kept])
 
     def _generate_multilayer_gcode(self, suggested_filename: str = None, timestamp: str = None) -> PostProcessorResult:
         """Generate G-code for multi-layer DXF (2.5D machining)"""
@@ -1740,9 +2220,6 @@ class FRCPostProcessor:
         gcode = self._generate_gcode_header(timestamp, is_multilayer=True)
         warnings = []
 
-        # Track already-cut geometry to avoid redundant cuts
-        cut_geometry = None
-
         # Track total features across all layers
         total_holes = 0
         total_pockets = 0
@@ -1754,27 +2231,119 @@ class FRCPostProcessor:
 
             gcode.append(f"(===== LAYER: {layer_name} | DEPTH: Z={depth:.4f}\" =====)")
 
-            # Get raw geometry for this layer
-            raw_circles = layer_info['circles'].copy()
-            raw_polylines = layer_info['polylines'].copy()
+            # === SHAPELY POLYGON APPROACH ===
+            # Get Shapely Polygons for this layer
+            current_polygons = layer_info['polygons']
+            print(f"  Current layer: {len(current_polygons)} polygon(s)")
 
-            # Subtract already-cut geometry from deeper layers
-            if cut_geometry is not None:
-                self.circles, self.polylines = self._subtract_geometry(
-                    raw_circles, raw_polylines, cut_geometry
-                )
-            else:
-                self.circles = raw_circles
-                self.polylines = raw_polylines
+            # === PROPER 3D SLICING LOGIC ===
+            # Find the next deeper layer
+            next_deeper_layer = None
+            next_deeper_depth = None
+            for check_name, check_info in self.layer_data.items():
+                check_depth = check_info['depth']
+                if check_depth < depth - 0.001:  # Deeper than current
+                    if next_deeper_depth is None or check_depth > next_deeper_depth:
+                        next_deeper_layer = check_name
+                        next_deeper_depth = check_depth
 
-            # Track this layer's geometry for future subtraction
-            layer_geom = self._geometries_to_shapely(self.circles, self.polylines)
-            if layer_geom is not None:
-                if cut_geometry is None:
-                    cut_geometry = layer_geom
+            # If no explicit deeper layer, check if bottom face exists and is deeper
+            if has_true_bottom and bottom_layer[1]['depth'] < depth - 0.001:
+                if next_deeper_depth is None or bottom_layer[1]['depth'] > next_deeper_depth:
+                    next_deeper_layer = bottom_layer_name
+                    next_deeper_depth = bottom_layer[1]['depth']
+
+            # Region removed by ALL strictly-deeper passes, so a thin-wall island is
+            # dissolved only when that material is genuinely cut away later. The
+            # bottom/through face is stored as the KEEP plate (octagon-with-holes), so
+            # its removed material is its HOLES (interiors); deeper pocket layers store
+            # the removed pocket directly, so use those polygons as-is.
+            deeper_removed_geoms = []
+            for _lname, _linfo in self.layer_data.items():
+                if _linfo['depth'] < depth - 0.001:
+                    if has_true_bottom and _lname == bottom_layer_name:
+                        for _p in _linfo['polygons']:
+                            deeper_removed_geoms.extend(Polygon(r) for r in _p.interiors)
+                    else:
+                        deeper_removed_geoms.extend(_linfo['polygons'])
+            deeper_removed = unary_union(deeper_removed_geoms) if deeper_removed_geoms else None
+
+            # Get geometry at next deeper layer and perform slicing
+            if next_deeper_layer:
+                next_layer_info = self.layer_data[next_deeper_layer]
+                deeper_polygons = next_layer_info['polygons']
+                print(f"  Next deeper layer: {next_deeper_layer} at Z={next_deeper_depth:.4f}\"")
+                print(f"    Deeper geometry: {len(deeper_polygons)} polygon(s)")
+
+                # For bottom face: exclude perimeter from subtraction
+                # The perimeter is the outermost boundary (part outline), not cleared material
+                if next_deeper_layer == bottom_layer_name and has_true_bottom:
+                    # Identify which polygon is the perimeter (largest area)
+                    if deeper_polygons:
+                        perimeter_polygon = max(deeper_polygons, key=lambda p: p.area)
+                        # Exclude perimeter, keep only interior features (holes/pockets)
+                        deeper_polygons_for_subtraction = [p for p in deeper_polygons if p != perimeter_polygon]
+                        print(f"    Excluding perimeter from subtraction (area={perimeter_polygon.area:.3f} sq in)")
+                        print(f"    Using {len(deeper_polygons_for_subtraction)} interior feature(s) for subtraction")
+                    else:
+                        deeper_polygons_for_subtraction = []
                 else:
-                    from shapely.ops import unary_union
-                    cut_geometry = unary_union([cut_geometry, layer_geom])
+                    deeper_polygons_for_subtraction = deeper_polygons
+
+                # SLICING: material_to_machine = current_solid - deeper_solid
+                if not deeper_polygons_for_subtraction:
+                    # No geometry to subtract
+                    result = unary_union(current_polygons) if len(current_polygons) > 1 else (current_polygons[0] if current_polygons else None)
+                else:
+                    current_union = unary_union(current_polygons) if len(current_polygons) > 1 else current_polygons[0]
+                    deeper_union = unary_union(deeper_polygons_for_subtraction) if len(deeper_polygons_for_subtraction) > 1 else deeper_polygons_for_subtraction[0]
+                    result = current_union.difference(deeper_union)
+
+                # Convert result back to list of polygons
+                if result.is_empty:
+                    sliced_polygons = []
+                    print(f"  Result: No material to machine (fully covered by deeper layer)")
+                elif isinstance(result, Polygon):
+                    sliced_polygons = [result]
+                    print(f"  Result: 1 polygon to machine")
+                elif isinstance(result, MultiPolygon):
+                    sliced_polygons = list(result.geoms)
+                    print(f"  Result: {len(sliced_polygons)} polygons to machine")
+                else:
+                    # Other geometry types (unlikely but handle gracefully)
+                    sliced_polygons = []
+                    print(f"  Result: Unexpected geometry type {result.geom_type}")
+            else:
+                # No deeper layer - use all polygons as-is
+                sliced_polygons = current_polygons
+                print(f"  No deeper geometry to subtract - using all features as-is")
+
+            # Convert Shapely Polygons back to circles/polylines for existing toolpath generation
+            # Store Polygons with islands separately for special handling
+            self.circles = []
+            self.polylines = []
+            self.pocket_polygons = []  # NEW: Store Polygon objects for island-aware machining
+
+            for poly in sliced_polygons:
+                if not poly.is_valid or poly.is_empty:
+                    continue
+
+                # Drop islands whose wall is too thin to machine IF a deeper pass
+                # removes that material anyway (see _dissolve_thin_islands).
+                poly = self._dissolve_thin_islands(poly, self.tool_diameter, deeper_removed)
+
+                # Check if polygon has interior holes (islands)
+                if len(poly.interiors) > 0:
+                    # Store the complete Polygon object for island-aware machining
+                    self.pocket_polygons.append(poly)
+                    print(f"    Polygon with {len(poly.interiors)} interior hole(s) - will be machined as ring/pocket with islands")
+                else:
+                    # Simple polygon - extract as polyline
+                    exterior_coords = list(poly.exterior.coords)[:-1]  # Remove duplicate last point
+                    if len(exterior_coords) >= 3:
+                        self.polylines.append(exterior_coords)
+
+            print(f"  Converted to {len(self.circles)} circles, {len(self.polylines)} polylines, {len(self.pocket_polygons)} island-aware pockets")
 
             # Classify geometry (holes, pockets) - reuses existing methods
             self.classify_holes()
@@ -1790,20 +2359,78 @@ class FRCPostProcessor:
             self.cut_depth = depth
 
             # Generate toolpaths at this depth
+            # Apply same contouring logic as 2D mode
+            threshold_area = self._contour_threshold_area()
+
+            # Check if this layer is a through-cut (at or below Z=0)
+            # Only contour through-cuts; partial-depth layers must be fully cleared
+            is_through_cut = self.cut_depth <= 0
+
             if self.holes:
                 gcode.append(f"(Layer {layer_name}: {len(self.holes)} holes)")
                 total_holes += len(self.holes)
-                for i, hole in enumerate(self.holes, 1):
+
+                # Separate holes by size (only contour through-cuts)
+                contoured_holes = []
+                cleared_holes = []
+                for hole in self.holes:
+                    hole_area = math.pi * (hole['diameter'] / 2) ** 2
+                    if is_through_cut and hole_area > threshold_area:
+                        contoured_holes.append(hole)
+                    else:
+                        cleared_holes.append(hole)
+
+                # Process cleared holes
+                for hole in cleared_holes:
                     center = hole['center']
                     diameter = hole['diameter']
                     needs_peck = hole.get('needs_peck_drill', False)
                     gcode.extend(self._generate_hole_gcode(center[0], center[1], diameter, needs_peck_drill=needs_peck))
 
+                # Process contoured holes
+                for hole in contoured_holes:
+                    center = hole['center']
+                    diameter = hole['diameter']
+                    # Generate circular points for contouring (50-segment tessellation)
+                    circle_points = self._tessellate_circle(center[0], center[1], diameter / 2)
+                    gcode.append(f"(Large hole {diameter:.3f}\" dia - CONTOUR ONLY)")
+                    gcode.extend(self._generate_pocket_contour_gcode(circle_points))
+
             if self.pockets:
                 gcode.append(f"(Layer {layer_name}: {len(self.pockets)} pockets)")
                 total_pockets += len(self.pockets)
-                for i, pocket in enumerate(self.pockets, 1):
+
+                # Separate pockets by size (only contour through-cuts)
+                contoured_pockets = []
+                cleared_pockets = []
+                for pocket in self.pockets:
+                    pocket_poly = Polygon(pocket)
+                    pocket_area = pocket_poly.area
+                    if is_through_cut and pocket_area > threshold_area:
+                        contoured_pockets.append(pocket)
+                    else:
+                        cleared_pockets.append(pocket)
+
+                # Process cleared pockets
+                for pocket in cleared_pockets:
                     gcode.extend(self._generate_pocket_gcode(pocket))
+
+                # Process contoured pockets
+                for pocket in contoured_pockets:
+                    pocket_poly = Polygon(pocket)
+                    gcode.append(f"(Large pocket {pocket_poly.area:.3f} sq in - CONTOUR ONLY)")
+                    gcode.extend(self._generate_pocket_contour_gcode(pocket))
+
+            # Process island-aware pockets (Polygons with interior holes)
+            if hasattr(self, 'pocket_polygons') and self.pocket_polygons:
+                gcode.append(f"(Layer {layer_name}: {len(self.pocket_polygons)} island-aware pockets)")
+                total_pockets += len(self.pocket_polygons)
+
+                for pocket_poly in self.pocket_polygons:
+                    # For now, these are always cleared (no contouring for rings/grooves)
+                    # In the future, could add size threshold check here too
+                    gcode.append(f"(Ring/groove pocket with {len(pocket_poly.interiors)} islands)")
+                    gcode.extend(self._generate_pocket_gcode_from_polygon(pocket_poly))
 
             # Restore original cut depth
             self.cut_depth = saved_cut_depth
@@ -1835,10 +2462,28 @@ class FRCPostProcessor:
         if has_true_bottom:
             gcode.append(f"(Bottom face at Z={depth:.4f}\" - through-holes and through-pockets)")
 
+            # Apply contouring logic to bottom face (same as depth layers)
+            threshold_area = self._contour_threshold_area()
+
+            # Bottom face is always through-cut (Z=0)
+            is_through_cut = True
+
             if self.holes:
                 gcode.append("(===== HOLES =====)")
                 total_holes += len(self.holes)
-                for i, hole in enumerate(self.holes, 1):
+
+                # Separate holes by size (only contour through-cuts)
+                contoured_holes = []
+                cleared_holes = []
+                for hole in self.holes:
+                    hole_area = math.pi * (hole['diameter'] / 2) ** 2
+                    if is_through_cut and hole_area > threshold_area:
+                        contoured_holes.append(hole)
+                    else:
+                        cleared_holes.append(hole)
+
+                # Process cleared holes
+                for i, hole in enumerate(cleared_holes, 1):
                     center = hole['center']
                     diameter = hole['diameter']
                     needs_peck = hole.get('needs_peck_drill', False)
@@ -1846,12 +2491,42 @@ class FRCPostProcessor:
                     gcode.extend(self._generate_hole_gcode(center[0], center[1], diameter, needs_peck_drill=needs_peck))
                     gcode.append("")
 
+                # Process contoured holes
+                for i, hole in enumerate(contoured_holes, 1):
+                    center = hole['center']
+                    diameter = hole['diameter']
+                    # Generate circular points for contouring (50-segment tessellation)
+                    circle_points = self._tessellate_circle(center[0], center[1], diameter / 2)
+                    gcode.append(f"(Hole {len(cleared_holes) + i} - {diameter:.3f}\" diameter - CONTOUR ONLY)")
+                    gcode.extend(self._generate_pocket_contour_gcode(circle_points))
+                    gcode.append("")
+
             if self.pockets:
                 gcode.append("(===== POCKETS =====)")
                 total_pockets += len(self.pockets)
-                for i, pocket in enumerate(self.pockets, 1):
+
+                # Separate pockets by size (only contour through-cuts)
+                contoured_pockets = []
+                cleared_pockets = []
+                for pocket in self.pockets:
+                    pocket_poly = Polygon(pocket)
+                    pocket_area = pocket_poly.area
+                    if is_through_cut and pocket_area > threshold_area:
+                        contoured_pockets.append(pocket)
+                    else:
+                        cleared_pockets.append(pocket)
+
+                # Process cleared pockets
+                for i, pocket in enumerate(cleared_pockets, 1):
                     gcode.append(f"(Pocket {i})")
                     gcode.extend(self._generate_pocket_gcode(pocket))
+                    gcode.append("")
+
+                # Process contoured pockets
+                for i, pocket in enumerate(contoured_pockets, 1):
+                    pocket_poly = Polygon(pocket)
+                    gcode.append(f"(Pocket {len(cleared_pockets) + i} - {pocket_poly.area:.3f} sq in - CONTOUR ONLY)")
+                    gcode.extend(self._generate_pocket_contour_gcode(pocket))
                     gcode.append("")
         else:
             gcode.append(f"(Perimeter outline from deepest layer - holes/pockets already cut at depth)")
@@ -1880,24 +2555,17 @@ class FRCPostProcessor:
         time_estimate = self._estimate_cycle_time(gcode)
 
         # Add cycle time to header (insert after the operations section)
-        for i, line in enumerate(gcode):
-            if line.startswith("(Operations:"):
-                # Find where to insert (after "No straight plunges")
-                insert_idx = i + 3  # After Operations, Helical angle, No straight plunges
-                time_lines = [
-                    "",
-                    f"(Estimated cycle time: {self._format_time(time_estimate['total'])})",
-                    f"(  Cutting: {self._format_time(time_estimate['cutting'])}, Rapids: {self._format_time(time_estimate['rapid'])}, Spindle: {self._format_time(time_estimate['dwell'])})",
-                    "(  Note: Estimate does not include acceleration/deceleration)"
-                ]
-                for j, time_line in enumerate(time_lines):
-                    gcode.insert(insert_idx + j, time_line)
-                break
+        self._insert_cycle_time_comment(gcode, time_estimate)
 
-        # Generate filename
-        base_name = suggested_filename if suggested_filename else "output"
-        timestamp_for_file = timestamp.replace('-', '').replace(' ', '_').replace(':', '')
-        filename = f"{base_name}_{timestamp_for_file}.nc"
+        # Check for errors that occurred during generation
+        if self.errors:
+            return PostProcessorResult(
+                success=False,
+                errors=self.errors.copy()
+            )
+
+        # Generate filename (name sanitized for safe disk write + download)
+        filename = build_output_filename(suggested_filename, timestamp, "output")
 
         return PostProcessorResult(
             success=True,
@@ -1973,7 +2641,15 @@ class FRCPostProcessor:
         retract_plane = self.material_top + 0.1  # 0.1" above stock for chip clearing (not full retract)
         final_depth = self.cut_depth  # Bottom of cut (negative value)
 
-        gcode.append(f"(Peck drill at center, then spiral clear to {diameter:.3f}\" diameter)")
+        # A hole at (essentially) the tool diameter has no material to clear beyond the
+        # drilled bore: it's a pure straight peck drill. Skip the spiral + finishing arcs
+        # entirely (a zero-radius arc I0 J0 is degenerate and errors on many controllers).
+        pure_drill = final_toolpath_radius <= self.hole_size_tolerance
+
+        if pure_drill:
+            gcode.append(f"(Peck drill straight down - hole is tool-sized, no lateral clearing)")
+        else:
+            gcode.append(f"(Peck drill at center, then spiral clear to {diameter:.3f}\" diameter)")
 
         # Rapid to hole center above material
         gcode.append(f"G0 X{cx:.4f} Y{cy:.4f}  ; Rapid to hole center")
@@ -1984,6 +2660,10 @@ class FRCPostProcessor:
         # Z = final depth (negative), R = retract plane, Q = peck depth, F = plunge rate
         gcode.append(f"G83 X{cx:.4f} Y{cy:.4f} Z{final_depth:.4f} R{retract_plane:.4f} Q{peck_depth:.4f} F{self.plunge_rate}  ; Peck drill to full depth")
         gcode.append("G80  ; Cancel canned cycle")
+
+        if pure_drill:
+            gcode.append(f"G0 Z{self.retract_height:.4f}  ; Retract")
+            return gcode
 
         # Now at bottom of hole, do spiral clearing pass to open to final diameter
         # Start from center and spiral outward
@@ -2018,6 +2698,11 @@ class FRCPostProcessor:
         gcode.append(f"G1 X{final_x:.4f} Y{final_y:.4f} F{self.feed_rate}  ; Move to final radius")
         gcode.append(f"G3 X{final_x:.4f} Y{final_y:.4f} I{-final_toolpath_radius:.4f} J0 F{self.feed_rate}  ; Final cleanup circle CCW for climb milling")
 
+        # Spring pass: repeat the final circle at zero stepover to relieve tool
+        # deflection that left the hole slightly undersized.
+        gcode.append(f"(Spring pass - compensate for tool deflection)")
+        gcode.append(f"G3 X{final_x:.4f} Y{final_y:.4f} I{-final_toolpath_radius:.4f} J0 F{self.feed_rate}  ; Spring pass at final radius")
+
         # Retract
         gcode.append(f"G0 Z{self.retract_height:.4f}  ; Retract")
 
@@ -2039,13 +2724,15 @@ class FRCPostProcessor:
         hole_radius = diameter / 2
         final_toolpath_radius = hole_radius - self.tool_radius
 
+        # If hole is too small for helical entry, use peck drilling to get down. A hole at
+        # the tool size has a zero (or float-noise-negative) toolpath radius: clamp it to 0
+        # so it becomes a pure straight peck drill (the peck helper skips lateral clearing).
+        if needs_peck_drill:
+            return self._generate_peck_drill_and_spiral_gcode(cx, cy, diameter, max(final_toolpath_radius, 0.0))
+
         if final_toolpath_radius <= 0:
             gcode.append(f"(WARNING: Tool diameter {self.tool_diameter:.4f}\" is too large for {diameter:.4f}\" hole!)")
             return gcode
-
-        # If hole is too small for helical entry, use peck drilling to get down
-        if needs_peck_drill:
-            return self._generate_peck_drill_and_spiral_gcode(cx, cy, diameter, final_toolpath_radius)
 
         # Strategy: Helical entry at small radius, then spiral outward
         # Each pass increases the radius by stepover percentage (material-specific)
@@ -2065,7 +2752,7 @@ class FRCPostProcessor:
         start_x = cx + entry_radius
         start_y = cy
         gcode.append(f"G1 X{start_x:.4f} Y{start_y:.4f} F{self.traverse_rate}  ; Position at entry radius")
-        gcode.append(f"G1 Z{ramp_start_height:.4f} F{self.approach_rate}  ; Approach to ramp start height")
+        gcode.extend(self._approach_ramp_start(ramp_start_height))
 
         # Helical entry in multiple passes using ramp feed rate
         gcode.append(f"(Helical entry: {num_helical_passes} passes at {self.ramp_angle} deg, {depth_per_pass:.4f}\" per pass)")
@@ -2109,6 +2796,11 @@ class FRCPostProcessor:
         gcode.append(f"(Final cleanup pass at exact radius)")
         gcode.append(f"G1 X{final_x:.4f} Y{final_y:.4f} F{self.feed_rate}  ; Move to final radius")
         gcode.append(f"G3 X{final_x:.4f} Y{final_y:.4f} I{-final_toolpath_radius:.4f} J0 F{self.feed_rate}  ; Cut final circle CCW for climb milling")
+
+        # Spring pass: repeat the final circle at zero stepover to relieve tool
+        # deflection that left the hole slightly undersized.
+        gcode.append(f"(Spring pass - compensate for tool deflection)")
+        gcode.append(f"G3 X{final_x:.4f} Y{final_y:.4f} I{-final_toolpath_radius:.4f} J0 F{self.feed_rate}  ; Spring pass at final radius")
 
         # Retract
         gcode.append(f"G0 Z{self.retract_height:.4f}  ; Retract")
@@ -2286,6 +2978,170 @@ class FRCPostProcessor:
 
         return relative_deviation < tolerance
 
+    def _contour_threshold_area(self) -> float:
+        """Area above which a through-cut hole/pocket is contour-cleared rather than
+        pocket-cleared. From config `machining.pockets.contour_threshold` (default 510; set 0
+        to disable contouring -> infinite threshold), scaled by the tool footprint and
+        stepover: contour_threshold * tool_diameter^2 * stepover_percentage."""
+        contour_threshold = self.config._get('machining', 'pockets', 'contour_threshold', default=510)
+        if contour_threshold <= 0:
+            return float('inf')
+        return contour_threshold * self.tool_diameter ** 2 * self.stepover_percentage
+
+    def _insert_cycle_time_comment(self, gcode: List[str], time_estimate: dict, offset: int = 3) -> None:
+        """Insert the estimated-cycle-time comment block into `gcode`, just after the header's
+        (Operations: ...) line. `offset` is where the block lands relative to that line: the
+        standard header has two more lines after Operations (offset 3); the multi-part job
+        header does not (offset 1). Mutates gcode in place; no-op if there is no Operations line."""
+        for i, line in enumerate(gcode):
+            if line.startswith("(Operations:"):
+                time_lines = [
+                    "",
+                    f"(Estimated cycle time: {self._format_time(time_estimate['total'])})",
+                    f"(  Cutting: {self._format_time(time_estimate['cutting'])}, Rapids: {self._format_time(time_estimate['rapid'])}, Spindle: {self._format_time(time_estimate['dwell'])})",
+                    "(  Note: Estimate does not include acceleration/deceleration)"
+                ]
+                for j, time_line in enumerate(time_lines):
+                    gcode.insert(i + offset + j, time_line)
+                break
+
+    @staticmethod
+    def _tessellate_circle(cx: float, cy: float, radius: float, segments: int = None,
+                           chord_tol: float = 0.001, min_segments: int = 50,
+                           max_segments: int = 400) -> List[Tuple[float, float]]:
+        """Return points evenly spaced around a circle (open loop - no repeated closing
+        point), used to turn a CAD circle into a polyline for contouring/containment.
+
+        By default the segment count is chosen adaptively so the chord deviation from the
+        true circle stays within `chord_tol` inches - a large circle (big bore or round
+        plate perimeter) gets more segments instead of faceting, while the count is floored
+        at `min_segments` (the long-standing 50) so small circles keep their exact prior
+        density and output. Pass an explicit `segments` to force a fixed count."""
+        if segments is None:
+            if radius > 0 and chord_tol > 0:
+                ratio = 1.0 - chord_tol / radius
+                if ratio <= -1.0:      # tolerance dwarfs a sub-tol radius
+                    n = min_segments
+                else:
+                    dtheta = 2.0 * math.acos(ratio)   # sagitta = r(1-cos(dtheta/2)) = chord_tol
+                    n = math.ceil(2 * math.pi / dtheta)
+                segments = max(min_segments, min(max_segments, n))
+            else:
+                segments = min_segments
+        return [(cx + radius * math.cos((j / segments) * 2 * math.pi),
+                 cy + radius * math.sin((j / segments) * 2 * math.pi))
+                for j in range(segments)]
+
+    @staticmethod
+    def _reorder_closed_ring(points: List[Tuple[float, float]], ref: Tuple[float, float]) -> List[Tuple[float, float]]:
+        """Rotate a closed ring's vertex list so it begins at the vertex nearest `ref`, keeping
+        winding order. Makes the link from the previous ring a short one-stepover hop instead of
+        a long diagonal (shapely's orient() does not fix the start vertex)."""
+        if len(points) < 2:
+            return list(points)
+        rx, ry = ref
+        best = min(range(len(points)), key=lambda i: (points[i][0] - rx) ** 2 + (points[i][1] - ry) ** 2)
+        return list(points[best:]) + list(points[:best])
+
+    def _emit_ring_ramp(self, gcode: List[str], ring: List[Tuple[float, float]],
+                        ramp_start_height: float, final_cut_z: float) -> None:
+        """Descend from ramp_start_height to final_cut_z by walking the closed `ring` (looping
+        as many full laps as the ramp angle needs), ending back at ring[0] at depth. The tool is
+        assumed positioned above ring[0] at ramp_start_height. Ramping ALONG the ring keeps the
+        plunge inside the pocket - never a straight full-depth plunge into keep-material."""
+        drop = ramp_start_height - final_cut_z
+        if drop <= 1e-9:
+            return
+        loop = list(ring) + [ring[0]]
+        perim = sum(math.dist(loop[i], loop[i + 1]) for i in range(len(loop) - 1)) or 1e-9
+        ramp_len = drop / math.tan(math.radians(self.ramp_angle)) if self.ramp_angle > 0 else drop
+        laps = min(max(1, int(math.ceil(ramp_len / perim))), 100)  # cap laps for tiny rings
+        total_len = laps * perim
+        traveled = 0.0
+        prev = ring[0]
+        for _ in range(laps):
+            for pt in loop[1:]:               # one full lap ends back at ring[0]
+                traveled += math.dist(prev, pt)
+                z = ramp_start_height - drop * min(1.0, traveled / total_len)
+                gcode.append(f"G1 X{pt[0]:.4f} Y{pt[1]:.4f} Z{z:.4f} F{self.ramp_feed_rate}  ; Ramp in along ring")
+                prev = pt
+
+    def _corner_feed_scale(self, prev: Tuple[float, float], v: Tuple[float, float],
+                           nxt: Tuple[float, float]) -> float:
+        """Feed multiplier for the corner at vertex v, from the included angle between its two
+        edges (v->prev and v->nxt). Straight-through (~180 deg) -> 1.0 (no slowdown); sharper
+        corners scale down toward corner_min_feed_scale, easing the feed through the high
+        engagement where the cutter wraps two edges at once."""
+        ax, ay = prev[0] - v[0], prev[1] - v[1]
+        bx, by = nxt[0] - v[0], nxt[1] - v[1]
+        la = math.hypot(ax, ay)
+        lb = math.hypot(bx, by)
+        if la < 1e-9 or lb < 1e-9:
+            return 1.0
+        cos_a = max(-1.0, min(1.0, (ax * bx + ay * by) / (la * lb)))
+        included = math.degrees(math.acos(cos_a))   # 0 (spike back on itself) .. 180 (straight)
+        GENTLE, SHARP = 150.0, 60.0                  # >= GENTLE: full feed; <= SHARP: full slowdown
+        if included >= GENTLE:
+            return 1.0
+        if included <= SHARP:
+            return self.corner_min_feed_scale
+        t = (included - SHARP) / (GENTLE - SHARP)
+        return self.corner_min_feed_scale + t * (1.0 - self.corner_min_feed_scale)
+
+    def _emit_ring_cut_with_corner_slowdown(self, gcode: List[str],
+                                            ring: List[Tuple[float, float]], base_feed: float) -> None:
+        """Trace a CLOSED ring (ring[0] -> ... -> ring[0]) as G1 cutting moves at base_feed,
+        easing the feed down within corner_slowdown_zone of each sharp corner (see
+        _corner_feed_scale) to tame the engagement/force spike there. Only collinear waypoints
+        are inserted, so the toolpath geometry is unchanged. Assumes the tool is at ring[0]."""
+        n = len(ring)
+        if n < 2:
+            return
+        scale = [self._corner_feed_scale(ring[(i - 1) % n], ring[i], ring[(i + 1) % n]) for i in range(n)]
+        for i in range(n):
+            a, b = ring[i], ring[(i + 1) % n]
+            sa, sb = scale[i], scale[(i + 1) % n]
+            seg = math.hypot(b[0] - a[0], b[1] - a[1])
+            slow_a, slow_b = sa < 0.999, sb < 0.999
+            if seg < 1e-9 or (not slow_a and not slow_b):
+                gcode.append(f"G1 X{b[0]:.4f} Y{b[1]:.4f} F{base_feed:.1f}")
+                continue
+            zone = min(self.corner_slowdown_zone, seg / 2.0)
+            ux, uy = (b[0] - a[0]) / seg, (b[1] - a[1]) / seg
+            cur = a
+            if slow_a:  # ease OUT of the corner at a
+                p1 = (a[0] + ux * zone, a[1] + uy * zone)
+                gcode.append(f"G1 X{p1[0]:.4f} Y{p1[1]:.4f} F{base_feed * sa:.1f}  ; corner slowdown")
+                cur = p1
+            if slow_b:  # full feed across the middle, then ease INTO the corner at b
+                p2 = (b[0] - ux * zone, b[1] - uy * zone)
+                if math.hypot(p2[0] - cur[0], p2[1] - cur[1]) > 1e-6:
+                    gcode.append(f"G1 X{p2[0]:.4f} Y{p2[1]:.4f} F{base_feed:.1f}")
+                gcode.append(f"G1 X{b[0]:.4f} Y{b[1]:.4f} F{base_feed * sb:.1f}  ; corner slowdown")
+            else:
+                gcode.append(f"G1 X{b[0]:.4f} Y{b[1]:.4f} F{base_feed:.1f}")
+
+    def _link_and_cut_ring(self, gcode: List[str], ring_points: List[Tuple[float, float]],
+                           cur_pos: Tuple[float, float], safe_region, ramp_start_height: float,
+                           final_cut_z: float, link_tol: float) -> Tuple[float, float]:
+        """Move from cur_pos onto a closed contour ring, cut it, and return the end position
+        (its start vertex). The ring is reordered to start nearest cur_pos (fix 2). If the
+        straight link would leave the pocket - a concave notch, or a disconnected buffer region -
+        retract and ramp back down along the ring instead of gouging straight across keep-material
+        (fix 1)."""
+        ring = self._reorder_closed_ring(ring_points, cur_pos)
+        start = ring[0]
+        if safe_region.buffer(link_tol).contains(LineString([cur_pos, start])):
+            gcode.append(f"G1 X{start[0]:.4f} Y{start[1]:.4f} F{self.feed_rate}")
+        else:
+            gcode.append(f"G0 Z{self.retract_height:.4f}  ; Retract - straight link would cross keep-material")
+            gcode.append(f"G0 X{start[0]:.4f} Y{start[1]:.4f}  ; Rapid over the notch to the ring")
+            gcode.append(f"G0 Z{ramp_start_height:.4f}  ; Down to ramp-start height")
+            self._emit_ring_ramp(gcode, ring, ramp_start_height, final_cut_z)  # ends at `start` at depth
+        # Clean lap at depth, easing the feed through sharp (high-engagement) corners.
+        self._emit_ring_cut_with_corner_slowdown(gcode, ring, self.feed_rate)
+        return start
+
     def _generate_pocket_gcode(self, pocket_points: List[Tuple[float, float]]) -> List[str]:
         """Generate G-code for a pocket with tool compensation (offset inward) and helical entry.
         Uses spiral clearing for circular pockets, contour-parallel for non-circular."""
@@ -2303,8 +3159,12 @@ class FRCPostProcessor:
             self._add_error(error_msg)
             return gcode
 
-        # Get the boundary of the offset polygon
+        # Get the boundary of the offset polygon. GEOS buffer() does NOT reliably orient
+        # its output (it returns CW exteriors here), so normalize to canonical orientation
+        # (exterior CCW) explicitly: cutting an interior pocket CCW is climb milling, matching
+        # the CCW helical entry and hole toolpaths.
         if hasattr(offset_poly, 'exterior'):
+            offset_poly = orient(offset_poly, 1.0)
             offset_points = list(offset_poly.exterior.coords)[:-1]  # Remove duplicate last point
         else:
             center_x, center_y = self._get_polygon_center(pocket_poly)
@@ -2312,9 +3172,16 @@ class FRCPostProcessor:
             self._add_error(error_msg)
             return gcode
 
-        # Use pocket centroid as entry position (center of pocket)
-        entry_x = offset_poly.centroid.x
-        entry_y = offset_poly.centroid.y
+        # Entry (plunge) point. The offset polygon's centroid is a nicely-centered plunge
+        # point for convex pockets, but for a CONCAVE pocket (e.g. an L or U shape) the
+        # centroid can fall OUTSIDE the polygon - which would helical-bore into keep-material
+        # and then slot laterally across to reach the pocket. Fall back to
+        # representative_point() (guaranteed inside the polygon) in that case.
+        entry_point = offset_poly.centroid
+        if not offset_poly.contains(entry_point):
+            entry_point = offset_poly.representative_point()
+        entry_x = entry_point.x
+        entry_y = entry_point.y
 
         # Calculate helical entry parameters
         helix_radius = self.tool_radius * self.helix_radius_multiplier  # Helix radius from material preset
@@ -2325,7 +3192,7 @@ class FRCPostProcessor:
 
         # Position at pocket center
         gcode.append(f"G1 X{entry_x:.4f} Y{entry_y:.4f} F{self.traverse_rate}  ; Position at pocket center")
-        gcode.append(f"G1 Z{ramp_start_height:.4f} F{self.approach_rate}  ; Approach to ramp start height")
+        gcode.extend(self._approach_ramp_start(ramp_start_height))
 
         # Helical entry at center
         start_x = entry_x + helix_radius
@@ -2342,80 +3209,533 @@ class FRCPostProcessor:
         # Calculate stepover for pocket clearing
         stepover = self.tool_diameter * self.stepover_percentage
 
+        # A genuinely round pocket clears best with an Archimedean spiral (continuous
+        # engagement, no ring-closure reversals or radial link cuts). Only take this path
+        # when the pocket really is circular; everything else falls through to the
+        # general contour-parallel strategy, which handles arbitrary (e.g. slot-shaped)
+        # pockets that a circular spiral would leave uncleared in the corners.
+        circle = self._detect_solid_circle(pocket_poly)
+        if circle is not None:
+            final_radius = math.sqrt(offset_poly.area / math.pi)  # tool-center travel radius
+            if final_radius > 0.001:
+                gcode.extend(self._generate_circular_pocket_spiral(entry_x, entry_y, final_radius))
+                gcode.append(f"G0 Z{self.retract_height:.4f}  ; Retract")
+                return gcode
+
         # Always use contour-parallel clearing for reliable material removal
-        # (Previous circular spiral optimization left material in slot-shaped pockets)
+        # (a circular spiral would leave material in slot-shaped pockets)
         gcode.append(f"(Pocket clearing - using contour-parallel stepover passes)")
 
-        # Generate inward offsets from perimeter to center
-        current_offset_distance = -self.tool_radius  # Start from tool-compensated perimeter
-        contours = []
+        # Depth the helix reached; every contour/perimeter pass cuts at this Z, and a ramped
+        # re-entry (in _link_and_cut_ring) must ramp back down to it.
+        final_cut_z = ramp_start_height - num_helical_passes * depth_per_pass
 
-        # Calculate how many offset passes we need
-        # Find the maximum inset we can do (when pocket becomes too small)
-        test_offset = current_offset_distance
+        # Generate inward offsets from perimeter to center
+        contours = []
+        test_offset = -self.tool_radius   # Start from the tool-compensated perimeter
         while True:
             test_offset -= stepover
             test_poly = pocket_poly.buffer(test_offset)
             if test_poly.is_empty or test_poly.area < 0.001:
                 break
-            # For complex shapes, buffer can create MultiPolygon - handle both cases
-            contours.append(test_poly)
+            contours.append(test_poly)   # may be a MultiPolygon for complex (e.g. concave) shapes
 
         gcode.append(f"(Contour-parallel clearing: {len(contours)} offset passes)")
 
-        # Cut contours from outside-in (perimeter to center)
+        # Cut contours center-outward, then the exact perimeter. Every ring is linked with a
+        # GUARDED move: a straight feed when the link stays inside the pocket (offset_poly),
+        # otherwise a retract + ramped re-entry along the ring - so a concave (L/U) pocket never
+        # slots straight across the notch through keep-material. Rings are also reordered to
+        # start nearest the tool, keeping links to a short one-stepover hop. The tool sits at the
+        # pocket entry (at depth) after the helix.
+        link_tol = 1e-4
+        cur_pos = (entry_x, entry_y)
         pass_number = 0
         for contour_geom in reversed(contours):
-            # Handle both Polygon and MultiPolygon (complex shapes can split into multiple regions)
             polygons_to_cut = []
             if hasattr(contour_geom, 'exterior'):
-                # Single Polygon
                 polygons_to_cut.append(contour_geom)
             elif hasattr(contour_geom, 'geoms'):
-                # MultiPolygon - cut all separate regions
-                polygons_to_cut.extend(contour_geom.geoms)
-
+                polygons_to_cut.extend(contour_geom.geoms)   # disconnected regions of a concave pocket
             for poly in polygons_to_cut:
                 if not hasattr(poly, 'exterior'):
                     continue
-
+                poly = orient(poly, 1.0)   # exterior CCW = climb milling for interior pockets
                 contour_points = list(poly.exterior.coords)[:-1]
                 if len(contour_points) < 3:
                     continue
-
                 pass_number += 1
                 gcode.append(f"(Contour pass {pass_number})")
+                cur_pos = self._link_and_cut_ring(gcode, contour_points, cur_pos, offset_poly,
+                                                  ramp_start_height, final_cut_z, link_tol)
 
-                # Move to start of contour
-                gcode.append(f"G1 X{contour_points[0][0]:.4f} Y{contour_points[0][1]:.4f} F{self.feed_rate}")
-
-                # Cut the contour
-                for point in contour_points[1:]:
-                    gcode.append(f"G1 X{point[0]:.4f} Y{point[1]:.4f} F{self.feed_rate}")
-
-                # Close the contour
-                gcode.append(f"G1 X{contour_points[0][0]:.4f} Y{contour_points[0][1]:.4f} F{self.feed_rate}")
-
-                # Return to center between passes for safety
-                gcode.append(f"G1 X{entry_x:.4f} Y{entry_y:.4f} F{self.feed_rate}")
-
-        # Final pass - cut actual perimeter at exact size
+        # Final pass - cut the exact (tool-compensated) perimeter.
         gcode.append(f"(Final pass: cut exact perimeter)")
-        gcode.append(f"G1 X{offset_points[0][0]:.4f} Y{offset_points[0][1]:.4f} F{self.feed_rate}")
-        for point in offset_points[1:]:
+        cur_pos = self._link_and_cut_ring(gcode, offset_points, cur_pos, offset_poly,
+                                          ramp_start_height, final_cut_z, link_tol)
+
+        # Spring pass: re-trace the perimeter at zero stepover to relieve tool deflection that
+        # left the pocket slightly undersized. The tool is already on the perimeter.
+        gcode.append(f"(Spring pass - compensate for tool deflection)")
+        spring = self._reorder_closed_ring(offset_points, cur_pos)
+        for point in spring[1:]:
             gcode.append(f"G1 X{point[0]:.4f} Y{point[1]:.4f} F{self.feed_rate}")
-        gcode.append(f"G1 X{offset_points[0][0]:.4f} Y{offset_points[0][1]:.4f} F{self.feed_rate}  ; Close pocket")
+        gcode.append(f"G1 X{spring[0][0]:.4f} Y{spring[0][1]:.4f} F{self.feed_rate}  ; Close spring pass")
 
         # Retract
         gcode.append(f"G0 Z{self.retract_height:.4f}  ; Retract")
 
         return gcode
-    
-    def _generate_perimeter_gcode(self, perimeter_points: List[Tuple[float, float]]) -> List[str]:
-        """Generate G-code for perimeter with tabs and tool compensation (offset outward)
 
+    def _detect_solid_circle(self, polygon: Polygon) -> Optional[Tuple[float, float, float]]:
+        """Return (cx, cy, radius) if the polygon is a solid circle, else None.
+
+        A solid circle has no interior holes and a circular exterior. Uses the same
+        isoperimetric quotient (4*pi*area/perimeter^2) and 0.95 threshold as
+        _detect_circular_ring, so the spiral clearing path is taken only when the
+        pocket is genuinely round.
+        """
+        if not isinstance(polygon, Polygon) or len(polygon.interiors) != 0:
+            return None
+
+        area = polygon.area
+        perimeter = polygon.exterior.length
+        if perimeter <= 0 or area <= 0:
+            return None
+
+        circularity = (4 * math.pi * area) / (perimeter ** 2)
+        if circularity < 0.95:
+            return None
+
+        centroid = polygon.centroid
+        radius = math.sqrt(area / math.pi)
+        return (centroid.x, centroid.y, radius)
+
+    def _detect_circular_ring(self, polygon: Polygon) -> Optional[Tuple[float, float, float, float]]:
+        """Check if a polygon with interiors is approximately a circular ring.
+
+        Uses the isoperimetric quotient (4*pi*area/perimeter^2) to test circularity
+        of both the exterior and each interior boundary, and verifies they share
+        a common center.
+
+        Args:
+            polygon: Shapely Polygon, potentially with interior holes
+
+        Returns:
+            (center_x, center_y, outer_radius, inner_radius) if circular ring,
+            or None if not a circular ring
+        """
+        if len(polygon.interiors) != 1:
+            return None
+
+        circularity_threshold = 0.95
+        center_tolerance = 0.01  # inches
+
+        # Check exterior circularity
+        ext_area = Polygon(polygon.exterior).area
+        ext_perimeter = polygon.exterior.length
+        ext_circularity = (4 * math.pi * ext_area) / (ext_perimeter ** 2)
+        if ext_circularity < circularity_threshold:
+            return None
+
+        # Check interior circularity
+        interior = polygon.interiors[0]
+        int_area = Polygon(interior.coords).area
+        int_perimeter = interior.length
+        int_circularity = (4 * math.pi * int_area) / (int_perimeter ** 2)
+        if int_circularity < circularity_threshold:
+            return None
+
+        # Check shared center
+        ext_centroid = Polygon(polygon.exterior).centroid
+        int_centroid = Polygon(interior.coords).centroid
+        if ext_centroid.distance(int_centroid) > center_tolerance:
+            return None
+
+        # Calculate radii from area (more accurate than perimeter for discretized circles)
+        cx = ext_centroid.x
+        cy = ext_centroid.y
+        outer_radius = math.sqrt(ext_area / math.pi)
+        inner_radius = math.sqrt(int_area / math.pi)
+
+        return (cx, cy, outer_radius, inner_radius)
+
+    def _generate_circular_ring_gcode(self, pocket_poly: Polygon, offset_poly: Polygon,
+                                      cx: float, cy: float,
+                                      outer_radius: float, inner_radius: float) -> List[str]:
+        """Generate G-code for a circular ring/groove pocket using spiral clearing.
+
+        Instead of contour-parallel passes (which cause full-width slotting on the
+        first pass), this uses a ring-centered helical ramp at the entry radius,
+        then Archimedean spirals outward and inward to clear the full ring width.
+        Every pass only engages stepover-width of material.
+
+        Args:
+            pocket_poly: Original pocket polygon (before tool compensation)
+            offset_poly: Tool-compensated polygon (buffered inward by tool_radius)
+            cx, cy: Ring center coordinates
+            outer_radius, inner_radius: Radii of the tool-compensated ring
+        """
+        gcode = []
+
+        stepover = self.tool_diameter * self.stepover_percentage
+        spiral_constant = stepover / (2 * math.pi)
+        angle_increment = math.radians(10)
+
+        # Entry point: use representative_point which lands in the solid ring
+        rep_point = offset_poly.representative_point()
+        entry_radius = math.sqrt((rep_point.x - cx) ** 2 + (rep_point.y - cy) ** 2)
+        entry_radius = max(inner_radius, min(outer_radius, entry_radius))
+
+        # Place the entry on the +X axis (angle 0) for a clean helical ramp.
+        entry_x = cx + entry_radius
+        entry_y = cy
+
+        ramp_start_height = self.material_top + self.ramp_start_clearance
+        num_helical_passes, depth_per_pass = self._calculate_helical_passes(
+            entry_radius, ramp_start_height=ramp_start_height)
+
+        gcode.append(f"(Circular ring spiral clearing: center {cx:.4f}, {cy:.4f}, "
+                     f"outer r={outer_radius:.4f}, inner r={inner_radius:.4f})")
+
+        # Position at entry point on ring circumference
+        gcode.append(f"G1 X{entry_x:.4f} Y{entry_y:.4f} F{self.traverse_rate}  ; Position at ring entry")
+        gcode.extend(self._approach_ramp_start(ramp_start_height))
+
+        # Ring-centered helical ramp: helix around ring center at entry_radius.
+        i_offset = cx - entry_x  # = -entry_radius (since entry_x = cx + entry_radius)
+        j_offset = cy - entry_y  # = 0 (since entry_y = cy)
+        gcode.append(f"(Helical ramp: {num_helical_passes} passes at entry radius {entry_radius:.4f})")
+        for pass_num in range(num_helical_passes):
+            target_z = ramp_start_height - (pass_num + 1) * depth_per_pass
+            gcode.append(f"G3 X{entry_x:.4f} Y{entry_y:.4f} I{i_offset:.4f} J{j_offset:.4f} "
+                         f"Z{target_z:.4f} F{self.ramp_feed_rate}  ; Helical pass {pass_num + 1}/{num_helical_passes}")
+        gcode.append(f"G3 X{entry_x:.4f} Y{entry_y:.4f} I{i_offset:.4f} J{j_offset:.4f} "
+                     f"F{self.feed_rate}  ; Cleanup pass at entry radius")
+
+        # Archimedean spiral helper. Spirals from (start_radius, start_angle) to
+        # end_radius, emitting a G1 point every angle_increment, and returns the
+        # tool's final (angle, radius). CRITICAL: each phase continues from where
+        # the previous one ended - we never emit a straight move between two
+        # different angles, because that cuts a CHORD across the ring interior and
+        # gouges the central island (the class of bug this rewrite fixes).
+        def spiral_to(start_radius, start_angle, end_radius):
+            angle, radius = start_angle, start_radius
+            if abs(end_radius - start_radius) > 0.001 and spiral_constant > 0:
+                direction = 1.0 if end_radius > start_radius else -1.0
+                total_angle = abs(end_radius - start_radius) / spiral_constant
+                num_points = int(math.ceil(total_angle / angle_increment))
+                for k in range(1, num_points + 1):
+                    angle = start_angle + k * angle_increment
+                    radius = start_radius + direction * spiral_constant * (k * angle_increment)
+                    radius = min(radius, end_radius) if direction > 0 else max(radius, end_radius)
+                    x = cx + radius * math.cos(angle)
+                    y = cy + radius * math.sin(angle)
+                    gcode.append(f"G1 X{x:.4f} Y{y:.4f} F{self.feed_rate}")
+            return angle, radius
+
+        def point_on(radius, angle):
+            return cx + radius * math.cos(angle), cy + radius * math.sin(angle)
+
+        # Spiral outward to the outer wall, then a full cleanup circle FROM THE
+        # CURRENT position (a G2/G3 full circle traces the whole ring from any start
+        # point, so no reposition-to-angle-0 chord is needed).
+        angle, radius = spiral_to(entry_radius, 0.0, outer_radius)
+        if abs(radius - outer_radius) > 1e-4:
+            ox, oy = point_on(outer_radius, angle)  # radial nudge, constant angle
+            gcode.append(f"G1 X{ox:.4f} Y{oy:.4f} F{self.feed_rate}  ; Radial to outer radius")
+        ox, oy = point_on(outer_radius, angle)
+        gcode.append(f"G3 X{ox:.4f} Y{oy:.4f} I{cx - ox:.4f} J{cy - oy:.4f} "
+                     f"F{self.feed_rate}  ; Outer cleanup circle, CCW climb milling")
+        gcode.append(f"(Spring pass - compensate for tool deflection)")
+        gcode.append(f"G3 X{ox:.4f} Y{oy:.4f} I{cx - ox:.4f} J{cy - oy:.4f} "
+                     f"F{self.feed_rate}  ; Outer wall spring pass")
+
+        # Radial move (constant angle) back in to entry radius, then spiral inward
+        # to the inner wall and a full cleanup circle from the current position.
+        ex, ey = point_on(entry_radius, angle)
+        gcode.append(f"G1 X{ex:.4f} Y{ey:.4f} F{self.feed_rate}  ; Radial to entry radius")
+        angle, radius = spiral_to(entry_radius, angle, inner_radius)
+        if abs(radius - inner_radius) > 1e-4:
+            ix, iy = point_on(inner_radius, angle)  # radial nudge, constant angle
+            gcode.append(f"G1 X{ix:.4f} Y{iy:.4f} F{self.feed_rate}  ; Radial to inner radius")
+        ix, iy = point_on(inner_radius, angle)
+        gcode.append(f"G2 X{ix:.4f} Y{iy:.4f} I{cx - ix:.4f} J{cy - iy:.4f} "
+                     f"F{self.feed_rate}  ; Inner cleanup circle, CW climb milling")
+        gcode.append(f"(Spring pass - compensate for tool deflection)")
+        gcode.append(f"G2 X{ix:.4f} Y{iy:.4f} I{cx - ix:.4f} J{cy - iy:.4f} "
+                     f"F{self.feed_rate}  ; Inner wall spring pass")
+
+        gcode.append(f"G0 Z{self.retract_height:.4f}  ; Retract")
+
+        return gcode
+
+    def _generate_circular_pocket_spiral(self, cx: float, cy: float,
+                                         final_radius: float) -> List[str]:
+        """Clear a solid circular pocket with an Archimedean spiral from the center out.
+
+        Assumes the helical entry at the center has already reached full depth (the tool
+        is at the pocket center). Spirals outward at one stepover per revolution to
+        final_radius (the tool-center travel radius), then a finish circle plus spring
+        pass at the wall. Continuous engagement, so no ring-closure reversals or radial
+        link cuts. CCW throughout = climb milling for an interior pocket.
+        """
+        gcode = []
+        stepover = self.tool_diameter * self.stepover_percentage
+
+        gcode.append("(Circular pocket - Archimedean spiral clearing)")
+
+        # Archimedean spiral r = spiral_constant * theta, growing one stepover per turn.
+        spiral_constant = stepover / (2 * math.pi)
+        if spiral_constant > 0:
+            total_angle = final_radius / spiral_constant
+            angle_increment = math.radians(10)
+            num_points = int(math.ceil(total_angle / angle_increment))
+            gcode.append(f"(Spiral outward: {num_points} points from center to r={final_radius:.4f})")
+            for i in range(num_points + 1):
+                current_angle = i * angle_increment
+                current_radius = min(spiral_constant * current_angle, final_radius)
+                x = cx + current_radius * math.cos(current_angle)
+                y = cy + current_radius * math.sin(current_angle)
+                gcode.append(f"G1 X{x:.4f} Y{y:.4f} F{self.feed_rate}")
+
+        # Finish circle at the wall (exact size), then a zero-stepover spring pass to
+        # relieve tool deflection. G3/CCW = climb on the interior wall.
+        wall_x = cx + final_radius
+        wall_y = cy
+        gcode.append(f"G1 X{wall_x:.4f} Y{wall_y:.4f} F{self.feed_rate}  ; Move to wall radius")
+        gcode.append(f"G3 X{wall_x:.4f} Y{wall_y:.4f} I{-final_radius:.4f} J0 F{self.feed_rate}  ; Finish circle, CCW climb")
+        gcode.append(f"(Spring pass - compensate for tool deflection)")
+        gcode.append(f"G3 X{wall_x:.4f} Y{wall_y:.4f} I{-final_radius:.4f} J0 F{self.feed_rate}  ; Spring pass")
+
+        return gcode
+
+    def _generate_pocket_gcode_from_polygon(self, pocket_poly: Polygon) -> List[str]:
+        """Generate G-code for a pocket from a Shapely Polygon (supports interior holes/islands).
+        This is the island-aware version that respects Polygon interiors."""
+        gcode = []
+
+        # Validate input
+        if not pocket_poly.is_valid or pocket_poly.is_empty:
+            return gcode
+
+        # Check groove width for polygons with interior holes (rings/grooves)
+        if len(pocket_poly.interiors) > 0:
+            min_groove_width = float('inf')
+            for interior in pocket_poly.interiors:
+                interior_ring = LinearRing(interior.coords)
+                width = pocket_poly.exterior.distance(interior_ring)
+                min_groove_width = min(min_groove_width, width)
+
+            if min_groove_width < self.tool_diameter:
+                center_x, center_y = pocket_poly.centroid.x, pocket_poly.centroid.y
+                error_msg = (
+                    f"Groove at approximately ({center_x:.3f}, {center_y:.3f}) "
+                    f"is {min_groove_width:.4f}\" wide, which is too narrow for "
+                    f"{self.tool_diameter:.4f}\" tool"
+                )
+                self._add_error(error_msg)
+                return gcode
+
+        # Buffer inward (negative buffer) for tool compensation
+        # Key: Shapely automatically respects interior holes during buffer!
+        offset_poly = pocket_poly.buffer(-self.tool_radius)
+
+        if offset_poly.is_empty or offset_poly.area < 0.001:
+            center_x, center_y = pocket_poly.centroid.x, pocket_poly.centroid.y
+            error_msg = f"Pocket at approximately ({center_x:.3f}, {center_y:.3f}) is too small for {self.tool_diameter:.4f}\" tool - tool cannot fit inside with proper clearance"
+            self._add_error(error_msg)
+            return gcode
+
+        # Check for circular ring - use spiral clearing instead of contour-parallel
+        if isinstance(offset_poly, Polygon) and len(offset_poly.interiors) > 0:
+            ring_params = self._detect_circular_ring(offset_poly)
+            if ring_params is not None:
+                cx, cy, outer_r, inner_r = ring_params
+                return self._generate_circular_ring_gcode(
+                    pocket_poly, offset_poly, cx, cy, outer_r, inner_r)
+
+        # Find a good entry point within the machining area
+        # CRITICAL: For rings/donuts, centroid is in the center hole (island)!
+        # Use representative_point() which is guaranteed to be inside the solid geometry
+        if hasattr(offset_poly, 'representative_point'):
+            rep_point = offset_poly.representative_point()
+            entry_x = rep_point.x
+            entry_y = rep_point.y
+        elif hasattr(offset_poly, 'geoms'):
+            # MultiPolygon - use representative point of largest piece
+            largest_poly = max(offset_poly.geoms, key=lambda p: p.area)
+            rep_point = largest_poly.representative_point()
+            entry_x = rep_point.x
+            entry_y = rep_point.y
+        else:
+            # Fallback to centroid
+            entry_x = offset_poly.centroid.x
+            entry_y = offset_poly.centroid.y
+
+        # Calculate helical entry parameters
+        helix_radius = self.tool_radius * self.helix_radius_multiplier
+
+        # Adapt helix radius to fit within available space
+        # The max helix radius at the entry point is the distance from entry to nearest boundary
+        max_helix_radius = offset_poly.boundary.distance(Point(entry_x, entry_y))
+        if helix_radius > max_helix_radius * 0.9:  # 90% safety factor
+            helix_radius = max(max_helix_radius * 0.9, self.tool_radius * 0.25)  # Floor at 25% of tool_radius
+
+        ramp_start_height = self.material_top + self.ramp_start_clearance
+        num_helical_passes, depth_per_pass = self._calculate_helical_passes(helix_radius, ramp_start_height=ramp_start_height)
+
+        gcode.append(f"(Island-aware pocket with helical entry: {num_helical_passes} passes at {self.ramp_angle} deg)")
+
+        # Position at entry point
+        gcode.append(f"G1 X{entry_x:.4f} Y{entry_y:.4f} F{self.traverse_rate}  ; Position at entry point")
+        gcode.extend(self._approach_ramp_start(ramp_start_height))
+
+        # Helical entry
+        start_x = entry_x + helix_radius
+        start_y = entry_y
+        gcode.append(f"G1 X{start_x:.4f} Y{start_y:.4f} F{self.traverse_rate}  ; Move to helix start")
+
+        for pass_num in range(num_helical_passes):
+            target_z = ramp_start_height - (pass_num + 1) * depth_per_pass
+            gcode.append(f"G3 X{start_x:.4f} Y{start_y:.4f} I{-helix_radius:.4f} J0 Z{target_z:.4f} F{self.ramp_feed_rate}  ; Helical pass {pass_num + 1}/{num_helical_passes}")
+
+        # Return to entry point after helix
+        gcode.append(f"G1 X{entry_x:.4f} Y{entry_y:.4f} F{self.feed_rate}  ; Return to entry point")
+
+        # Calculate stepover for pocket clearing
+        stepover = self.tool_diameter * self.stepover_percentage
+
+        gcode.append(f"(Contour-parallel clearing with island avoidance)")
+
+        # For ring polygons (with interior holes), buffer() on the whole ring shrinks
+        # from both sides simultaneously, collapsing the ring in ~2 steps.
+        # Instead, offset from the EXTERIOR ONLY and stop at the interior boundary.
+        solid_exterior = Polygon(pocket_poly.exterior)
+
+        # Build expanded interior (holes + tool_radius) as the no-go zone
+        expanded_interiors = None
+        if len(pocket_poly.interiors) > 0:
+            interior_geoms = []
+            for interior in pocket_poly.interiors:
+                interior_poly = Polygon(interior.coords)
+                interior_geoms.append(interior_poly.buffer(self.tool_radius))
+            expanded_interiors = unary_union(interior_geoms)
+
+        # Generate offset contours from exterior inward
+        contours = []
+        test_offset = -self.tool_radius
+        while True:
+            test_offset -= stepover
+            offset_circle = solid_exterior.buffer(test_offset)
+            if offset_circle.is_empty or offset_circle.area < 0.001:
+                break
+
+            # Subtract expanded interior to stay in machining area
+            if expanded_interiors is not None:
+                machining_portion = offset_circle.difference(expanded_interiors)
+                if machining_portion.is_empty or machining_portion.area < 0.001:
+                    break
+                contours.append(machining_portion)
+            else:
+                contours.append(offset_circle)
+
+        gcode.append(f"(Contour-parallel clearing: {len(contours)} offset passes)")
+
+        # Cut contours from outside-in
+        pass_number = 0
+        for contour_geom in reversed(contours):
+            # Handle both Polygon and MultiPolygon
+            polygons_to_cut = []
+            if isinstance(contour_geom, Polygon):
+                polygons_to_cut.append(contour_geom)
+            elif isinstance(contour_geom, MultiPolygon):
+                polygons_to_cut.extend(contour_geom.geoms)
+
+            for poly_to_cut in polygons_to_cut:
+                if not hasattr(poly_to_cut, 'exterior'):
+                    continue
+
+                # Canonical orientation (exterior CCW) = climb milling for interior pockets.
+                poly_to_cut = orient(poly_to_cut, 1.0)
+                contour_coords = list(poly_to_cut.exterior.coords)
+                if len(contour_coords) < 3:
+                    continue
+
+                pass_number += 1
+                gcode.append(f"(Contour pass {pass_number})")
+
+                gcode.append(f"G1 X{contour_coords[0][0]:.4f} Y{contour_coords[0][1]:.4f} F{self.feed_rate}")
+                for point in contour_coords[1:]:
+                    gcode.append(f"G1 X{point[0]:.4f} Y{point[1]:.4f} F{self.feed_rate}")
+
+        # Final pass - trace tool-compensated boundary (exterior + interiors). Canonical
+        # orientation makes the exterior CCW (climb around the pocket wall) and interiors CW
+        # (climb around any island), matching the CCW hole/helical toolpaths.
+        if isinstance(offset_poly, Polygon):
+            offset_poly = orient(offset_poly, 1.0)
+        exterior_coords = list(offset_poly.exterior.coords)[:-1]
+        if len(exterior_coords) >= 3:
+            pass_number += 1
+            gcode.append(f"(Contour pass {pass_number} - final outer perimeter)")
+            gcode.append(f"G1 X{exterior_coords[0][0]:.4f} Y{exterior_coords[0][1]:.4f} F{self.feed_rate}")
+            for point in exterior_coords[1:]:
+                gcode.append(f"G1 X{point[0]:.4f} Y{point[1]:.4f} F{self.feed_rate}")
+            gcode.append(f"G1 X{exterior_coords[0][0]:.4f} Y{exterior_coords[0][1]:.4f} F{self.feed_rate}")
+
+            # Spring pass: re-trace the exterior at zero stepover to relieve
+            # tool deflection.
+            gcode.append(f"(Spring pass - compensate for tool deflection)")
+            for point in exterior_coords[1:]:
+                gcode.append(f"G1 X{point[0]:.4f} Y{point[1]:.4f} F{self.feed_rate}")
+            gcode.append(f"G1 X{exterior_coords[0][0]:.4f} Y{exterior_coords[0][1]:.4f} F{self.feed_rate}")
+
+        # Also trace interior boundaries of the tool-compensated ring
+        if hasattr(offset_poly, 'interiors'):
+            for interior in offset_poly.interiors:
+                interior_coords = list(interior.coords)[:-1]
+                if len(interior_coords) >= 3:
+                    pass_number += 1
+                    gcode.append(f"(Contour pass {pass_number} - inner boundary)")
+                    gcode.append(f"G1 X{interior_coords[0][0]:.4f} Y{interior_coords[0][1]:.4f} F{self.feed_rate}")
+                    for point in interior_coords[1:]:
+                        gcode.append(f"G1 X{point[0]:.4f} Y{point[1]:.4f} F{self.feed_rate}")
+                    gcode.append(f"G1 X{interior_coords[0][0]:.4f} Y{interior_coords[0][1]:.4f} F{self.feed_rate}")
+
+                    # Spring pass on this interior boundary.
+                    gcode.append(f"(Spring pass - compensate for tool deflection)")
+                    for point in interior_coords[1:]:
+                        gcode.append(f"G1 X{point[0]:.4f} Y{point[1]:.4f} F{self.feed_rate}")
+                    gcode.append(f"G1 X{interior_coords[0][0]:.4f} Y{interior_coords[0][1]:.4f} F{self.feed_rate}")
+
+        # Retract
+        gcode.append(f"G0 Z{self.retract_height:.4f}  ; Retract")
+
+        return gcode
+
+    def _generate_contour_gcode(self,
+                               contour_points: List[Tuple[float, float]],
+                               contour_type: str,
+                               offset_direction: int,
+                               clockwise: bool,
+                               remove_tabs_at_end: bool,
+                               defer_tab_removal: bool = False) -> List[str]:
+        """Generate G-code for contour cutting (perimeter or pocket contour) with tabs
+
+        Shared logic for both perimeter and pocket contour operations.
         Supports multi-pass cutting for thick materials based on max_slotting_depth.
         Tabs are only cut on the final pass.
+
+        Args:
+            contour_points: List of (x, y) coordinates defining the contour
+            contour_type: "perimeter" or "pocket" (for comments)
+            offset_direction: +1 for outward offset (perimeter), -1 for inward (pocket)
+            clockwise: True for CW (perimeter), False for CCW (pocket interior)
+            remove_tabs_at_end: Whether to generate tab removal pass (False for pockets)
+            defer_tab_removal: when True, don't emit the tab-removal pass inline; instead
+                stash the computed tab positions on self._deferred_tab_positions so the
+                caller (multi-part job assembler) can emit all parts' tab removals as a
+                final collated phase. Used only for the perimeter in job mode.
         """
         gcode = []
 
@@ -2426,31 +3746,36 @@ class FRCPostProcessor:
 
         if num_passes > 1:
             actual_depth_per_pass = total_cut_depth / num_passes
-            gcode.append(f"(Multi-pass perimeter: {num_passes} passes @ {actual_depth_per_pass:.3f}\" each, max {self.max_slotting_depth:.3f}\" per pass)")
+            gcode.append(f"(Multi-pass {contour_type}: {num_passes} passes @ {actual_depth_per_pass:.3f}\" each, max {self.max_slotting_depth:.3f}\" per pass)")
 
-        # Create offset path (outward by tool radius)
-        perimeter_poly = Polygon(perimeter_points)
+        # Create offset path
+        contour_poly = Polygon(contour_points)
 
-        # Buffer outward (positive buffer)
-        offset_poly = perimeter_poly.buffer(self.tool_radius)
+        # Buffer by tool radius (positive for outward/perimeter, negative for inward/pocket)
+        offset_distance = offset_direction * self.tool_radius
+        offset_poly = contour_poly.buffer(offset_distance)
 
         if offset_poly.is_empty:
-            center_x, center_y = self._get_polygon_center(perimeter_poly)
-            error_msg = f"Perimeter at approximately ({center_x:.3f}, {center_y:.3f}) failed offset operation - may have internal corners with radius smaller than {self.tool_diameter:.4f}\" tool can mill"
+            center_x, center_y = self._get_polygon_center(contour_poly)
+            error_msg = f"{contour_type.capitalize()} at approximately ({center_x:.3f}, {center_y:.3f}) failed offset operation - may have internal corners with radius smaller than {self.tool_diameter:.4f}\" tool can mill"
             self._add_error(error_msg)
             return gcode
 
         # Get the boundary of the offset polygon
         if hasattr(offset_poly, 'exterior'):
+            # GEOS buffer() does NOT reliably orient its output, so normalize to canonical
+            # orientation (exterior CCW) explicitly. CCW = climb for an interior pocket;
+            # reverse to CW for climb on an outside feature (perimeter).
+            offset_poly = orient(offset_poly, 1.0)
             offset_points = list(offset_poly.exterior.coords)[:-1]  # Remove duplicate last point
-            # Reverse points for clockwise direction (climb milling on outside features)
-            offset_points = offset_points[::-1]
+            if clockwise:
+                offset_points = offset_points[::-1]
         else:
-            center_x, center_y = self._get_polygon_center(perimeter_poly)
-            error_msg = f"Perimeter at approximately ({center_x:.3f}, {center_y:.3f}) resulted in invalid geometry after tool compensation - may have internal corners too sharp for {self.tool_diameter:.4f}\" tool"
+            center_x, center_y = self._get_polygon_center(contour_poly)
+            error_msg = f"{contour_type.capitalize()} at approximately ({center_x:.3f}, {center_y:.3f}) resulted in invalid geometry after tool compensation - may have internal corners too sharp for {self.tool_diameter:.4f}\" tool"
             self._add_error(error_msg)
             return gcode
-        
+
         # Calculate segment lengths
         segment_lengths = []
         for i in range(len(offset_points)):
@@ -2459,8 +3784,8 @@ class FRCPostProcessor:
             length = self._distance_2d(p1, p2)
             segment_lengths.append(length)
 
-        # Calculate total perimeter length
-        perimeter_length = sum(segment_lengths)
+        # Calculate total contour length
+        contour_length = sum(segment_lengths)
 
         # Will store tab positions for final removal pass (only populated on final pass)
         all_tab_positions = []
@@ -2495,8 +3820,8 @@ class FRCPostProcessor:
             # Calculate tab zones ONLY on final pass (if tabs are enabled)
             tab_zones = []  # List of (start_dist, end_dist) tuples
             if is_final_pass and self.tabs_enabled:
-                # We cut from ramp_distance to perimeter_length, so tabs should only be in that range
-                cutting_length = perimeter_length - ramp_distance
+                # We cut from ramp_distance to contour_length, so tabs should only be in that range
+                cutting_length = contour_length - ramp_distance
 
                 # Calculate number of tabs based on desired spacing, with minimum of 3
                 num_tabs = max(3, int(math.ceil(cutting_length / self.tab_spacing)))
@@ -2517,7 +3842,7 @@ class FRCPostProcessor:
             # Move to start
             start = offset_points[0]
             gcode.append(f"G1 X{start[0]:.4f} Y{start[1]:.4f} F{self.traverse_rate}  ; Move to perimeter start")
-            gcode.append(f"G1 Z{ramp_start_height:.4f} F{self.approach_rate}  ; Approach to ramp start height")
+            gcode.extend(self._approach_ramp_start(ramp_start_height))
 
             # Ramp in along the perimeter path
             # Calculate points along perimeter for ramping
@@ -2575,7 +3900,7 @@ class FRCPostProcessor:
                         num_loops = max(1, int(math.ceil(remaining_depth / depth_per_loop)))
                         depth_per_loop_actual = remaining_depth / num_loops
 
-                        gcode.append(f"(Perimeter too short - using helical finish: {num_loops} loop(s) at {self.ramp_angle} deg)")
+                        gcode.append(f"(Perimeter too short - using helical finish: {num_loops} loops at {self.ramp_angle} deg)")
 
                         # Move to edge of helix radius
                         start_x = helix_center_x + helix_radius
@@ -2599,10 +3924,14 @@ class FRCPostProcessor:
             tab_number = 0
             current_z = pass_cut_depth  # Track current Z height to avoid unnecessary moves
 
-            # Store tab positions for the tab removal pass (only on final pass)
-            # List of (tab_idx, start_x, start_y, end_x, end_y) tuples
-            tab_positions = []
-            recorded_tabs = set()  # Track which tab_idx values we've already recorded
+            # Store tab positions for the tab removal pass (only on final pass).
+            # A single tab can straddle multiple contour segments — common on
+            # curves, where circles are approximated as many short chords — so
+            # we keep an ordered waypoint list per tab. The removal pass plunges
+            # at the first waypoint and traces every piece in order; a tab that
+            # lives entirely on one segment ends up with two waypoints, same as
+            # the old straight-line behavior.
+            tab_waypoints_by_idx = {}  # tab_idx -> [(x, y), (x, y), ...]
 
             # Create perimeter points list starting from where ramp ended
             # Continue from ramp_end_segment to end, then wrap around to start
@@ -2611,7 +3940,7 @@ class FRCPostProcessor:
 
             # Helper function to process a segment with tab checking
             def process_segment(p1, p2, seg_start_dist, seg_length):
-                nonlocal tab_number, current_z, tab_positions, recorded_tabs
+                nonlocal tab_number, current_z, tab_waypoints_by_idx
 
                 if seg_length == 0:
                     return
@@ -2671,10 +4000,13 @@ class FRCPostProcessor:
                         start_x = p1[0] + t_start * (p2[0] - p1[0])
                         start_y = p1[1] + t_start * (p2[1] - p1[1])
 
-                        # Store tab position for removal pass (only once per tab_idx)
-                        if tab_idx not in recorded_tabs:
-                            tab_positions.append((tab_idx, start_x, start_y, end_x, end_y))
-                            recorded_tabs.add(tab_idx)
+                        # Record this sub-segment for the removal pass. Contiguous
+                        # pieces of the same tab share an endpoint geometrically,
+                        # so we only append the new endpoint on continuations.
+                        if tab_idx not in tab_waypoints_by_idx:
+                            tab_waypoints_by_idx[tab_idx] = [(start_x, start_y), (end_x, end_y)]
+                        else:
+                            tab_waypoints_by_idx[tab_idx].append((end_x, end_y))
 
                         # Move to tab start in XY
                         gcode.append(f"G1 X{start_x:.4f} Y{start_y:.4f} F{self.feed_rate}")
@@ -2718,59 +4050,126 @@ class FRCPostProcessor:
 
             # Store tab positions from final pass for removal
             if is_final_pass:
-                all_tab_positions = tab_positions
+                all_tab_positions = sorted(tab_waypoints_by_idx.items(), key=lambda kv: kv[0])
 
             # Retract
             gcode.append(f"G0 Z{self.retract_height:.4f}  ; Retract")
 
         # ===== TAB REMOVAL PASS =====
-        # Remove tabs in star pattern to gradually release the part (only if tabs were created and removal is enabled)
-        if all_tab_positions and self.config.remove_tabs:
+        # Remove tabs in star pattern to gradually release the part (only if tabs were created
+        # and removal is enabled). Note: Pocket contours NEVER remove tabs (center material
+        # remains for manual removal).
+        # In job mode (defer_tab_removal) the caller collates all parts' tab removals into a
+        # final phase, so we stash the positions instead of emitting the pass inline here.
+        if defer_tab_removal:
+            self._deferred_tab_positions = all_tab_positions
+        elif all_tab_positions and remove_tabs_at_end:
+            gcode.extend(self._generate_tab_removal_gcode(all_tab_positions))
+
+        return gcode
+
+    def _generate_tab_removal_gcode(self, all_tab_positions) -> List[str]:
+        """Generate the star-pattern tab-removal pass for a perimeter's tabs.
+
+        Args:
+            all_tab_positions: list of (tab_idx, waypoints) sorted by tab_idx, as captured
+                on the final perimeter pass. waypoints[0] is the kerf entry point; the rest
+                are the cut-through points for that tab.
+
+        Returns the tab-removal toolpath lines (empty list if there are no tabs).
+        """
+        gcode = []
+        if not all_tab_positions:
+            return gcode
+
+        gcode.append("")
+        gcode.append("(===== TAB REMOVAL PASS =====)")
+        gcode.append(f"(Removing {len(all_tab_positions)} tabs in star pattern)")
+
+        # all_tab_positions is already sorted by tab_idx.
+
+        # Generate star pattern order: alternates between first and second half
+        # For 4 tabs (0,1,2,3): order is 0,2,1,3
+        # For 6 tabs (0,1,2,3,4,5): order is 0,3,1,4,2,5
+        num_tabs = len(all_tab_positions)
+        star_order = []
+        half = num_tabs // 2
+        for i in range(half):
+            star_order.append(i)
+            if i + half < num_tabs:
+                star_order.append(i + half)
+        # Handle odd number of tabs
+        if num_tabs % 2 == 1:
+            star_order.append(num_tabs - 1)
+
+        gcode.append(f"(Star pattern order: {', '.join(str(i+1) for i in star_order)})")
+        gcode.append("")
+
+        # Remove each tab in star order
+        for removal_num, tab_order_idx in enumerate(star_order, 1):
+            tab_idx, waypoints = all_tab_positions[tab_order_idx]
+            start_x, start_y = waypoints[0]
+
+            gcode.append(f"(Tab {tab_idx + 1} removal - #{removal_num} in sequence)")
+
+            # Rapid to retract height (like moving between holes)
+            gcode.append(f"G0 Z{self.retract_height:.4f}")
+
+            # Rapid to position just before the tab (in the kerf)
+            gcode.append(f"G0 X{start_x:.4f} Y{start_y:.4f}  ; Move to tab start (in kerf)")
+
+            # Plunge to cut depth in empty kerf at approach rate (faster - no material)
+            gcode.append(f"G1 Z{self.cut_depth:.4f} F{self.approach_rate}  ; Plunge in kerf")
+
+            # Cut through each piece of the tab in contour order so curved
+            # tabs (spanning multiple short chord segments) get fully removed.
+            for ex, ey in waypoints[1:]:
+                gcode.append(f"G1 X{ex:.4f} Y{ey:.4f} F{self.feed_rate}  ; Cut through tab")
+
+            # Retract after each tab
+            gcode.append(f"G0 Z{self.retract_height:.4f}  ; Retract")
             gcode.append("")
-            gcode.append("(===== TAB REMOVAL PASS =====)")
-            gcode.append(f"(Removing {len(all_tab_positions)} tabs in star pattern)")
 
-            # Sort tabs by their index to ensure consistent ordering
-            all_tab_positions.sort(key=lambda x: x[0])
+        return gcode
 
-            # Generate star pattern order: alternates between first and second half
-            # For 4 tabs (0,1,2,3): order is 0,2,1,3
-            # For 6 tabs (0,1,2,3,4,5): order is 0,3,1,4,2,5
-            num_tabs = len(all_tab_positions)
-            star_order = []
-            half = num_tabs // 2
-            for i in range(half):
-                star_order.append(i)
-                if i + half < num_tabs:
-                    star_order.append(i + half)
-            # Handle odd number of tabs
-            if num_tabs % 2 == 1:
-                star_order.append(num_tabs - 1)
+    def _generate_perimeter_gcode(self, perimeter_points: List[Tuple[float, float]],
+                                  defer_tab_removal: bool = False) -> List[str]:
+        """Generate G-code for perimeter with tabs and tool compensation (offset outward)
 
-            gcode.append(f"(Star pattern order: {', '.join(str(i+1) for i in star_order)})")
-            gcode.append("")
+        Wrapper function that calls _generate_contour_gcode with perimeter-specific parameters.
+        Supports multi-pass cutting for thick materials based on max_slotting_depth.
+        Tabs are only cut on the final pass.
+        """
+        return self._generate_contour_gcode(
+            contour_points=perimeter_points,
+            contour_type="perimeter",
+            offset_direction=+1,  # Outward offset
+            clockwise=True,       # CW for climb milling on outside features
+            remove_tabs_at_end=self.config.remove_tabs,  # Config-based tab removal
+            defer_tab_removal=defer_tab_removal
+        )
 
-            # Remove each tab in star order
-            for removal_num, tab_order_idx in enumerate(star_order, 1):
-                tab_idx, start_x, start_y, end_x, end_y = all_tab_positions[tab_order_idx]
+    def _generate_pocket_contour_gcode(self, pocket_points: List[Tuple[float, float]]) -> List[str]:
+        """Generate G-code for pocket contour (outline only) with tabs
 
-                gcode.append(f"(Tab {tab_order_idx + 1} removal - #{removal_num} in sequence)")
+        Contours large pockets instead of fully clearing them to save machining time.
+        The center material remains attached by tabs and must be manually removed.
 
-                # Rapid to retract height (like moving between holes)
-                gcode.append(f"G0 Z{self.retract_height:.4f}")
+        Args:
+            pocket_points: List of (x, y) coordinates defining the pocket boundary
 
-                # Rapid to position just before the tab (in the kerf)
-                gcode.append(f"G0 X{start_x:.4f} Y{start_y:.4f}  ; Move to tab start (in kerf)")
+        Returns:
+            List of G-code lines for pocket contouring operation
+        """
+        gcode = ["(WARNING: Interior pocket contour - center material requires manual removal)"]
 
-                # Plunge to cut depth in empty kerf at approach rate (faster - no material)
-                gcode.append(f"G1 Z{self.cut_depth:.4f} F{self.approach_rate}  ; Plunge in kerf")
-
-                # Cut across the tab at contour feed rate
-                gcode.append(f"G1 X{end_x:.4f} Y{end_y:.4f} F{self.feed_rate}  ; Cut through tab")
-
-                # Retract after each tab
-                gcode.append(f"G0 Z{self.retract_height:.4f}  ; Retract")
-                gcode.append("")
+        gcode.extend(self._generate_contour_gcode(
+            contour_points=pocket_points,
+            contour_type="pocket",
+            offset_direction=-1,  # Inward offset
+            clockwise=False,      # CCW for climb milling on inside features
+            remove_tabs_at_end=False  # NEVER remove tabs on pockets - material stays in place
+        ))
 
         return gcode
 
@@ -3194,7 +4593,7 @@ class FRCPostProcessor:
         gcode.append('( )')
         gcode.append('( SETUP INSTRUCTIONS: )')
         gcode.append('( 1. Mount tube in jig with end facing user )')
-        gcode.append('( 2. Verify G55 is set to jig origin )')
+        gcode.append(self._tube_wcs_setup_comment())
         gcode.append('( 3. Z=0 is at bottom of tube [jig surface] )')
         gcode.append('( 4. Y=0 is at nominal end face of tube )')
         gcode.append('( )')
@@ -3206,20 +4605,24 @@ class FRCPostProcessor:
         gcode.append('G20')
         gcode.append('G90  ; Absolute positioning mode')
         gcode.append('')
-        gcode.append('( Tool and spindle )')
-        gcode.append('T1 M6')
+        gcode.append('( Spindle )')
         gcode.append(f'S{self.spindle_speed} M3')
-        gcode.append('M7  ; Air blast on')
+        tube_coolant_on = self._coolant_on_gcode()
+        if tube_coolant_on:
+            gcode.append(tube_coolant_on)
         gcode.append('G4 P3.0')
         gcode.append('')
-        gcode.append('G55  ; Use jig work coordinate system')
+        gcode.append(self._tube_wcs_activate_gcode())
         gcode.append('')
+
+        # Safe height above the tube, in work coordinates (portable - no G53).
+        tube_safe_z = tube_height + 0.25
 
         # === PHASE 1: FACE FIRST HALF ===
         gcode.append('( === PHASE 1: FACE FIRST HALF === )')
         gcode.append('( Face from Y=-0.125 to Y=+0.125 )')
         gcode.append('')
-        gcode.append(f'G53 G0 Z{self.machine_park_z:.4f}  ; Move to safe machine Z clearance')
+        gcode.append(f'G0 Z{tube_safe_z:.4f}  ; Safe Z clearance')
         gcode.append('G0 X0 Y0  ; Rapid to work origin')
         gcode.append('')
 
@@ -3236,14 +4639,15 @@ class FRCPostProcessor:
             [
                 'Flip tube 180 degrees end-for-end',
                 'Re-clamp tube in jig'
-            ]
+            ],
+            safe_z=tube_safe_z  # must clear the full tube, not just the wall
         ))
 
         # === PHASE 2: FACE SECOND HALF ===
         gcode.append('( === PHASE 2: FACE SECOND HALF === )')
         gcode.append('( Face from Y=-0.250 to Y=-0.125 )')
         gcode.append('')
-        gcode.append(f'G53 G0 Z{self.machine_park_z:.4f}  ; Move to safe machine Z clearance')
+        gcode.append(f'G0 Z{tube_safe_z:.4f}  ; Safe Z clearance')
         gcode.append('G0 X0 Y0  ; Rapid to work origin')
         gcode.append('')
 
@@ -3257,21 +4661,22 @@ class FRCPostProcessor:
         # === END ===
         gcode.append('')
         gcode.append('( === PROGRAM END === )')
-        gcode.append(f'G53 G0 Z{self.machine_park_z:.4f}  ; Move to safe machine Z clearance')
-        gcode.append(f'G53 G0 X{self.machine_park_x} Y{self.machine_park_y}  ; Park at back of machine')
-        gcode.append('M9  ; Air blast off')
+        gcode.append(f'G0 Z{tube_safe_z:.4f}  ; Safe Z clearance')
+        tube_coolant_off = self._coolant_off_gcode()
+        if tube_coolant_off:
+            gcode.append(tube_coolant_off)
         gcode.append('M5')
-        gcode.append('G54  ; Reset to standard work coordinate system')
+        wcs_reset = self._tube_wcs_reset_gcode()
+        if wcs_reset:
+            gcode.append(wcs_reset)
+        gcode.extend(self._park_gcode('Park for part access'))  # G53 park only if configured
         gcode.append('M30')
 
         # Estimate cycle time
         time_estimate = self._estimate_cycle_time(gcode)
 
-        # Generate filename with timestamp
-        base_name = suggested_filename if suggested_filename else "tube_facing"
-        # Format timestamp for filename: YYYYMMDD_HHMMSS
-        timestamp_for_file = timestamp.replace('-', '').replace(' ', '_').replace(':', '')
-        filename = f"{base_name}_{timestamp_for_file}.nc"
+        # Generate filename with timestamp (name sanitized for safe disk write + download)
+        filename = build_output_filename(suggested_filename, timestamp, "tube_facing")
 
         # Return result
         return PostProcessorResult(
@@ -3295,7 +4700,7 @@ class FRCPostProcessor:
                 'dwell_time': self._format_time(time_estimate['dwell']),
                 'setup_instructions': [
                     'Mount tube in jig with end facing spindle',
-                    'Verify G55 is set to jig origin',
+                    self._tube_wcs_setup_instruction(),
                     'Z=0 is at bottom of tube (jig surface)',
                     'Y=0 is at nominal end face of tube'
                 ],
@@ -3310,18 +4715,26 @@ class FRCPostProcessor:
     def generate_tube_pattern_gcode(self, tube_height: float,
                                    square_end: bool, cut_to_length: bool,
                                    tube_width: float = None, tube_length: float = None,
-                                   suggested_filename: str = None, timestamp: str = None) -> PostProcessorResult:
+                                   suggested_filename: str = None, timestamp: str = None,
+                                   second_face_pp: 'FRCPostProcessor' = None) -> PostProcessorResult:
         """
-        Generate G-code for machining DXF pattern on both faces of a tube.
+        Generate G-code for machining DXF pattern(s) on both faces of a tube.
 
         The tube sits in a jig with the end facing the spindle. This method:
         1. Optionally squares the tube end (if square_end=True)
-        2. Machines the DXF pattern on the first face
+        2. Machines the first face's DXF pattern
         3. Pauses (M0) for the operator to flip the tube 180° around Y-axis
-        4. Machines the DXF pattern on the second face (Y-mirrored)
+        4. Machines the second face (X-mirrored to account for the physical flip)
         5. Optionally machines tube to length (if cut_to_length=True - stub)
 
-        The jig uses G55 work coordinate system with:
+        The second face's pattern is either:
+        - the same pattern as face 1 mirrored onto the opposite side (one-face mode,
+          second_face_pp is None), or
+        - a distinct pattern (two-face mode) when second_face_pp is provided — its
+          geometry is X-mirrored the same way to land correctly on the flipped tube.
+
+        The jig uses the configured tube work coordinate system (default G54; an alternate
+        fixed WCS such as G55 is opt-in via config.tube_work_coordinate_system) with:
         - Origin at bottom-left corner of tube face
         - X-axis along tube width
         - Y-axis pointing away from spindle (into tube)
@@ -3334,19 +4747,26 @@ class FRCPostProcessor:
             tube_width: Width of tube face (X dimension) in inches (optional, calculated from DXF if not provided)
             tube_length: Length of tube face (Y dimension) in inches (optional, for future use)
             suggested_filename: Optional filename (without timestamp, will be added)
+            second_face_pp: Optional processor already loaded with a distinct second-face
+                pattern. When None, face 2 = face 1 mirrored (one-face mode).
 
         Returns:
             PostProcessorResult with gcode string and stats
         """
-        # Check for validation errors first
-        if self.errors:
-            print(f"\n❌ Cannot generate G-code: {len(self.errors)} validation error(s) found")
-            for error in self.errors:
+        # Check for validation errors first (both faces, in two-face mode).
+        combined_errors = list(self.errors)
+        if second_face_pp is not None:
+            combined_errors.extend(second_face_pp.errors)
+        if combined_errors:
+            print(f"\n❌ Cannot generate G-code: {len(combined_errors)} validation error(s) found")
+            for error in combined_errors:
                 print(f"   - {error}")
             return PostProcessorResult(
                 success=False,
-                errors=self.errors.copy()
+                errors=combined_errors
             )
+
+        two_face = second_face_pp is not None
 
         gcode = []
 
@@ -3364,11 +4784,18 @@ class FRCPostProcessor:
         gcode.append(f'( Tube height: {tube_height:.3f}" )')
         gcode.append(f'( Tool: {self.tool_diameter:.3f}" end mill )')
         gcode.append(f'( Material: {self.spindle_speed} RPM, {self.feed_rate:.1f} ipm )')
+        if two_face:
+            gcode.append('( Two-face mode: distinct pattern machined on each side )')
+        else:
+            gcode.append('( One-face mode: face 1 pattern mirrored onto opposite side )')
         gcode.append('( )')
         gcode.append('( SETUP INSTRUCTIONS: )')
         gcode.append('( 1. Mount tube in jig with end facing spindle )')
-        gcode.append('( 2. Jig uses G55 work coordinate system [fixed position] )')
-        gcode.append('( 3. G55 origin is at bottom-left corner of tube face )')
+        if self.tube_wcs == 'G54':
+            gcode.append('( 2. Zero G54 to the tube for this job )')
+        else:
+            gcode.append(f'( 2. Jig uses fixed {self.tube_wcs} work coordinate system )')
+        gcode.append(f'( 3. {self.tube_wcs} origin is at bottom-left corner of tube face )')
         gcode.append('( 4. X = tube width, Y = into tube, Z = tube height )')
         gcode.append('( )')
 
@@ -3379,14 +4806,18 @@ class FRCPostProcessor:
         gcode.append('G20')
         gcode.append('G90  ; Absolute positioning mode')
         gcode.append('')
-        gcode.append('( Tool and spindle )')
-        gcode.append('T1 M6')
+        gcode.append('( Spindle )')
         gcode.append(f'S{self.spindle_speed} M3')
-        gcode.append('M7  ; Air blast on')
+        pattern_coolant_on = self._coolant_on_gcode()
+        if pattern_coolant_on:
+            gcode.append(pattern_coolant_on)
         gcode.append('G4 P3.0')
         gcode.append('')
-        gcode.append('G55  ; Use jig work coordinate system')
+        gcode.append(self._tube_wcs_activate_gcode())
         gcode.append('')
+
+        # Safe height above the tube, in work coordinates (portable - no G53).
+        tube_safe_z = tube_height + 0.25
 
         # Determine tube width for facing operations
         if tube_width is None:
@@ -3456,7 +4887,8 @@ class FRCPostProcessor:
             [
                 'Flip tube 180 degrees around Y-axis',
                 'Holes will be machined on opposite face'
-            ]
+            ],
+            safe_z=tube_safe_z  # must clear the full tube, not just the wall
         ))
 
         # === PHASE 2: SECOND FACE (SQUARE + MACHINE PATTERN) ===
@@ -3483,9 +4915,15 @@ class FRCPostProcessor:
                 gcode.append(line)
             gcode.append('')
 
-        # Machine the pattern on this face (X-mirrored, Y offset for facing alignment)
-        gcode.append('( Machine pattern on second face - X-mirrored )')
-        gcode.append('( Pattern is X-mirrored [tube flipped end-for-end] so holes align opposite )')
+        # Machine the pattern on this face (X-mirrored, Y offset for facing alignment).
+        # In two-face mode the second face has its own distinct pattern; otherwise it is
+        # face 1's pattern mirrored onto the opposite side.
+        if two_face:
+            gcode.append('( Machine second face pattern - X-mirrored )')
+            gcode.append('( Distinct second-face pattern, X-mirrored [tube flipped end-for-end] )')
+        else:
+            gcode.append('( Machine pattern on second face - X-mirrored )')
+            gcode.append('( Pattern is X-mirrored [tube flipped end-for-end] so holes align opposite )')
         z_offset = tube_height - self.material_thickness
         gcode.append(f'( Z offset: +{z_offset:.3f}" [tube_height - wall_thickness] )')
         # Y offset: 0 for Phase 2 - work zero is re-established after flip, face is at Y=0"
@@ -3493,8 +4931,10 @@ class FRCPostProcessor:
         gcode.append(f'( Y offset: {y_offset_phase2:.4f}" [face at Y=0, no offset needed] )')
         gcode.append('')
 
-        # Mirror X coordinates around tube centerline (tube flipped end-for-end)
-        mirrored_toolpath = self._generate_toolpath_gcode_mirrored_x(
+        # Mirror X coordinates around tube centerline (tube flipped end-for-end). The
+        # geometry source is the second face's processor in two-face mode, else self.
+        face2_source = second_face_pp if two_face else self
+        mirrored_toolpath = face2_source._generate_toolpath_gcode_mirrored_x(
             z_offset=z_offset, tube_width=tube_width, y_offset=y_offset_phase2
         )
         gcode.extend(mirrored_toolpath)
@@ -3509,27 +4949,39 @@ class FRCPostProcessor:
         # === END ===
         gcode.append('')
         gcode.append('( === PROGRAM END === )')
-        gcode.append(f'G53 G0 Z{self.machine_park_z:.4f}')
-        gcode.append(f'G53 G0 X{self.machine_park_x} Y{self.machine_park_y}')
-        gcode.append('M9  ; Air blast off')
+        gcode.append(f'G0 Z{tube_safe_z:.4f}  ; Safe Z clearance')
+        pattern_coolant_off = self._coolant_off_gcode()
+        if pattern_coolant_off:
+            gcode.append(pattern_coolant_off)
         gcode.append('M5')
-        gcode.append('G54  ; Reset to standard work coordinate system')
+        wcs_reset = self._tube_wcs_reset_gcode()
+        if wcs_reset:
+            gcode.append(wcs_reset)
+        gcode.extend(self._park_gcode('Park for part access'))  # G53 park only if configured
         gcode.append('M30')
 
         # Estimate cycle time
         time_estimate = self._estimate_cycle_time(gcode)
 
-        # Collect stats
-        num_holes = len(self.holes) if hasattr(self, 'holes') else 0
-        num_pockets = len(self.pockets) if hasattr(self, 'pockets') else 0
+        # Collect stats. In one-face mode both sides share face 1's counts; in two-face
+        # mode each side has its own, so sum them for the total.
+        face1_holes = len(self.holes) if hasattr(self, 'holes') else 0
+        face1_pockets = len(self.pockets) if hasattr(self, 'pockets') else 0
+        if two_face:
+            face2_holes = len(second_face_pp.holes) if hasattr(second_face_pp, 'holes') else 0
+            face2_pockets = len(second_face_pp.pockets) if hasattr(second_face_pp, 'pockets') else 0
+        else:
+            face2_holes, face2_pockets = face1_holes, face1_pockets
+        num_holes = face1_holes + face2_holes
+        num_pockets = face1_pockets + face2_pockets
 
-        # Generate filename with timestamp
-        base_name = suggested_filename if suggested_filename else "tube_pattern"
-        # Format timestamp for filename: YYYYMMDD_HHMMSS
-        timestamp_for_file = timestamp.replace('-', '').replace(' ', '_').replace(':', '')
-        filename = f"{base_name}_{timestamp_for_file}.nc"
+        # Generate filename with timestamp (name sanitized for safe disk write + download)
+        filename = build_output_filename(suggested_filename, timestamp, "tube_pattern")
 
         # Build operation notes based on configuration
+        phase2_note = ('Phase 2: Machine distinct pattern on opposite face'
+                       if two_face else
+                       'Phase 2: Machine pattern on opposite face (mirrored)')
         operation_notes = []
         if square_end:
             operation_notes.extend([
@@ -3538,13 +4990,13 @@ class FRCPostProcessor:
                 'Phase 0: Square opposite end',
                 'Phase 1: Machine pattern on first face',
                 'Flip tube 180° around Y-axis (M0)',
-                'Phase 2: Machine pattern on opposite face (mirrored)'
+                phase2_note
             ])
         else:
             operation_notes.extend([
                 'Phase 1: Machine pattern on first face',
                 'Flip tube 180° around Y-axis (M0)',
-                'Phase 2: Machine pattern on opposite face (mirrored)'
+                phase2_note
             ])
         if cut_to_length:
             operation_notes.append(f'Cut to length: Y={tube_length}" (each phase)')
@@ -3564,8 +5016,9 @@ class FRCPostProcessor:
                 'cut_to_length': cut_to_length,
                 'num_holes': num_holes,
                 'num_pockets': num_pockets,
-                'num_holes_per_face': num_holes,
-                'num_pockets_per_face': num_pockets,
+                'num_holes_per_face': face1_holes,
+                'num_pockets_per_face': face1_pockets,
+                'two_face': two_face,
                 'has_perimeter': False,
                 'total_lines': len(gcode),
                 'cycle_time_seconds': time_estimate['total'],
@@ -3575,7 +5028,7 @@ class FRCPostProcessor:
                 'dwell_time': self._format_time(time_estimate['dwell']),
                 'setup_instructions': [
                     'Mount tube in jig with end facing spindle',
-                    'Verify G55 is set to jig origin',
+                    self._tube_wcs_setup_instruction(),
                     'Origin (0,0,0) = bottom-left corner of tube face'
                 ],
                 'operation_notes': operation_notes
@@ -3676,43 +5129,6 @@ class FRCPostProcessor:
             toolpath = [self._offset_z_coordinate(line, z_offset) for line in toolpath]
 
         return toolpath
-
-    def _mirror_x_coordinate(self, line: str, tube_width: float) -> str:
-        """
-        Mirror X coordinate in a G-code line around tube centerline.
-
-        When flipping tube end-for-end, X coordinates reflect around the centerline.
-        Arc direction (G2/G3) stays the same because the physical cutting conditions
-        are unchanged - the spindle is in the same position and tool rotation is the same.
-
-        Transformations:
-        - X_new = tube_width - X_old
-        - I_new = -I_old (flip X arc offset)
-        - J_new = J_old (Y arc offset unchanged)
-        - G2/G3 unchanged (arc direction stays the same)
-
-        Args:
-            line: G-code line to modify
-            tube_width: Width of tube face
-
-        Returns:
-            Modified G-code line with mirrored X coordinates
-        """
-        # Mirror X coordinates
-        def replace_x(match):
-            x_val = float(match.group(1))
-            new_x = tube_width - x_val
-            return f'X{new_x:.4f}'
-        line = re.sub(r'X(-?\d+\.?\d*)', replace_x, line)
-
-        # Flip I offset sign (X component of arc center)
-        def replace_i(match):
-            i_val = float(match.group(1))
-            new_i = -i_val
-            return f'I{new_i:.4f}'
-        line = re.sub(r'I(-?\d+\.?\d*)', replace_i, line)
-
-        return line
 
     def _offset_z_coordinate(self, line: str, z_offset: float) -> str:
         """
@@ -3982,6 +5398,184 @@ class FRCPostProcessor:
                 gcode.append(f'G0 Z{z_safe:.4f}')
 
         return gcode
+
+
+def validate_job_layout(parts, machine_x_max, machine_y_max, min_gap=0.0):
+    """Validate a multi-part job layout. The parts' combined bounding box IS the stock,
+    so the only fit check is that it fits the machine; there's no separate sheet to be
+    "outside" of. Parts also must not overlap or sit closer than min_gap.
+
+    Args:
+        parts: list of dicts, each with 'name' and 'bbox' = (minX, minY, maxX, maxY),
+               and optionally 'polygon' (a placed Shapely polygon for real-geometry
+               overlap testing).
+        machine_x_max, machine_y_max: machine travel envelope (inches).
+        min_gap: required clearance between parts (inches). Pass the tool diameter to
+                 reject parts closer than one kerf. Defaults to 0 (touching allowed).
+
+    Returns:
+        List of error dicts: {'part_index': int|None, 'name': str|None, 'error': str}.
+        Empty list means the layout is valid.
+    """
+    errors = []
+    tol = 1e-6
+
+    # The combined bounding box (the stock) must fit the machine.
+    boxes = [p.get('bbox') for p in parts if p.get('bbox')]
+    if boxes:
+        w = max(b[2] for b in boxes) - min(b[0] for b in boxes)
+        h = max(b[3] for b in boxes) - min(b[1] for b in boxes)
+        if w > machine_x_max + tol or h > machine_y_max + tol:
+            errors.append({
+                'part_index': None,
+                'name': None,
+                'error': (f"Parts ({w:.2f}\" x {h:.2f}\") exceed the machine "
+                          f"({machine_x_max:.1f}\" x {machine_y_max:.1f}\").")
+            })
+    for i, part in enumerate(parts):
+        if part.get('bbox') is None:
+            errors.append({'part_index': i, 'name': part.get('name', f'part {i + 1}'),
+                           'error': f"{part.get('name', 'part')}: no geometry to place."})
+
+    # Parts must not overlap (or sit closer than min_gap). When a placed perimeter
+    # polygon is supplied, test the real geometry (so a part can nest into another's
+    # concave region even though their bounding boxes intersect). Otherwise fall back
+    # to a bounding-box gap test.
+    for i in range(len(parts)):
+        bi = parts[i].get('bbox')
+        if bi is None:
+            continue
+        for j in range(i + 1, len(parts)):
+            bj = parts[j].get('bbox')
+            if bj is None:
+                continue
+
+            # Cheap bbox prune: if the boxes themselves clear the gap, parts are clear.
+            clear_x = (bi[2] + min_gap <= bj[0] + tol) or (bj[2] + min_gap <= bi[0] + tol)
+            clear_y = (bi[3] + min_gap <= bj[1] + tol) or (bj[3] + min_gap <= bi[1] + tol)
+            if clear_x or clear_y:
+                continue
+
+            pi = parts[i].get('polygon')
+            pj = parts[j].get('polygon')
+            too_close = True
+            if pi is not None and pj is not None:
+                try:
+                    too_close = pi.distance(pj) < (min_gap - tol)
+                except Exception:
+                    too_close = True  # geometry error -> be conservative
+
+            if too_close:
+                ni = parts[i].get('name', f'part {i + 1}')
+                nj = parts[j].get('name', f'part {j + 1}')
+                gap_note = f" (need {min_gap:.3f}\" clearance)" if min_gap else ""
+                errors.append({
+                    'part_index': j,
+                    'name': nj,
+                    'error': f"{ni} and {nj} overlap or are too close{gap_note}."
+                })
+
+    return errors
+
+
+def assemble_job_gcode(part_jobs, header_pp, timestamp=None, suggested_filename=None):
+    """Stitch per-part G-code phases into one multi-part program, collated by phase.
+
+    Rather than running each part to completion before the next, the whole job is
+    ordered by phase across all parts: all interiors -> one shared refixturing pause
+    (if configured) -> all perimeters -> all tab removals. This makes the
+    "pause before perimeter" option sensible for a whole sheet (fixture every part
+    once, between interiors and perimeters). A single-part job reduces to the normal
+    single-part order.
+
+    Args:
+        part_jobs: ordered list of dicts:
+            {'name': str, 'place_x': float, 'place_y': float, 'rotation': float,
+             'interior': [str], 'perimeter': [str], 'tab_removal': [str]}
+            -- the three phase line-lists from FRCPostProcessor.generate_part_phases().
+        header_pp: an FRCPostProcessor carrying the shared job parameters (material,
+            tool, thickness, spindle, park Z, pause_before_perimeter). Used to build the
+            single header/footer, the shared pause, and estimate total cycle time.
+            (v1: one tool/material per job.)
+        timestamp, suggested_filename: as in generate_gcode.
+
+    Returns:
+        PostProcessorResult with the assembled program and aggregate stats.
+    """
+    if not timestamp:
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    gcode = header_pp._generate_gcode_header(timestamp, is_job=True, job_part_count=len(part_jobs))
+
+    def _part_label(i, pj):
+        name = pj.get('name', f'part {i}')
+        px = pj.get('place_x', 0.0)
+        py = pj.get('place_y', 0.0)
+        rot = pj.get('rotation', 0)
+        # Sanitize the name for a comment (no nested parens, ASCII only).
+        safe_name = str(name).replace('(', '[').replace(')', ']')
+        return f"(--- PART {i}: {safe_name} @ X{px:.4f} Y{py:.4f} ROT {rot:g} deg ---)"
+
+    def _emit_phase(section_title, phase_key):
+        """Append every part's body for one phase, each under its part label + safe Z.
+        Returns True if any part contributed lines to this phase."""
+        bodies = [(i, pj) for i, pj in enumerate(part_jobs, 1) if pj.get(phase_key)]
+        if not bodies:
+            return False
+        gcode.append("")
+        gcode.append(f"(===== {section_title} =====)")
+        for i, pj in bodies:
+            gcode.append("")
+            gcode.append(_part_label(i, pj))
+            gcode.append(f"G0 Z{header_pp._safe_z():.4f}  ; Safe Z between parts")
+            gcode.extend(pj[phase_key])
+        return True
+
+    # Phase A: all parts' interior features.
+    _emit_phase("PHASE: INTERIOR FEATURES", 'interior')
+
+    # Phase B: one shared refixturing pause between interiors and perimeters, if
+    # configured. Only meaningful when there are perimeters still to cut.
+    has_perimeters = any(pj.get('perimeter') for pj in part_jobs)
+    if header_pp.pause_before_perimeter and has_perimeters:
+        gcode.extend(header_pp._generate_pause_and_park_gcode(
+            'PAUSE FOR FIXTURING',
+            [
+                "All parts' internal features complete",
+                'Install screws through holes into sacrifice board on ALL parts',
+                'Fixture every part securely before perimeter cutting'
+            ]
+        ))
+
+    # Phase C: all parts' perimeters (tab removal deferred to phase D).
+    _emit_phase("PHASE: PERIMETERS", 'perimeter')
+
+    # Phase D: all parts' tab removals (only parts whose perimeter left tabs).
+    _emit_phase("PHASE: TAB REMOVAL", 'tab_removal')
+
+    gcode.extend(header_pp._generate_gcode_footer())
+
+    # Estimate total cycle time across the whole program and insert into the header. The job
+    # header has no Helical/plunge lines after (Operations:), so the block lands at offset 1.
+    time_estimate = header_pp._estimate_cycle_time(gcode)
+    header_pp._insert_cycle_time_comment(gcode, time_estimate, offset=1)
+
+    filename = build_output_filename(suggested_filename, timestamp, "job")
+
+    return PostProcessorResult(
+        success=True,
+        gcode='\n'.join(gcode),
+        filename=filename,
+        stats={
+            'num_parts': len(part_jobs),
+            'total_lines': len(gcode),
+            'cycle_time_seconds': time_estimate['total'],
+            'cycle_time_display': header_pp._format_time(time_estimate['total']),
+            'cutting_time': header_pp._format_time(time_estimate['cutting']),
+            'rapid_time': header_pp._format_time(time_estimate['rapid']),
+            'dwell_time': header_pp._format_time(time_estimate['dwell'])
+        }
+    )
 
 
 def add_timestamp_to_filename(filename: str) -> str:

@@ -8,28 +8,55 @@ These assumptions are **independent of user-configurable inputs** such as materi
 
 ## 1. Controller & Motion Stack
 
-* G-code is interpreted by **Mach4** or a Mach4-compatible controller.
-* Motion control is provided by **Ethernet SmoothStepper (ESS)** or an equivalent Mach4-supported motion device.
-* The controller supports standard Mach-style modal behavior and state persistence.
+By **default** the output is **G54 work-coordinate only** and uses a common, portable
+subset of G-code (`G0 G1 G2 G3 G4 G17 G20/G21 G40 G49 G54 G80 G90 G91.1 G94`, `M0 M3 M5
+M30`). It is designed to run on **GRBL, WinCNC, Mach3/Mach4, LinuxCNC** and similar
+controllers without machine-coordinate moves.
 
-This G-code is **not directly portable** to GRBL, LinuxCNC, Fanuc, Haas, or other controllers without review.
+Three features are **opt-in via config** and, if enabled, add codes or assumptions that not
+every controller supports:
+
+* **`park_position`** (machine-coordinate park) → emits `G53` machine moves. Leave it out
+  for controllers that don't support `G53` (e.g. GRBL behaves unexpectedly). This is
+  the ONLY thing that puts `G53` in the output.
+* **`machine.coolant`** (`Air`/`Mist`/`Flood`) → emits `M7`/`M8`/`M9`. Leave it out (or set
+  `None`) on controllers without coolant M-codes (stock GRBL rejects `M7` unless compiled
+  with it).
+* **`machine.tube_work_coordinate_system`** (`G54`–`G59`) → the WCS **tube** jobs run in.
+  Default `G54` (the operator zeros G54 to each tube, like flat work — fully portable). Set
+  an alternate fixed WCS (e.g. `G55`) only if you have a permanently-fixtured jig **and**
+  have pre-set that WCS in the controller; an unset WCS defaults to machine zero and cuts in
+  the wrong place. Flat/2.5D work is always `G54`.
+
+Still assumed regardless: standard modal behavior and state persistence.
+
+Note: **Easel** (Inventables) is **not a supported target** — its importer rejects arcs
+(`G2/G3`) and non-`G54` work offsets, which PenguinCAM relies on. Teams on Easel-based
+machines should send PenguinCAM output **directly to the underlying GRBL controller** with a
+general G-code sender rather than importing it into Easel.
 
 ---
 
 ## 2. Work vs Machine Coordinates
 
-* **G54** is used for all programmed cutting motion.
-* **G53** is used explicitly for machine-coordinate safety moves.
-* The controller correctly supports `G53` as a non-modal machine-coordinate override.
+* **G54** is used for all flat/2.5D programmed motion, including start/end safe-Z retracts
+  (in work coordinates, `G0 Z<safe_height>`).
+* **Tube** jobs use the WCS from `machine.tube_work_coordinate_system` — default `G54` (same
+  zero-per-tube workflow as flat work), or an opt-in fixed WCS (e.g. `G55`) for a permanent
+  jig. When an alternate WCS is used the program switches to it after spindle start and
+  resets to `G54` before program end.
+* **G53** machine-coordinate moves appear **only** when `park_position` is configured
+  (the end-of-program / tube-flip gantry park). With no `park_position`, the program is
+  entirely work-coordinate and portable.
 
 ---
 
-## 3. Machine Z-Axis Orientation (Critical)
+## 3. Machine Z-Axis Orientation
 
-The program assumes:
-
-* Machine Z **increases upward**.
-* **Machine Z = 0.000** represents a **safe, high-clearance position**.
-* Executing `G53 G0 Z0.` retracts the spindle upward, away from the work.
-
-If machine Z=0 is at the bottom of travel or otherwise unsafe, gener
+* Machine Z **increases upward** (standard).
+* The safe retract height is a **work-coordinate** value above Z=0 (the sacrifice board):
+  `z_reference.safe_height` if set, else `material_thickness + clearance`. No assumption is
+  made about where machine Z=0 sits — that was the old `G53`-based behavior and is gone by
+  default.
+* If you enable `park_position`, then (and only then) the program assumes machine Z=0 is a
+  safe high position, since the park raises to `G53 Z<park_z>`.

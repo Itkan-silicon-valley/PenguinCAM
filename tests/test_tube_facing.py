@@ -4,6 +4,7 @@ import tempfile
 import os
 import re
 from frc_cam_postprocessor import FRCPostProcessor
+from team_config import TeamConfig
 
 
 class TestYCoordinateAdjustment(unittest.TestCase):
@@ -102,15 +103,16 @@ class TestTubeFacingGeneration(unittest.TestCase):
         finally:
             os.unlink(output_path)
 
-    def test_uses_g55_not_g52(self):
-        """Test output uses G55 and doesn't contain G52."""
+    def test_uses_work_offset_not_g52(self):
+        """Tube ops use a standard work coordinate system (G54 by default), never the G52
+        local-offset that some controllers mishandle."""
         with tempfile.NamedTemporaryFile(suffix='.nc', delete=False) as f:
             output_path = f.name
         try:
             self._generate_tube_gcode_to_file(output_path, '1x1')
             with open(output_path) as f:
                 content = f.read()
-            self.assertIn("G55", content)
+            self.assertIn("G54", content)      # default tube WCS
             self.assertNotIn("G52", content)
         finally:
             os.unlink(output_path)
@@ -228,16 +230,17 @@ class TestTubeFacingGeneration(unittest.TestCase):
             os.unlink(output_path)
 
     def test_contains_safe_z_clearance(self):
-        """Test output contains safe Z clearance moves using machine coordinates."""
+        """Safe Z clearance uses WORK coordinates (portable) - no machine-coord G53 by default."""
         with tempfile.NamedTemporaryFile(suffix='.nc', delete=False) as f:
             output_path = f.name
         try:
             self._generate_tube_gcode_to_file(output_path, '1x1')
             with open(output_path) as f:
                 content = f.read()
-            # Should use G53 G0 Z with park_z value (default -0.5) for safe clearance
-            self.assertIn("G53 G0 Z", content)
-            # Should not use G28 (removed to avoid soft limit issues on some machines)
+            # Work-coordinate safe Z (above the full tube: tube_height + 0.25 = 1.25")
+            self.assertIn("G0 Z1.2500  ; Safe Z clearance", content)
+            # No machine-coordinate moves by default (portable to GRBL/Easel/WinCNC)
+            self.assertNotIn("G53", content)
             self.assertNotIn("G28", content)
         finally:
             os.unlink(output_path)
@@ -254,41 +257,84 @@ class TestTubeFacingGeneration(unittest.TestCase):
         finally:
             os.unlink(output_path)
 
-    def test_uses_machine_coords_for_parking(self):
-        """Test parking uses machine coordinates (G53)."""
+    def test_no_tool_change(self):
+        """PenguinCAM is single-tool: tube output emits no tool change (M6/T1), which GRBL
+        rejects, so tube programs stay portable."""
         with tempfile.NamedTemporaryFile(suffix='.nc', delete=False) as f:
             output_path = f.name
         try:
             self._generate_tube_gcode_to_file(output_path, '1x1')
             with open(output_path) as f:
                 content = f.read()
-            self.assertIn("G53 G0 X0.5 Y0.5", content)  # Default generic parking position
-            self.assertNotIn("G0 X0 Y-2.0", content)  # Old work coord parking
+            self.assertNotIn("M6", content)
+            self.assertNotIn("T1", content)
         finally:
             os.unlink(output_path)
 
-    def test_z_before_xy_pattern(self):
-        """Test that G53 G0 Z0 always comes before XY moves."""
+    def test_no_g53_park_by_default(self):
+        """With no park_position configured, no G53 machine-coordinate park is emitted."""
         with tempfile.NamedTemporaryFile(suffix='.nc', delete=False) as f:
             output_path = f.name
         try:
             self._generate_tube_gcode_to_file(output_path, '1x1')
             with open(output_path) as f:
-                lines = f.readlines()
+                content = f.read()
+            self.assertNotIn("G53", content)
+        finally:
+            os.unlink(output_path)
 
-            # Find all G53 G0 Z0 lines and verify next XY move follows
-            for i, line in enumerate(lines):
-                if "G53 G0 Z0" in line:
-                    # Look for next non-empty, non-comment line
-                    for j in range(i+1, min(i+5, len(lines))):
-                        next_line = lines[j].strip()
-                        if next_line and not next_line.startswith('('):
-                            # Should be an XY move (G0 X... or G53 G0 X...)
-                            self.assertTrue(
-                                'X' in next_line or 'Y' in next_line or next_line == '',
-                                f"After G53 G0 Z0 at line {i}, expected XY move but got: {next_line}"
-                            )
-                            break
+    def test_g53_park_only_when_configured(self):
+        """A configured park_position opts back into the G53 machine-coordinate park."""
+        cfg = TeamConfig({'version': 2, 'default_machine': 'm', 'machines': {'m': {
+            'name': 'Mach', 'machine': {'park_position': {'x': 0.5, 'y': -0.5, 'z': -0.25}}}}})
+        pp = FRCPostProcessor(0.25, 0.157, config=cfg)
+        content = pp.generate_tube_facing_gcode(tube_size='1x1').gcode
+        self.assertIn("G53 G0 Z-0.2500", content)      # raise to machine safe Z
+        self.assertIn("G53 G0 X0.5 Y-0.5", content)    # gantry to the configured park spot
+
+    def test_tube_wcs_defaults_to_g54(self):
+        """With no tube WCS configured, tube ops run in G54 (operator zeros it per tube) -
+        portable, with no G55 and no WCS-reset noise."""
+        content = self.pp.generate_tube_facing_gcode(tube_size='1x1').gcode
+        self.assertIn("G54  ; Work coordinate system, zeroed at the tube origin", content)
+        self.assertNotIn("G55", content)
+        self.assertIn("Zero G54 at the tube origin", content)   # setup instruction matches
+        # Never switched away from G54, so there is no "reset" line.
+        self.assertNotIn("Reset to standard work coordinate system", content)
+
+    def test_tube_wcs_opt_in_alternate(self):
+        """A configured fixed WCS (e.g. G55) switches tube ops into it and resets to G54 at
+        program end, for teams with a permanently-fixtured jig."""
+        cfg = TeamConfig({'version': 2, 'default_machine': 'm', 'machines': {'m': {
+            'name': 'Mach', 'machine': {'tube_work_coordinate_system': 'G55'}}}})
+        pp = FRCPostProcessor(0.25, 0.157, config=cfg)
+        content = pp.generate_tube_facing_gcode(tube_size='1x1').gcode
+        self.assertIn("G55  ; Use fixed jig work coordinate system", content)
+        self.assertIn("Verify G55 is set to the fixed jig origin", content)
+        self.assertIn("G54  ; Reset to standard work coordinate system", content)
+
+    def test_tube_wcs_invalid_falls_back_to_g54(self):
+        """An out-of-range WCS value falls back to the safe G54 default rather than emitting
+        a bogus coordinate-system code."""
+        cfg = TeamConfig({'version': 2, 'default_machine': 'm', 'machines': {'m': {
+            'name': 'M', 'machine': {'tube_work_coordinate_system': 'G99'}}}})
+        pp = FRCPostProcessor(0.25, 0.157, config=cfg)
+        content = pp.generate_tube_facing_gcode(tube_size='1x1').gcode
+        self.assertNotIn("G99", content)
+        self.assertIn("G54  ; Work coordinate system, zeroed at the tube origin", content)
+
+    def test_safe_z_before_xy_pattern(self):
+        """The work-coordinate safe-Z retract precedes the first XY origin move."""
+        with tempfile.NamedTemporaryFile(suffix='.nc', delete=False) as f:
+            output_path = f.name
+        try:
+            self._generate_tube_gcode_to_file(output_path, '1x1')
+            with open(output_path) as f:
+                content = f.read()
+            z_idx = content.find("G0 Z1.2500  ; Safe Z clearance")
+            xy_idx = content.find("G0 X0 Y0")
+            self.assertGreaterEqual(z_idx, 0)
+            self.assertGreater(xy_idx, z_idx)   # safe Z comes before the XY origin move
         finally:
             os.unlink(output_path)
 

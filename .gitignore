@@ -1,7 +1,44 @@
+# Python
 __pycache__/
+*.pyc
+
+# Virtual environments (project uses uv/.venv; a stray root venv was cleaned up)
 venv/
 .venv/
 .pixi/
+bin/
+lib/
+lib64/
+include/
+share/
+pyvenv.cfg
+
+# Environment / editor / deploy
 .env
 .obsidian
 .vercel
+.DS_Store
+.lock
+
+# Credentials / OAuth config (NEVER commit these)
+google-creds.txt
+staging-oauth
+onshape_config.json
+*-creds.txt
+
+# Working team configs (keep the committed template, not local overrides)
+PenguinCAM-config.yaml
+new-config.yaml
+
+# Generated G-code and DXF debug/test artifacts
+*.nc
+debug_*.dxf
+test_output_*.nc
+*-output*.nc
+
+# Backup files
+*.bak
+*.backup
+
+# ...but never ignore test fixtures/goldens under tests/
+!tests/**

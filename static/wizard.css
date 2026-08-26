@@ -1,0 +1,400 @@
+:root {
+  --bg: #0f1419;
+  --panel: #1a212b;
+  --panel-2: #232c38;
+  --ink: #e6edf3;
+  --muted: #9aa7b4;
+  --accent: #2f81f7;
+  --accent-ink: #fff;
+  --danger: #f85149;
+  --ok: #3fb950;
+  --line: #30363d;
+  --canvas-bg: #11161d;      /* 2D layout / 3D viewer background */
+  --canvas-grid: #30363d;
+}
+
+/* Light theme — tied to Onshape's theme (?theme=light|dark) or standalone default. */
+:root[data-theme="light"] {
+  --bg: #f6f8fa;
+  --panel: #ffffff;
+  --panel-2: #eef1f4;
+  --ink: #1f2328;
+  --muted: #5a6570;
+  --accent: #2f81f7;
+  --accent-ink: #ffffff;
+  --danger: #d1242f;
+  --ok: #1a7f37;
+  --line: #d0d7de;
+  --canvas-bg: #f2f4f7;
+  --canvas-grid: #c7cfd8;
+  color-scheme: light;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--ink);
+  font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+}
+
+#wizard {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  min-width: 300px;
+}
+
+#wiz-header {
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel);
+}
+.brand { font-weight: 700; letter-spacing: 0.3px; }
+
+#stepbar {
+  display: flex;
+  gap: 6px;
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+  flex-wrap: wrap;
+}
+#stepbar li {
+  font-size: 12px;
+  color: var(--muted);
+  padding: 3px 10px;
+  border-radius: 999px;
+  background: var(--panel-2);
+  cursor: pointer;
+  user-select: none;
+  transition: background 0.12s, color 0.12s;
+}
+/* Numbers come from data-num, assigned by JS to the visible steps (the step list is
+   mode-dependent — tubing mode has no Layout step). They reflect position in the
+   sequence, not done/active state, so they never renumber as you advance. */
+#stepbar li::before { content: attr(data-num) ". "; opacity: 0.65; }
+#stepbar li[hidden] { display: none; }
+#stepbar li:hover { background: #2c3644; color: var(--ink); }
+#stepbar li:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+#stepbar li.done { color: var(--ok); }
+#stepbar li.done::after { content: " \2713"; }  /* completed check, kept separate from the number */
+#stepbar li.active { color: var(--accent-ink); background: var(--accent); }
+#stepbar li.active:hover { background: var(--accent); color: var(--accent-ink); }
+
+#wiz-body { flex: 1; overflow-y: auto; padding: 14px; }
+
+#wiz-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 14px;
+}
+#wiz-summary .chip {
+  font-size: 12px;
+  color: var(--muted);
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  padding: 3px 9px;
+  border-radius: 999px;
+  white-space: nowrap;
+}
+
+.step h2 { margin: 0 0 12px; font-size: 18px; }
+
+/* ---- Full-page grid mode (upload only): all four steps at once, 2x2 ----
+   Setup upper-left, Parts lower-left, Layout upper-right, Preview lower-right.
+   The current step is highlighted; transitions still fire per-step side effects
+   (JS gotoStep), so a quadrant stays incomplete until you navigate to it. The
+   narrow Onshape panel never gets the .grid class, so it keeps the single-step
+   wizard. The running decisions summary is redundant here (all steps visible). */
+#wizard.grid #wiz-summary { display: none; }
+#wizard.grid #wiz-body {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  grid-template-rows: 1fr 1fr;
+  gap: 12px;
+  overflow: hidden;          /* each quadrant scrolls itself */
+  min-height: 0;
+}
+#wizard.grid .step {
+  margin: 0;
+  min-height: 0;
+  overflow: auto;            /* quadrant content scrolls within its cell */
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel);
+}
+#wizard.grid .step[data-step="setup"]   { grid-column: 1; grid-row: 1; }
+#wizard.grid .step[data-step="parts"]   { grid-column: 1; grid-row: 2; }
+#wizard.grid .step[data-step="layout"]  { grid-column: 2; grid-row: 1; }
+#wizard.grid .step[data-step="preview"] { grid-column: 2; grid-row: 2; }
+#wizard.grid .step.current {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent) inset;
+}
+/* Narrow full-page widths: fall back to a single column, all steps still shown. */
+@media (max-width: 900px) {
+  #wizard.grid #wiz-body {
+    grid-template-columns: 1fr;
+    grid-template-rows: none;
+    grid-auto-rows: minmax(220px, auto);
+    overflow-y: auto;
+  }
+  #wizard.grid .step[data-step] { grid-column: 1; grid-row: auto; }
+}
+
+.field { display: block; margin: 0 0 14px; }
+.field > span, .field > legend { display: block; color: var(--muted); margin-bottom: 4px; font-size: 12px; }
+.field.inline { display: flex; align-items: center; gap: 8px; }
+.field.inline > span { margin: 0; }
+
+input[type="number"], input[type="text"], input[type="url"], select {
+  width: 100%;
+  padding: 8px;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--ink);
+  font: inherit;
+}
+input.invalid { border-color: var(--danger); }
+.field.inline input[type="number"], .field.inline input[type="text"] { width: 90px; }
+
+fieldset.field { border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; }
+.radio { display: block; color: var(--ink); margin: 4px 0; font-size: 13px; }
+/* The explicit display above beats the UA [hidden] rule, so hiding a .radio via
+   the hidden attribute needs this (e.g. 2.5D mode is hidden in upload mode). */
+.radio[hidden] { display: none; }
+
+.hint { color: var(--muted); font-size: 12px; }
+
+.btn {
+  appearance: none;
+  border: 1px solid var(--line);
+  background: var(--panel-2);
+  color: var(--ink);
+  padding: 8px 14px;
+  border-radius: 6px;
+  font: inherit;
+  cursor: pointer;
+}
+.btn:disabled { opacity: 0.45; cursor: not-allowed; }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+.btn.small { padding: 4px 8px; font-size: 12px; }
+
+#dropzone {
+  border: 2px dashed var(--line);
+  border-radius: 8px;
+  padding: 24px;
+  text-align: center;
+  color: var(--muted);
+  cursor: pointer;
+}
+#dropzone.drag { border-color: var(--accent); color: var(--ink); }
+
+.select-status {
+  padding: 12px;
+  border: 1px dashed var(--line);
+  border-radius: 8px;
+  text-align: center;
+  color: var(--ink);
+  background: var(--panel);
+  font-size: 13px;
+}
+
+#parts-list { list-style: none; margin: 14px 0 0; padding: 0; }
+.part-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  margin-bottom: 8px;
+  background: var(--panel);
+}
+.part-item svg { background: var(--bg); border-radius: 4px; flex: 0 0 auto; }
+.part-item .meta { flex: 1; min-width: 0; }
+.part-item .name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.part-item .dims { color: var(--muted); font-size: 12px; }
+.part-item .remove { color: var(--danger); background: none; border: none; cursor: pointer; font-size: 18px; }
+
+#layout-info {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 16px;
+  font-size: 12px;
+  color: var(--muted);
+  padding: 8px 10px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  margin-bottom: 8px;
+}
+#layout-info strong { color: var(--ink); }
+#layout-toolbar { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+#layout-toolbar .spacer { flex: 1; }
+#layout-canvas, #preview-canvas {
+  width: 100%;
+  height: auto;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  touch-action: none;
+}
+
+.errors { color: var(--danger); font-size: 13px; margin-top: 8px; white-space: pre-wrap; }
+
+#wiz-nav {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 14px;
+  border-top: 1px solid var(--line);
+  background: var(--panel);
+}
+#wiz-nav > .btn { flex: 1; }
+
+/* Final-action split button (Preview step). */
+.split-btn { position: relative; display: flex; flex: 1; }
+/* `display: flex` above overrides the HTML `hidden` attribute; restore it so the
+   button only shows on the Preview step. */
+#final-action[hidden] { display: none; }
+.split-btn #btn-do { flex: 1; }
+.split-btn.has-caret #btn-do { border-top-right-radius: 0; border-bottom-right-radius: 0; }
+.split-caret {
+  flex: 0 0 auto;
+  padding: 8px 16px;
+  font-size: 16px;
+  line-height: 1;
+  border-top-left-radius: 0;
+  border-bottom-left-radius: 0;
+  border-left: 1px solid rgba(0, 0, 0, 0.25);
+}
+.do-menu {
+  position: absolute;
+  bottom: 100%;
+  right: 0;
+  margin: 0 0 4px;
+  padding: 4px;
+  list-style: none;
+  min-width: 200px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.3);
+  z-index: 200;
+}
+.do-menu li {
+  padding: 8px 10px;
+  border-radius: 4px;
+  font-size: 13px;
+  color: var(--ink);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.do-menu li:hover { background: var(--panel-2); }
+
+#preview-stats { margin: 10px 0; color: var(--muted); font-size: 13px; }
+
+.config-info { margin-top: 6px; }
+.config-status { margin: 0; font-size: 12px; color: var(--muted); }
+.config-status a { color: var(--accent); text-decoration: none; }
+.config-status a:hover { text-decoration: underline; }
+.config-status-default { color: #d29922; }
+/* Deliberately understated: a reload affordance for the rare config change, not a
+   call-to-action. Nearly invisible until hovered. */
+.config-status a.config-refresh { color: var(--muted); opacity: 0.35; margin-left: 5px; font-size: 0.9em; text-decoration: none; transition: opacity 0.15s ease; }
+.config-status a.config-refresh:hover { opacity: 0.85; text-decoration: none; }
+
+/* Team-config source (upload flow, Setup step). */
+.config-source .field-label { display: block; color: var(--muted); margin-bottom: 4px; font-size: 12px; }
+.config-source-row { display: flex; gap: 6px; align-items: stretch; }
+.config-source-row input { flex: 1 1 auto; min-width: 0; }
+/* Understated, like the Onshape reload glyph: muted until hovered, not a call-to-action. */
+.config-source-row .btn { flex: 0 0 auto; white-space: nowrap; background: transparent; color: var(--muted); opacity: 0.7; transition: opacity 0.15s ease, color 0.15s ease; }
+.config-source-row .btn:hover { opacity: 1; color: var(--ink); border-color: var(--accent); }
+.config-source-row .btn.config-reset { border-color: transparent; }
+.config-source-status { margin: 6px 0 0; font-size: 12px; min-height: 1em; color: var(--muted); }
+.config-source-status.error { color: var(--danger); }
+.config-source-status.ok { color: var(--muted); }
+.config-source-status.warn { color: #d29922; }
+/* Loaded-config confirmation (team name/number) next to the field, for parse confidence. */
+.config-source-loaded { margin: 6px 0 0; font-size: 12px; color: var(--muted); }
+.config-source-loaded strong { color: var(--ink); font-weight: 600; }
+
+#viewer-container {
+  position: relative;
+  width: 100%;
+  height: 320px;
+  background: var(--canvas-bg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  overflow: hidden;
+}
+#gcode-canvas { display: block; width: 100%; height: 100%; }
+.empty-state {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--muted);
+  font-size: 13px;
+  pointer-events: none;
+}
+
+.scrubber-container { margin-top: 10px; }
+.scrubber-header { display: flex; justify-content: space-between; font-size: 12px; color: var(--muted); margin-bottom: 4px; gap: 8px; }
+.scrubber-op { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 60%; }
+#toolpath-scrubber { width: 100%; }
+
+.playback-controls { display: flex; align-items: center; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+.playback-controls .speed { font-size: 12px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
+.playback-controls .speed select { width: auto; padding: 4px 6px; }
+.btn.small.playing { background: var(--ok); border-color: var(--ok); color: #08130b; }
+
+#connect-overlay, #verify-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(15, 20, 25, 0.96);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 5000;
+  padding: 20px;
+}
+/* The `display: flex` above overrides the HTML `hidden` attribute, so restore
+   hidden behavior explicitly (higher specificity than the id rule). */
+#connect-overlay[hidden], #verify-overlay[hidden] { display: none; }
+.connect-card {
+  max-width: 320px;
+  text-align: center;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 24px;
+}
+.connect-card h2 { margin: 0 0 10px; }
+.connect-card p { color: var(--muted); }
+.connect-card .btn { margin-top: 8px; }
+
+#debug-overlay {
+  position: fixed;
+  right: 6px;
+  bottom: 6px;
+  max-width: 90vw;
+  max-height: 40vh;
+  overflow: auto;
+  background: rgba(0,0,0,0.85);
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  padding: 6px 8px;
+  font-size: 11px;
+  z-index: 9999;
+}
+#debug-overlay pre { margin: 4px 0 0; white-space: pre-wrap; word-break: break-word; }

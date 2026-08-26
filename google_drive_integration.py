@@ -4,7 +4,6 @@ Saves G-code files directly to team's shared Google Drive
 """
 
 import os
-import sys
 import json
 import pickle
 from pathlib import Path
@@ -14,22 +13,7 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from googleapiclient.errors import HttpError
-import logging
-
-# Configure logging for Vercel
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(message)s',
-    stream=sys.stderr,
-    force=True
-)
-logger = logging.getLogger(__name__)
-
-# Logging helper for Vercel/serverless environments
-def log(*args, **kwargs):
-    """Log to stderr using Python logging module for better Vercel compatibility"""
-    message = ' '.join(str(arg) for arg in args)
-    logger.info(message)
+from logging_config import log  # shared log() + logging setup (was duplicated per module)
 
 # Scopes needed - only Drive file access
 SCOPES = ['https://www.googleapis.com/auth/drive.file']
@@ -150,28 +134,6 @@ class GoogleDriveUploader:
         
         return current_folder_id
     
-    def create_folder(self, drive_id, parent_folder_id, folder_name):
-        """Create a folder in the shared drive"""
-        try:
-            file_metadata = {
-                'name': folder_name,
-                'mimeType': 'application/vnd.google-apps.folder',
-                'driveId': drive_id,
-                'parents': [parent_folder_id] if parent_folder_id else []
-            }
-            
-            folder = self.service.files().create(
-                body=file_metadata,
-                supportsAllDrives=True,
-                fields='id'
-            ).execute()
-            
-            return folder['id']
-            
-        except HttpError as error:
-            log(f"Error creating folder: {error}")
-            return None
-    
     def upload_file(self, file_path, filename=None):
         """
         Upload a file to the configured Google Drive folder
@@ -251,30 +213,3 @@ class GoogleDriveUploader:
                 'message': f"Upload failed: {str(error)}"
             }
     
-    def is_configured(self):
-        """Check if Google Drive is set up and ready"""
-        if not os.path.exists(CREDENTIALS_FILE):
-            return False, "Missing credentials.json - see GOOGLE_DRIVE_SETUP.md"
-        
-        try:
-            if not self.service:
-                self.authenticate()
-            return True, "Google Drive ready"
-        except Exception as e:
-            return False, f"Authentication error: {str(e)}"
-
-
-# Convenience function
-def upload_gcode_to_drive(file_path, filename=None):
-    """
-    Upload a G-code file to the team's Google Drive
-    
-    Args:
-        file_path: Path to the G-code file
-        filename: Optional custom filename
-    
-    Returns:
-        dict with upload result
-    """
-    uploader = GoogleDriveUploader()
-    return uploader.upload_file(file_path, filename)

@@ -15,6 +15,7 @@
         <a href="index.html" class="active">Introduction</a>
         <a href="usage.html">How to Use</a>
         <a href="configuration.html">Configuration</a>
+        <a href="feeds-speeds.html">Feeds &amp; Speeds</a>
         <a href="roadmap.html">Roadmap</a>
         <div class="nav-divider"></div>
         <a href="/" class="nav-external">← Back to App</a>
@@ -24,15 +25,64 @@
         <h1>Welcome to PenguinCAM</h1>
 
         <p class="lead">
-            PenguinCAM is a CAM post-processor that generates CNC G-code from DXF files exported from Onshape.
-            Built for <strong>FRC Team 6238 Popcorn Penguins</strong>, it automates the CAD-to-CNC workflow for flat plates without requiring CAM software.
+            PenguinCAM is a CAM post-processor that generates 3-axis CNC router G-code from DXF files exported from Onshape.
+            Built for <strong>FRC Team 6238 Popcorn Penguins</strong>, it automates the CAD-to-CNC workflow for flat plates and tubes without requiring CAM software.
+        </p>
+
+        <p class="lead">
+            <strong>Philosophy</strong>: FRC doesn't need to teach machining. Most teams do not have traditional machine tools. A (relatively) inexpensive
+            3-axis CNC router is all an FRC team really needs. But the traditional software to use any sort of CNC machine is fairly daunting. Instead,
+            PenguinCAM has the attitude that students want to get their part out of their CAD screen and into their hands with as little friction as possible,
+            similar to a laser cutter or 3D printer.
+        </p>
+
+        <p class="lead lead-tight">To accomplish this simplicity, it takes two strategies:</p>
+        <ul class="lead-list">
+            <li>Move the repetitive and opaque tasks into a one-time setup task (create a config file and save it in Onshape classroom) so that team-specific
+                choices are shared by all students on the team, with reasonable defaults so that most teams won't even need to do it.</li>
+            <li>Make the per-part inputs as minimal as possible. It does this by making some FRC-realistic assumptions:
+                <ul>
+                    <li>The machine is a 3-axis CNC router that speaks standard G-code (e.g. Omio, ShopBot, ShopSabre, Avid, XCarve, and similar)</li>
+                    <li>The parts will be cut from a small library of common FRC materials</li>
+                    <li>The parts are flat in nature (2D/2.5D plates and faces of tubes)</li>
+                    <li>A single tool (often a 4mm end mill) is sufficient to cut all features</li>
+                </ul>
+            </li>
+        </ul>
+
+        <p class="lead lead-tight">This design with these assumptions make it such that the student making parts only has to do minimal manual steps:</p>
+        <ul class="lead-list">
+            <li>Pick the part type</li>
+            <li>Identify the part(s) to be cut in CAD</li>
+            <li>Specify per-job variables (material, tool size)</li>
+            <li>Affix the stock to the CNC router and set the X/Y zero point on the stock</li>
+            <li>Load the G-code into the router</li>
+            <li>Press Go!</li>
+        </ul>
+
+        <p class="lead">
+            There might be certain machines for which there are extra steps. Some might require manual moving of the G-code to the router.
+            Some might require re-zeroing the Z axis. Some might require manually starting the spindle or the cooling system. But where
+            available, PenguinCAM will generate gcode to do all of that. PenguinCAM will even move the spindle out of the way at the end of
+            the job for you! If it's a repetitive manual step, PenguinCAM will attempt to automate it for you.
+        </p>
+
+        <p class="lead">
+            Because there are so few inputs and decisions made by the student, there is very little risk that anything will go wrong. If
+            an end mill breaks, it's almost certainly PenguinCAM's fault, not the student's.
         </p>
 
         <div class="feature-grid">
             <div class="feature-card">
                 <div class="feature-icon">🔗</div>
-                <h3>One-Click Integration</h3>
-                <p>Export parts directly from Onshape with a single click. No manual file export/import handling required.</p>
+                <h3>Runs Inside Onshape</h3>
+                <p>The entire workflow lives in a panel docked to your Onshape window. Click a face in your model and it imports instantly — no exporting, uploading, or switching tabs.</p>
+            </div>
+
+            <div class="feature-card">
+                <div class="feature-icon">🧩</div>
+                <h3>Multi-Part Jobs</h3>
+                <p>Nest several parts on one sheet of stock and cut them in a single program. Drag to position, rotate, and flip each part on a visual layout canvas.</p>
             </div>
 
             <div class="feature-card">
@@ -44,25 +94,25 @@
             <div class="feature-card">
                 <div class="feature-icon">📐</div>
                 <h3>Interactive Preview</h3>
-                <p>Visualize your toolpaths in 3D before cutting. Rotate, scrub through moves, and verify setup.</p>
-            </div>
-
-            <div class="feature-card">
-                <div class="feature-icon">⚙️</div>
-                <h3>Team Customization</h3>
-                <p>Configure machine dimensions, materials, and cutting parameters for your specific CNC setup.</p>
+                <p>Visualize your toolpaths in 3D before cutting. Orbit the view, scrub through moves, and animate the tool at adjustable speed.</p>
             </div>
 
             <div class="feature-card">
                 <div class="feature-icon">🔧</div>
-                <h3>Multi-Layer Support</h3>
-                <p>Create 2.5D parts with grooves, pockets, and countersinks at multiple depths.</p>
+                <h3>Multi-Layer (2.5D)</h3>
+                <p>Cut parts with grooves, pockets, countersinks, and raised bosses at multiple depths. Thickness is read straight from your CAD model.</p>
             </div>
 
             <div class="feature-card">
                 <div class="feature-icon">📦</div>
                 <h3>Tube Machining</h3>
-                <p>Special mode for cutting patterns on aluminum tubing, with automatic end squaring and mirroring.</p>
+                <p>Cut patterns on aluminum tubing, with automatic end squaring, cut-to-length, and mirrored or distinct patterns per face.</p>
+            </div>
+
+            <div class="feature-card">
+                <div class="feature-icon">⚙️</div>
+                <h3>Team Customization</h3>
+                <p>Configure machine dimensions, materials, and cutting parameters for your specific CNC setup with a simple config file.</p>
             </div>
         </div>
 
@@ -72,10 +122,11 @@
             <div class="step">
                 <div class="step-number">1</div>
                 <div class="step-content">
-                    <h3>Install Onshape App</h3>
+                    <h3>Install the Onshape App</h3>
                     <p>
                         Add PenguinCAM to your Onshape account from the
-                        <a href="https://cad.onshape.com/appstore/apps/CAM/6939eaf505d3df4aeac54600" target="_blank">Onshape App Store</a>
+                        <a href="https://cad.onshape.com/appstore/apps/CAM/6939eaf505d3df4aeac54600" target="_blank">Onshape App Store</a>.
+                        This docks a PenguinCAM panel to the side of your Onshape window.
                     </p>
                 </div>
             </div>
@@ -83,16 +134,24 @@
             <div class="step">
                 <div class="step-number">2</div>
                 <div class="step-content">
-                    <h3>Select a Face</h3>
-                    <p>In Onshape, open the PenguinCAM panel, then select the top face of your part and click "Send to PenguinCAM"</p>
+                    <h3>Set Up the Job</h3>
+                    <p>Open the panel and choose your machine, cutting mode (2D, 2.5D, or tubing), tool, and material.</p>
                 </div>
             </div>
 
             <div class="step">
                 <div class="step-number">3</div>
                 <div class="step-content">
-                    <h3>Generate G-code</h3>
-                    <p>Review parameters, preview the toolpath, and download your G-code program</p>
+                    <h3>Add Parts</h3>
+                    <p>Click a face in your Onshape model — it imports automatically. Add more faces to build a multi-part job, then arrange them on the stock.</p>
+                </div>
+            </div>
+
+            <div class="step">
+                <div class="step-number">4</div>
+                <div class="step-content">
+                    <h3>Preview &amp; Download</h3>
+                    <p>Review the 3D toolpath preview, then download your G-code program or save it straight to Google Drive.</p>
                 </div>
             </div>
         </div>
@@ -113,6 +172,16 @@
             </div>
         </div>
 
+        <div class="info-box">
+            <div class="info-icon">💡</div>
+            <div>
+                <strong>No Onshape? No problem.</strong> If you don't use Onshape, you can still run the full
+                workflow by uploading DXF files directly at
+                <a href="https://penguincam.popcornpenguins.com/app">penguincam.popcornpenguins.com/app</a>.
+                See <a href="usage.html">How to Use</a>.
+            </div>
+        </div>
+
         <h2>Support & Contact</h2>
 
         <p>
@@ -126,7 +195,7 @@
 
         <footer>
             <p>PenguinCAM is maintained by FRC Team 6238 Popcorn Penguins</p>
-            <p>Last Updated: January 2026</p>
+            <p>Last Updated: August 2026</p>
         </footer>
     </main>
 </body>

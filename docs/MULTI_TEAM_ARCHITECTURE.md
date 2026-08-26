@@ -161,8 +161,7 @@ Saves to team's configured Drive folder
 All routes protected by Flask-Limiter:
 - Global default: 200 requests/hour
 - `/process`: 10 requests/minute (CPU intensive)
-- `/onshape/import`: 20 requests/minute
-- `/onshape/save-dxf`: 20 requests/minute
+- `/onshape/export-face`: 30 requests/minute
 - `/drive/upload`: 30 requests/minute
 
 ## Future Enhancements

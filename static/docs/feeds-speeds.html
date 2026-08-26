@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>FRC Router Feeds &amp; Speeds Explainer &mdash; PenguinCAM</title>
+    <link rel="stylesheet" href="style.css">
+    <link rel="stylesheet" href="feeds-speeds.css">
+</head>
+<body>
+    <nav class="sidebar">
+        <div class="logo">
+            <span class="accent">Penguin</span>CAM
+        </div>
+        <div class="nav-section">Documentation</div>
+        <a href="index.html">Introduction</a>
+        <a href="usage.html">How to Use</a>
+        <a href="configuration.html">Configuration</a>
+        <a href="feeds-speeds.html" class="active">Feeds &amp; Speeds</a>
+        <a href="roadmap.html">Roadmap</a>
+        <div class="nav-divider"></div>
+        <a href="/" class="nav-external">&larr; Back to App</a>
+    </nav>
+
+    <main class="content">
+        <h1>FRC Router Feeds &amp; Speeds Explainer</h1>
+        <p class="lead">
+            A simple calculator showing how tool diameter, flute count, material, and machine
+            limits turn into practical CNC router feeds and speeds.
+        </p>
+
+        <div class="info-box disclaimer">
+            <div class="info-icon">&#9888;&#65039;</div>
+            <div>
+                These are <strong>starting points, not guarantees</strong>. Verify workholding,
+                chip evacuation, tool quality, and machine condition before you cut.
+            </div>
+        </div>
+
+        <div class="fs-grid">
+            <!-- ============ INPUTS ============ -->
+            <section class="fs-col fs-inputs">
+                <h2>Inputs</h2>
+
+                <fieldset>
+                    <legend>Machine</legend>
+                    <label>Preset
+                        <select id="machine-preset"></select>
+                    </label>
+                    <label>Max XY feed (IPM)
+                        <input type="number" id="machine-xy_feed_max" step="1" min="1">
+                    </label>
+                    <label>Spindle RPM min
+                        <input type="number" id="machine-rpm_min" step="100" min="1">
+                    </label>
+                    <label>Spindle RPM max
+                        <input type="number" id="machine-rpm_max" step="100" min="1">
+                    </label>
+                    <label>Rigidity
+                        <select id="machine-rigidity">
+                            <option value="light">Light</option>
+                            <option value="medium">Medium</option>
+                            <option value="heavy">Heavy</option>
+                        </select>
+                    </label>
+                </fieldset>
+
+                <fieldset>
+                    <legend>Material</legend>
+                    <label>Preset
+                        <select id="material-preset"></select>
+                    </label>
+                    <label>Preferred RPM
+                        <input type="number" id="material-preferred_rpm" step="100" min="1">
+                    </label>
+                    <label>Reference chipload (in/tooth)
+                        <input type="number" id="material-chipload_ref" step="0.0001" min="0">
+                    </label>
+                    <label>Slotting multiplier
+                        <input type="number" id="material-slotting_multiplier" step="0.01" min="0" max="1">
+                    </label>
+                    <label>Stepover ratio (x dia)
+                        <input type="number" id="material-stepover_ratio" step="0.01" min="0" max="1">
+                    </label>
+                </fieldset>
+
+                <fieldset>
+                    <legend>Tool</legend>
+                    <label>Preset
+                        <select id="tool-preset"></select>
+                    </label>
+                    <label>Diameter (in)
+                        <input type="number" id="tool-diameter" step="0.001" min="0.01">
+                    </label>
+                    <label>Flutes
+                        <input type="number" id="tool-flutes" step="1" min="1" max="6">
+                    </label>
+                    <label>Operation
+                        <select id="operation">
+                            <option value="profile">Profile / slot</option>
+                            <option value="pocket">Pocket / clearing</option>
+                            <option value="peck_drill">Peck-drill hole</option>
+                        </select>
+                    </label>
+                </fieldset>
+            </section>
+
+            <!-- ============ RESULTS ============ -->
+            <section class="fs-col fs-results">
+                <h2>Results</h2>
+                <div class="result-grid">
+                    <div class="result-card"><span class="result-label">Spindle RPM</span><span class="result-value" id="r-rpm">&ndash;</span></div>
+                    <div class="result-card primary"><span class="result-label">XY feed</span><span class="result-value" id="r-feed">&ndash;</span><span class="result-unit">IPM</span></div>
+                    <div class="result-card"><span class="result-label">Ramp feed</span><span class="result-value" id="r-ramp">&ndash;</span><span class="result-unit">IPM</span></div>
+                    <div class="result-card"><span class="result-label">Peck / plunge feed</span><span class="result-value" id="r-peck">&ndash;</span><span class="result-unit">IPM</span></div>
+                    <div class="result-card"><span class="result-label">Stepover</span><span class="result-value" id="r-stepover">&ndash;</span><span class="result-unit">in</span></div>
+                    <div class="result-card"><span class="result-label">Max slotting stepdown</span><span class="result-value" id="r-stepdown">&ndash;</span><span class="result-unit">in</span></div>
+                    <div class="result-card"><span class="result-label">Achieved chipload</span><span class="result-value" id="r-chipload">&ndash;</span><span class="result-unit">in/tooth</span></div>
+                </div>
+
+                <div id="warnings" class="warnings"></div>
+
+                <div class="copy-buttons">
+                    <button data-copy="yaml">Copy YAML</button>
+                    <button data-copy="json">Copy JSON</button>
+                    <button data-copy="sheet">Copy setup sheet</button>
+                </div>
+            </section>
+
+            <!-- ============ EXPLANATION ============ -->
+            <section class="fs-col fs-explain">
+                <h2>Explanation</h2>
+                <p id="explanation" class="explanation">&ndash;</p>
+                <h3>Formulas</h3>
+                <pre id="formulas" class="formulas"></pre>
+            </section>
+        </div>
+
+        <footer>
+            <p>PenguinCAM is maintained by FRC Team 6238 Popcorn Penguins</p>
+        </footer>
+    </main>
+
+    <script src="feeds-speeds.js"></script>
+</body>
+</html>

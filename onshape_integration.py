@@ -3,30 +3,45 @@ Onshape Integration for PenguinCAM
 Handles OAuth authentication and DXF export from Onshape
 """
 
+import math
 import os
-import sys
 import json
+import tempfile
+import time
+import traceback
+
+import ezdxf
 import requests
 import base64
-from urllib.parse import urlencode, parse_qs
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
+from urllib.parse import urlencode, parse_qs
+
 from flask import session
-import logging
+from shapely.geometry import Point, Polygon
+from shapely.ops import unary_union
 
-# Configure logging for Vercel
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(message)s',
-    stream=sys.stderr,
-    force=True
-)
-logger = logging.getLogger(__name__)
+from dxf_geometry import entities_to_closed_paths
+from logging_config import log  # shared log() + logging setup (was duplicated per module)
 
-# Logging helper for Vercel/serverless environments
-def log(*args, **kwargs):
-    """Log to stderr using Python logging module for better Vercel compatibility"""
-    message = ' '.join(str(arg) for arg in args)
-    logger.info(message)
+
+def mask(secret):
+    """Redact a secret for logging.
+
+    Returns a fingerprint that is safe to write to logs / stack traces without
+    revealing the value. Never returns enough characters to reconstruct it.
+    Used anywhere an API key/secret (or a derived auth header) might otherwise
+    be printed.
+    """
+    if not secret:
+        return '<unset>'
+    s = str(secret)
+    if len(s) <= 8:
+        return '****'
+    return f'****{s[-4:]}'
+
 
 class OnshapeClient:
     """Client for interacting with Onshape API"""
@@ -39,7 +54,46 @@ class OnshapeClient:
         self.access_token = None
         self.refresh_token = None
         self.token_expires = None
-    
+        # Auth mode: 'oauth' (interactive, session-driven) or 'apikey' (headless).
+        self.auth_mode = 'oauth'
+        self.api_access_key = None
+        self.api_secret_key = None
+        # Shared connection pool with retry/backoff for transient failures
+        # (connection resets, 429/5xx). Applies to every API call in both auth
+        # modes; important for the headless harness that fires many requests.
+        self.session = requests.Session()
+        retry = Retry(
+            total=4, connect=4, read=4, status=4,
+            backoff_factor=0.5,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=frozenset(['GET', 'POST', 'PUT', 'DELETE']),
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(max_retries=retry)
+        self.session.mount('https://', adapter)
+        self.session.mount('http://', adapter)
+
+    @classmethod
+    def from_api_keys(cls, access_key=None, secret_key=None):
+        """Build a headless client authenticated with an Onshape API key pair.
+
+        No OAuth / Flask session involved. When args are omitted, reads
+        ONSHAPE_ACCESS_KEY / ONSHAPE_SECRET_KEY from the environment. The secret
+        stays inside this process and is never logged; only a masked fingerprint
+        of the access key is emitted so runs are traceable.
+        """
+        client = cls()
+        client.auth_mode = 'apikey'
+        client.api_access_key = access_key or os.environ.get('ONSHAPE_ACCESS_KEY')
+        client.api_secret_key = secret_key or os.environ.get('ONSHAPE_SECRET_KEY')
+        if not client.api_access_key or not client.api_secret_key:
+            raise ValueError(
+                "API-key auth requires ONSHAPE_ACCESS_KEY and ONSHAPE_SECRET_KEY "
+                "environment variables to be set (their values are never printed)."
+            )
+        log(f"   Onshape API-key mode: access key {mask(client.api_access_key)}")
+        return client
+
     def _load_config(self):
         """Load Onshape OAuth configuration, prioritizing environment variables"""
         # Try to load from file first
@@ -188,6 +242,11 @@ class OnshapeClient:
     
     def _ensure_valid_token(self):
         """Ensure we have a valid access token"""
+        if self.auth_mode == 'apikey':
+            # API keys don't expire and carry no refresh flow; nothing to do.
+            if not (self.api_access_key and self.api_secret_key):
+                raise ValueError("API-key mode selected but keys are not set")
+            return
         if not self.access_token:
             raise ValueError("No access token. User must authenticate first.")
         
@@ -209,13 +268,20 @@ class OnshapeClient:
             Response object
         """
         self._ensure_valid_token()
-        
+
         url = f"{self.API_BASE}{endpoint}"
-        
         headers = kwargs.pop('headers', {})
+
+        if self.auth_mode == 'apikey':
+            # HTTP Basic (accessKey:secretKey). requests builds the header
+            # internally; the credential is never placed in a variable we log.
+            return self.session.request(
+                method, url, headers=headers,
+                auth=(self.api_access_key, self.api_secret_key), **kwargs
+            )
+
         headers['Authorization'] = f'Bearer {self.access_token}'
-        
-        return requests.request(method, url, headers=headers, **kwargs)
+        return self.session.request(method, url, headers=headers, **kwargs)
     
     def get_user_info(self):
         """Get information about the authenticated user"""
@@ -228,100 +294,6 @@ class OnshapeClient:
             log(f"Error getting user info: {e}")
             return None
 
-    def get_user_session_info(self):
-        """
-        Get detailed session info for the authenticated user
-
-        Returns:
-            dict with user session info including name, email, etc.
-        """
-        try:
-            log("   Fetching user session info...")
-            response = self._make_api_request('GET', '/users/sessioninfo')
-            if response.status_code == 200:
-                user_info = response.json()
-                log(f"   ✅ User: {user_info.get('name', 'Unknown')}")
-                return user_info
-            else:
-                log(f"   ❌ Failed to get session info: HTTP {response.status_code}")
-                return None
-        except Exception as e:
-            log(f"   ❌ Error getting session info: {e}")
-            import traceback
-            log(traceback.format_exc())
-            return None
-
-    def get_companies(self):
-        """
-        Get list of companies/teams the user belongs to
-
-        Returns:
-            list of company dicts
-        """
-        try:
-            log("   Fetching companies...")
-            response = self._make_api_request('GET', '/companies?activeOnly=true&includeAll=false')
-            if response.status_code == 200:
-                companies = response.json().get('items', [])
-                log(f"   ✅ Found {len(companies)} companies: {[c.get('name') for c in companies]}")
-                return companies
-            else:
-                log(f"   ❌ Failed to get companies: HTTP {response.status_code}")
-                return None
-        except Exception as e:
-            log(f"   ❌ Error getting companies: {e}")
-            import traceback
-            log(traceback.format_exc())
-            return None
-
-    def get_document_company(self, document_id):
-        """
-        Get the company/team that owns a specific document
-
-        Args:
-            document_id: Onshape document ID
-
-        Returns:
-            dict with company info, or None if not found
-        """
-        try:
-            log("   Determining document owner company...")
-
-            # Get document info to find owner
-            doc_info = self.get_document_info(document_id)
-            if not doc_info:
-                log("   ❌ Could not get document info")
-                return None
-
-            # Documents have an 'owner' field with type and id
-            # type: 0 = user, 1 = company, 2 = team (I think - need to verify)
-            owner_info = doc_info.get('owner', {})
-            owner_type = owner_info.get('type')
-            owner_id = owner_info.get('id')
-            owner_name = owner_info.get('name', 'Unknown')
-
-            log(f"   Document owner: {owner_name} (type={owner_type}, id={owner_id[:8]}...)")
-
-            # If owner is a company/team (type 1 or 2), find it in the companies list
-            if owner_type in [1, 2]:
-                companies = self.get_companies()
-                if companies:
-                    for company in companies:
-                        if company.get('id') == owner_id:
-                            log(f"   ✅ Document belongs to company: {company.get('name')}")
-                            return company
-                    log(f"   ⚠️  Document owner company not found in user's companies")
-                    return None
-            else:
-                log(f"   ℹ️  Document is owned by user (not a company/team)")
-                return None
-
-        except Exception as e:
-            log(f"   ❌ Error getting document company: {e}")
-            import traceback
-            log(traceback.format_exc())
-            return None
-    
     def _calculate_view_matrix(self, normal):
         """
         Calculate a view matrix that looks at a face straight-on based on its normal.
@@ -332,7 +304,6 @@ class OnshapeClient:
         Returns:
             String representing a 4x4 view matrix in Onshape format
         """
-        import math
 
         nx = normal.get('x', 0)
         ny = normal.get('y', 0)
@@ -396,7 +367,30 @@ class OnshapeClient:
         # Convert to comma-separated string
         return ','.join(str(v) for v in matrix)
 
-    def export_face_to_dxf(self, document_id, workspace_id, element_id, face_id, body_id=None, face_normal=None):
+    @staticmethod
+    def _wvm_path(document_id, workspace_id=None, version_id=None, microversion_id=None):
+        """Build the Onshape document-context path segment 'd/{did}/{w|v|m}/{id}'.
+
+        Onshape addresses element data by workspace (w, live/editable), version (v),
+        or microversion (m) - the latter two are read-only snapshots. When our element
+        panel is launched on an OLDER VERSION of a document, Onshape substitutes the
+        {$versionId} placeholder in the panel URL but leaves {$workspaceId} unfilled
+        (there is no workspace in that context). Callers pass whichever id they were
+        handed and this picks the matching segment, preferring workspace when present.
+        Read is valid against all three, so DXF export works from a version too.
+        """
+        if workspace_id:
+            wvm = f"w/{workspace_id}"
+        elif version_id:
+            wvm = f"v/{version_id}"
+        elif microversion_id:
+            wvm = f"m/{microversion_id}"
+        else:
+            raise ValueError("Onshape document context needs a workspace, version, or microversion id")
+        return f"d/{document_id}/{wvm}"
+
+    def export_face_to_dxf(self, document_id, workspace_id, element_id, face_id, body_id=None, face_normal=None,
+                           version_id=None, microversion_id=None):
         """
         Export a face from a Part Studio as DXF
 
@@ -422,7 +416,7 @@ class OnshapeClient:
         
         # Try the internal export endpoint that Onshape's web UI uses
         log("\n[Method 1] Trying exportinternal endpoint (web UI method)...")
-        endpoint = f"/documents/d/{document_id}/w/{workspace_id}/e/{element_id}/exportinternal"
+        endpoint = f"/documents/{self._wvm_path(document_id, workspace_id, version_id, microversion_id)}/e/{element_id}/exportinternal"
         
         try:
             # For Part Studios, Onshape's "partIds" parameter actually expects face IDs, not body IDs
@@ -471,18 +465,18 @@ class OnshapeClient:
                 
         except Exception as e:
             log(f"Error with exportinternal: {e}")
-            import traceback
             log(traceback.format_exc())
         
         # Fallback: Try async translations API
         log("\n[Method 2] Trying async translations API...")
-        result = self.export_dxf_async(document_id, workspace_id, element_id)
+        result = self.export_dxf_async(document_id, workspace_id, element_id,
+                                       version_id=version_id, microversion_id=microversion_id)
         if result:
             return result
-        
+
         # Fallback: Try POST /export endpoint
         log("\n[Method 3] Trying POST /export endpoint...")
-        endpoint = f"/partstudios/d/{document_id}/w/{workspace_id}/e/{element_id}/export"
+        endpoint = f"/partstudios/{self._wvm_path(document_id, workspace_id, version_id, microversion_id)}/e/{element_id}/export"
         
         try:
             body = {
@@ -505,35 +499,15 @@ class OnshapeClient:
         log("\n=== All export methods failed ===")
         return None
     
-    def _export_element_to_dxf(self, document_id, workspace_id, element_id):
-        """Try to export entire element as DXF"""
-        endpoint = f"/partstudios/d/{document_id}/w/{workspace_id}/e/{element_id}/dxf"
-        
-        try:
-            log(f"Exporting entire element as DXF...")
-            response = self._make_api_request('GET', endpoint)
-            
-            log(f"Response status: {response.status_code}")
-            
-            if response.status_code == 200:
-                log(f"Success! DXF content length: {len(response.content)} bytes")
-                return response.content
-            else:
-                log(f"Failed: {response.status_code} - {response.text}")
-                return None
-                
-        except Exception as e:
-            log(f"Error: {e}")
-            return None
-    
-    def start_dxf_translation(self, document_id, workspace_id, element_id):
+    def start_dxf_translation(self, document_id, workspace_id, element_id,
+                              version_id=None, microversion_id=None):
         """
         Start an async DXF export translation
-        
+
         Returns:
             Translation ID if successful, None otherwise
         """
-        endpoint = f"/partstudios/d/{document_id}/w/{workspace_id}/e/{element_id}/translations"
+        endpoint = f"/partstudios/{self._wvm_path(document_id, workspace_id, version_id, microversion_id)}/e/{element_id}/translations"
         
         try:
             log(f"\nStarting DXF translation for element {element_id}")
@@ -563,7 +537,6 @@ class OnshapeClient:
                 
         except Exception as e:
             log(f"Error starting translation: {e}")
-            import traceback
             log(traceback.format_exc())
             return None
     
@@ -620,18 +593,19 @@ class OnshapeClient:
             log(f"Error downloading result: {e}")
             return None
     
-    def export_dxf_async(self, document_id, workspace_id, element_id, timeout=60):
+    def export_dxf_async(self, document_id, workspace_id, element_id, timeout=60,
+                         version_id=None, microversion_id=None):
         """
         Export DXF using async translations API
         Polls until complete or timeout
-        
+
         Returns:
             DXF content as bytes, or None
         """
-        import time
-        
+
         # Start translation
-        translation_id = self.start_dxf_translation(document_id, workspace_id, element_id)
+        translation_id = self.start_dxf_translation(document_id, workspace_id, element_id,
+                                                    version_id=version_id, microversion_id=microversion_id)
         if not translation_id:
             return None
         
@@ -670,14 +644,15 @@ class OnshapeClient:
         log(f"Translation timed out after {timeout} seconds")
         return None
     
-    def list_faces(self, document_id, workspace_id, element_id):
+    def list_faces(self, document_id, workspace_id, element_id,
+                   version_id=None, microversion_id=None):
         """
         List all faces in a Part Studio element using bodydetails endpoint
 
         Returns:
             Dict with bodies and their faces, or None if failed
         """
-        endpoint = f"/partstudios/d/{document_id}/w/{workspace_id}/e/{element_id}/bodydetails"
+        endpoint = f"/partstudios/{self._wvm_path(document_id, workspace_id, version_id, microversion_id)}/e/{element_id}/bodydetails"
 
         try:
             log(f"\n{'='*70}")
@@ -742,12 +717,12 @@ class OnshapeClient:
         except Exception as e:
             log(f"\n❌ Exception during list_faces:")
             log(f"Error: {e}")
-            import traceback
             log(traceback.format_exc())
             log(f"{'='*70}\n")
             return None
     
-    def get_body_faces(self, document_id, workspace_id, element_id, body_id=None, cached_faces_data=None):
+    def get_body_faces(self, document_id, workspace_id, element_id, body_id=None, cached_faces_data=None,
+                       version_id=None, microversion_id=None):
         """
         Get face information for bodies in an element
 
@@ -758,7 +733,8 @@ class OnshapeClient:
         Returns:
             Dict mapping body IDs to lists of face info dicts with id, area, surface type, position
         """
-        data = cached_faces_data if cached_faces_data else self.list_faces(document_id, workspace_id, element_id)
+        data = cached_faces_data if cached_faces_data else self.list_faces(
+            document_id, workspace_id, element_id, version_id=version_id, microversion_id=microversion_id)
         
         if not data or 'bodies' not in data:
             return None
@@ -806,7 +782,8 @@ class OnshapeClient:
         
         return result
     
-    def auto_select_top_face(self, document_id, workspace_id, element_id, body_id=None, cached_faces_data=None):
+    def auto_select_top_face(self, document_id, workspace_id, element_id, body_id=None, cached_faces_data=None,
+                             version_id=None, microversion_id=None):
         """
         Automatically select the largest planar face
 
@@ -829,7 +806,8 @@ class OnshapeClient:
         log(f"Requested body_id: {body_id if body_id else '(auto-detect)'}")
         log(f"Using cached data: {cached_faces_data is not None}")
 
-        faces_by_body = self.get_body_faces(document_id, workspace_id, element_id, body_id, cached_faces_data)
+        faces_by_body = self.get_body_faces(document_id, workspace_id, element_id, body_id, cached_faces_data,
+                                            version_id=version_id, microversion_id=microversion_id)
 
         if not faces_by_body:
             log("❌ get_body_faces returned None - no bodies found")
@@ -923,7 +901,8 @@ class OnshapeClient:
     def find_parallel_faces_by_depth(self, document_id, workspace_id, element_id,
                                       reference_normal, reference_origin,
                                       body_id=None, cached_faces_data=None,
-                                      angle_tolerance=0.1, depth_tolerance=0.01):
+                                      angle_tolerance=0.1, depth_tolerance=0.01,
+                                      version_id=None, microversion_id=None):
         """
         Find all planar faces parallel to a reference plane, binned by depth
 
@@ -944,7 +923,8 @@ class OnshapeClient:
         log(f"{'='*70}")
 
         # Get all faces
-        faces_by_body = self.get_body_faces(document_id, workspace_id, element_id, body_id, cached_faces_data)
+        faces_by_body = self.get_body_faces(document_id, workspace_id, element_id, body_id, cached_faces_data,
+                                            version_id=version_id, microversion_id=microversion_id)
         if not faces_by_body:
             log("No faces found")
             return {}
@@ -1050,9 +1030,384 @@ class OnshapeClient:
 
         return sorted_bins
 
+    @staticmethod
+    def _thickness_from_depth_bins(depth_bins):
+        """Designed stock thickness = the span of parallel-face depths (top minus bottom),
+        in inches - or None if fewer than two distinct depths were found (a single flat face
+        has no defined thickness). Single definition used by both the 2.5D multilayer export
+        and the 2D thickness probe."""
+        depths = list(depth_bins.keys())
+        if len(depths) < 2:
+            return None
+        return max(depths) - min(depths)
+
+    def detect_stock_thickness(self, document_id, workspace_id, element_id,
+                               reference_normal, reference_origin,
+                               body_id=None, cached_faces_data=None,
+                               version_id=None, microversion_id=None):
+        """Discover a part's designed stock thickness (height along the reference-face normal)
+        by binning its parallel faces by depth - the same derivation 2.5D uses, exposed so the
+        2D path can seed its (still-editable) thickness field. Returns inches, or None if it
+        can't be determined. Best-effort: callers should tolerate None."""
+        depth_bins = self.find_parallel_faces_by_depth(
+            document_id, workspace_id, element_id,
+            reference_normal, reference_origin,
+            body_id=body_id, cached_faces_data=cached_faces_data,
+            version_id=version_id, microversion_id=microversion_id)
+        return self._thickness_from_depth_bins(depth_bins)
+
+    # Typical tube wall thickness ceiling (inches). Real extrusion walls are
+    # 1/16"-1/8"; a "wall" thicker than this is more likely a real machining
+    # level than a hollow-section wall.
+    _TUBE_WALL_MAX_IN = 0.2
+
+    @staticmethod
+    def _classify_from_depths(depths, name_hint=''):
+        """Decide a machining setup from a part's parallel-face depths (pure logic).
+
+        This is the heuristic the harness uses to replicate what a user picks in
+        the wizard, factored out of any API calls so it is unit-testable.
+
+        Args:
+            depths: iterable of parallel-face depths in inches (0 = reference/top
+                face, negative going down). Order doesn't matter; sorted here.
+            name_hint: part/document name, used only as a weak tube signal.
+
+        Returns:
+            dict with:
+              part_type: '2d' | '2.5d' | 'tube' | 'unknown'
+              export_strategy: 'onshape_standard_dxf' | 'constructed_multilayer'
+                               | 'tube' | None
+              thickness_in: material/wall thickness (inches) or None
+              tube_height_in: full tube height (inches) for tubes, else None
+              confidence: 'high' | 'low'
+              needs_review: bool
+              notes: list[str] explaining the decision
+        """
+        name_l = (name_hint or '').lower()
+        ds = sorted(set(round(d, 4) for d in depths), reverse=True)  # shallow->deep
+        n = len(ds)
+        notes = []
+
+        if n <= 1:
+            return {
+                'part_type': 'unknown', 'export_strategy': None,
+                'thickness_in': None, 'tube_height_in': None,
+                'confidence': 'low', 'needs_review': True,
+                'notes': [f'Only {n} distinct parallel-face depth(s); '
+                          'cannot determine thickness. Needs a human.'],
+            }
+
+        gaps = [ds[i] - ds[i + 1] for i in range(n - 1)]  # all > 0
+        span = ds[0] - ds[-1]
+
+        # Tube signature: a thin wall at BOTH the top and bottom of the section
+        # with a large hollow void between them -> gap pattern small, big, small.
+        tube_by_geometry = (
+            n >= 4
+            and gaps[0] < OnshapeClient._TUBE_WALL_MAX_IN
+            and gaps[-1] < OnshapeClient._TUBE_WALL_MAX_IN
+            and max(gaps[1:-1]) > 3 * max(gaps[0], gaps[-1])
+        )
+        tube_by_name = 'tube' in name_l
+        if tube_by_geometry or tube_by_name:
+            if tube_by_geometry:
+                notes.append('Thin-wall/hollow depth signature (small-big-small gaps).')
+            if tube_by_name:
+                notes.append('Name mentions "tube".')
+            # Tube wizard fields: material thickness = wall, tube_height = section.
+            wall = gaps[0] if tube_by_geometry else None
+            return {
+                'part_type': 'tube', 'export_strategy': 'tube',
+                'thickness_in': wall, 'tube_height_in': span if tube_by_geometry else None,
+                # Tube is the riskiest call and the tube path differs the most,
+                # so always route it past a human even when both signals agree.
+                'confidence': 'high' if (tube_by_geometry and tube_by_name) else 'low',
+                'needs_review': True, 'notes': notes,
+            }
+
+        if n == 2:
+            return {
+                'part_type': '2d', 'export_strategy': 'onshape_standard_dxf',
+                'thickness_in': span, 'tube_height_in': None,
+                'confidence': 'high', 'needs_review': False,
+                'notes': ['Two parallel faces (top + bottom): simple through-cut '
+                          '-> devolve to a standard Onshape DXF export.'],
+            }
+
+        return {
+            'part_type': '2.5d', 'export_strategy': 'constructed_multilayer',
+            'thickness_in': span, 'tube_height_in': None,
+            'confidence': 'high', 'needs_review': False,
+            'notes': [f'{n} distinct depths: pocketed/multi-level part '
+                      '-> construct a multilayer DXF ourselves.'],
+        }
+
+    def classify_part(self, document_id, workspace_id, element_id,
+                      version_id=None, microversion_id=None):
+        """Infer how a user would set up a part in the wizard, from its geometry.
+
+        Mirrors the live 2.5D path's analyze-first approach but with no user in
+        the loop: auto-selects the largest planar face (instead of a click) and
+        decides 2D vs 2.5D vs tube from the parallel-face depth bins (instead of
+        a toggle). The result names the export_strategy Phase 3 dispatches on and
+        carries the face_id/body_id/normal those export calls need.
+
+        Returns a dict (see _classify_from_depths) augmented with source and
+        selection fields, or a low-confidence 'unknown' entry on any failure.
+        """
+        def _unknown(reason):
+            return {
+                'part_type': 'unknown', 'export_strategy': None,
+                'thickness_in': None, 'tube_height_in': None,
+                'confidence': 'low', 'needs_review': True, 'notes': [reason],
+                'face_id': None, 'body_id': None, 'face_normal': None,
+                'part_name': None, 'depth_bins_in': [],
+            }
+
+        faces = self.list_faces(document_id, workspace_id, element_id,
+                                version_id=version_id, microversion_id=microversion_id)
+        if not faces:
+            return _unknown('Onshape returned no face data for this element.')
+
+        face_id, body_id, part_name, normal = self.auto_select_top_face(
+            document_id, workspace_id, element_id, cached_faces_data=faces,
+            version_id=version_id, microversion_id=microversion_id)
+        if not face_id:
+            return _unknown('No planar face found to use as the reference/top face.')
+
+        # The selected face's plane origin is needed to measure depths from it.
+        reference_origin = None
+        for body in faces.get('bodies', []):
+            for fc in body.get('faces', []):
+                if fc.get('id') == face_id:
+                    reference_origin = (fc.get('surface') or {}).get('origin')
+                    break
+            if reference_origin is not None:
+                break
+        if reference_origin is None:
+            return _unknown('Could not resolve the reference face origin.')
+
+        depth_bins = self.find_parallel_faces_by_depth(
+            document_id, workspace_id, element_id, normal, reference_origin,
+            body_id=body_id, cached_faces_data=faces,
+            version_id=version_id, microversion_id=microversion_id)
+
+        result = self._classify_from_depths(list(depth_bins.keys()), name_hint=part_name)
+        result.update({
+            'face_id': face_id, 'body_id': body_id, 'face_normal': normal,
+            'part_name': part_name,
+            'depth_bins_in': sorted((round(d, 4) for d in depth_bins.keys()), reverse=True),
+        })
+        return result
+
+    def _convert_geometry_to_solid_hatch(self, source_msp, target_msp, layer_name):
+        """
+        Convert circles and polylines from source to solid HATCH entities in target.
+
+        This represents each face as a solid filled region (negative space to remove)
+        rather than stroked outlines. This makes slicing logic much simpler.
+
+        Args:
+            source_msp: Source modelspace with circles/lines/polylines
+            target_msp: Target modelspace to add HATCH entities to
+            layer_name: Layer name for the HATCH entities
+
+        Returns:
+            Number of HATCH entities created
+        """
+
+        # Extract all geometry
+        circles = []
+        polylines = []
+
+        # Get circles
+        for entity in source_msp.query('CIRCLE'):
+            center = (entity.dxf.center.x, entity.dxf.center.y)
+            radius = entity.dxf.radius
+            circles.append({'center': center, 'radius': radius})
+
+        # Get closed polylines
+        for entity in source_msp.query('LWPOLYLINE'):
+            if entity.closed:
+                points = [(p[0], p[1]) for p in entity.get_points('xy')]
+                if len(points) >= 3:
+                    polylines.append(points)
+
+        for entity in source_msp.query('POLYLINE'):
+            if entity.is_2d_polyline and entity.is_closed:
+                points = [(v.dxf.location.x, v.dxf.location.y) for v in entity.vertices]
+                if len(points) >= 3:
+                    polylines.append(points)
+
+        # Stitch open LINE/ARC/ELLIPSE/SPLINE + unclosed-LWPOLYLINE entities into closed
+        # boundary loops via the shared dxf_geometry stitcher (same code the 2D importer
+        # uses). It snaps sub-micron-apart CAD endpoints together so linemerge can close
+        # a boundary; full ellipses come back as their own closed loop.
+        def _warn_open_loop(coords, gap):
+            # A large loop that failed to close is exactly how a missing outer profile
+            # hides - surface it rather than silently dropping the boundary.
+            span_x = max(c[0] for c in coords) - min(c[0] for c in coords)
+            span_y = max(c[1] for c in coords) - min(c[1] for c in coords)
+            if max(span_x, span_y) > 1.0:
+                log(f"    WARNING: dropped an UNCLOSED boundary loop "
+                    f"({len(coords)} pts, {span_x:.2f}x{span_y:.2f}\", "
+                    f"end-gap {gap:.4f}\") - geometry may be incomplete")
+
+        stitched = entities_to_closed_paths(
+            lines=list(source_msp.query('LINE')),
+            arcs=list(source_msp.query('ARC')),
+            ellipses=list(source_msp.query('ELLIPSE')),
+            splines=list(source_msp.query('SPLINE')),
+            polylines=[e for e in source_msp.query('LWPOLYLINE') if not e.closed],
+            on_open_loop=_warn_open_loop,
+        )
+        for coords in stitched:
+            polylines.append(coords)
+            log(f"    Stitched segments into closed path ({len(coords)} points)")
+
+        log(f"    Converting to solid regions: {len(circles)} circles, {len(polylines)} polylines")
+
+        if not circles and not polylines:
+            log(f"    No geometry to convert")
+            return 0
+
+        # Detect concentric circles and convert to rings BEFORE unioning
+        # This is critical for circular grooves/rings
+        geoms = []
+        used_circles = set()
+
+        for i, circle1 in enumerate(circles):
+            if i in used_circles:
+                continue
+
+            center1 = circle1['center']
+            radius1 = circle1['radius']
+
+            # Look for concentric circles (same center, different radius)
+            concentric_group = [circle1]
+            for j, circle2 in enumerate(circles):
+                if i == j or j in used_circles:
+                    continue
+
+                center2 = circle2['center']
+                radius2 = circle2['radius']
+
+                # Check if centers are the same (within tolerance)
+                dx = abs(center1[0] - center2[0])
+                dy = abs(center1[1] - center2[1])
+                if dx < 0.001 and dy < 0.001 and abs(radius1 - radius2) > 0.001:
+                    # Concentric!
+                    concentric_group.append(circle2)
+                    used_circles.add(j)
+
+            used_circles.add(i)
+
+            # Create geometry from this group
+            if len(concentric_group) == 1:
+                # Single circle - filled disk
+                geom = Point(center1).buffer(radius1)
+                geoms.append(geom)
+            else:
+                # Multiple concentric circles - create ring(s)
+                # Sort by radius (largest first)
+                concentric_group.sort(key=lambda c: c['radius'], reverse=True)
+
+                # Outer boundary is the largest circle
+                outer_geom = Point(concentric_group[0]['center']).buffer(concentric_group[0]['radius'])
+
+                # Subtract all inner circles
+                for inner_circle in concentric_group[1:]:
+                    inner_geom = Point(inner_circle['center']).buffer(inner_circle['radius'])
+                    outer_geom = outer_geom.difference(inner_geom)
+
+                if not outer_geom.is_empty:
+                    geoms.append(outer_geom)
+                    log(f"      Detected concentric circles: outer r={concentric_group[0]['radius']:.3f}\", "
+                        f"{len(concentric_group)-1} inner hole(s) - created ring")
+
+        # Add polylines as filled polygons
+        for polyline in polylines:
+            try:
+                poly = Polygon(polyline)
+                if poly.is_valid:
+                    geoms.append(poly)
+            except Exception:
+                pass
+
+        # Containment-aware union: if a smaller polygon is fully inside a larger one,
+        # it represents a hole boundary (e.g., a circle inside a rectangle), not a
+        # filled region. Naive unary_union would lose the hole since union(A, B) = A
+        # when B is contained in A.
+        if geoms:
+            geoms.sort(key=lambda g: g.area, reverse=True)
+
+            result_geoms = []
+            used_as_hole = set()
+
+            for i, outer in enumerate(geoms):
+                if i in used_as_hole:
+                    continue
+
+                current = outer
+                for j in range(i + 1, len(geoms)):
+                    if j in used_as_hole:
+                        continue
+                    if current.contains(geoms[j]):
+                        current = current.difference(geoms[j])
+                        used_as_hole.add(j)
+                        log(f"      Detected hole: subtracted contained geometry (area={geoms[j].area:.4f})")
+
+                result_geoms.append(current)
+
+            union = unary_union(result_geoms)
+
+            # Convert union back to HATCH entities
+            hatch_count = 0
+
+            if union.geom_type == 'Polygon':
+                hatch_count += self._create_hatch_from_polygon(union, target_msp, layer_name)
+            elif union.geom_type == 'MultiPolygon':
+                for poly in union.geoms:
+                    hatch_count += self._create_hatch_from_polygon(poly, target_msp, layer_name)
+
+            log(f"    Created {hatch_count} solid HATCH entities")
+            return hatch_count
+
+        return 0
+
+    def _create_hatch_from_polygon(self, polygon, msp, layer_name):
+        """
+        Create a HATCH entity from a Shapely polygon.
+        Polygon may have holes (interior rings).
+
+        Returns:
+            Number of HATCHes created (1 if successful, 0 otherwise)
+        """
+        try:
+            # Create HATCH entity
+            hatch = msp.add_hatch(color=7, dxfattribs={'layer': layer_name})
+
+            # Add exterior boundary (EXTERNAL flag set by default)
+            exterior_coords = list(polygon.exterior.coords)
+            hatch.paths.add_polyline_path(exterior_coords, is_closed=True)
+
+            # Add interior holes (NO EXTERNAL flag - marks them as holes, not outer boundaries)
+            # DXF path_type_flags: bit 0 (1) = EXTERNAL, bit 1 (2) = POLYLINE
+            # For holes: flags=0 (no EXTERNAL bit)
+            for interior in polygon.interiors:
+                interior_coords = list(interior.coords)
+                hatch.paths.add_polyline_path(interior_coords, is_closed=True, flags=0)
+
+            return 1
+        except Exception as e:
+            log(f"      Warning: Could not create HATCH: {e}")
+            return 0
+
     def merge_dxfs_with_layers(self, dxf_contents_by_depth, depth_metadata=None):
         """
-        Merge multiple DXF contents into one with depth-encoded layer names
+        Merge multiple DXF contents into one with depth-encoded layer names.
+        Converts geometry to solid HATCH entities representing negative space.
 
         Args:
             dxf_contents_by_depth: Dict {depth: dxf_bytes}
@@ -1061,12 +1416,9 @@ class OnshapeClient:
         Returns:
             Merged DXF content as bytes
         """
-        import ezdxf
-        import tempfile
-        import os
 
         log(f"\n{'='*70}")
-        log(f"MERGING DXFs WITH LAYER NAMES")
+        log(f"MERGING DXFs WITH LAYER NAMES (AS SOLID REGIONS)")
         log(f"{'='*70}")
 
         # Create new DXF document
@@ -1111,24 +1463,22 @@ class OnshapeClient:
                 if layer_name not in merged_doc.layers:
                     merged_doc.layers.add(layer_name)
 
-                # Copy all entities to merged doc with new layer and translation
-                entity_count = 0
-                for entity in source_msp:
-                    # Clone entity and change its layer
-                    try:
-                        new_entity = entity.copy()
-                        new_entity.dxf.layer = layer_name
+                # Apply translation to source geometry if needed
+                if offset_x != 0 or offset_y != 0:
+                    log(f"  Translating source geometry by ({offset_x:.4f}, {offset_y:.4f})")
+                    for entity in source_msp:
+                        try:
+                            entity.translate(offset_x, offset_y, 0)
+                        except Exception:
+                            pass
 
-                        # Apply translation offset to align coordinate systems
-                        if offset_x != 0 or offset_y != 0:
-                            new_entity.translate(offset_x, offset_y, 0)
+                # Convert geometry to solid HATCH entities
+                hatch_count = self._convert_geometry_to_solid_hatch(source_msp, merged_msp, layer_name)
 
-                        merged_msp.add_entity(new_entity)
-                        entity_count += 1
-                    except Exception as e:
-                        log(f"  Warning: Could not copy entity {entity.dxftype()}: {e}")
-
-                log(f"  Copied {entity_count} entities to layer {layer_name}")
+                if hatch_count > 0:
+                    log(f"  Added {hatch_count} solid regions to layer {layer_name}")
+                else:
+                    log(f"  Warning: No solid regions created for layer {layer_name}")
 
             finally:
                 # Clean up temp file
@@ -1147,17 +1497,21 @@ class OnshapeClient:
 
         log(f"\nMerged DXF size: {len(merged_bytes)} bytes")
 
-        # DEBUG: Save merged DXF for inspection
-        debug_path = "/tmp/debug_merged.dxf"
-        with open(debug_path, "wb") as f:
-            f.write(merged_bytes)
-        log(f"DEBUG: Saved merged DXF to {debug_path}")
+        # Optionally dump the merged DXF for inspection. Off by default so production 2.5D
+        # imports don't write to a world-readable /tmp path on every request; set
+        # PENGUINCAM_DEBUG_DXF=1 to enable locally.
+        if os.environ.get('PENGUINCAM_DEBUG_DXF'):
+            debug_path = "/tmp/debug_merged.dxf"
+            with open(debug_path, "wb") as f:
+                f.write(merged_bytes)
+            log(f"DEBUG: Saved merged DXF to {debug_path}")
 
         return merged_bytes
 
     def export_multilayer_dxf(self, document_id, workspace_id, element_id,
                              reference_face_id, reference_body_id, reference_normal, reference_origin,
-                             body_id=None, cached_faces_data=None):
+                             body_id=None, cached_faces_data=None,
+                             version_id=None, microversion_id=None):
         """
         Export multiple parallel faces as a single multi-layer DXF for 2.5D machining
 
@@ -1185,7 +1539,8 @@ class OnshapeClient:
             document_id, workspace_id, element_id,
             reference_normal, reference_origin,
             body_id, cached_faces_data,
-            depth_tolerance=0.001  # 0.001" = 1 mil tolerance
+            depth_tolerance=0.001,  # 0.001" = 1 mil tolerance
+            version_id=version_id, microversion_id=microversion_id
         )
 
         if not depth_bins:
@@ -1235,7 +1590,6 @@ class OnshapeClient:
         # Export each depth group
         dxf_contents = {}
 
-        from concurrent.futures import ThreadPoolExecutor, as_completed
 
         def export_depth_group(depth, faces):
             """Export a single depth group"""
@@ -1248,7 +1602,8 @@ class OnshapeClient:
             # We'll modify export_face_to_dxf to accept multiple IDs
             return depth, self._export_faces_group_to_dxf(
                 document_id, workspace_id, element_id,
-                face_ids_str, reference_normal
+                face_ids_str, reference_normal,
+                version_id=version_id, microversion_id=microversion_id
             )
 
         # Export depth groups in parallel
@@ -1274,6 +1629,11 @@ class OnshapeClient:
             log("No DXF content exported")
             return None
 
+        # Stash the raw per-depth DXFs (exactly as Onshape returned them, before
+        # _convert_geometry_to_solid_hatch reconstructs geometry) so the Flask layer
+        # can expose them for debugging the geometry pipeline.
+        self.last_raw_depth_dxfs = dict(dxf_contents)
+
         # No coordinate translation needed
         # Onshape exports each depth group with faces at their correct relative positions
         # The face 'origin' field is a plane equation reference point, not a geometric centroid
@@ -1292,15 +1652,15 @@ class OnshapeClient:
 
             log(f"  Depth {depth:.4f}\": {len(faces)} faces, offset (0.0000, 0.0000)")
 
-        # Calculate part thickness from depth bins
-        # Depths are signed distances from reference (top) face
-        # Reference face ≈ 0, bottom face ≈ -thickness (or +thickness if flipped)
+        # Calculate part thickness from depth bins (shared formula with the 2D probe).
+        # Depths are signed distances from reference (top) face:
+        # reference face ≈ 0, bottom face ≈ -thickness (or +thickness if flipped).
         depths = list(depth_bins.keys())
+        detected_thickness = self._thickness_from_depth_bins(depth_bins)
         if depths:
-            max_depth = max(depths)  # Shallowest (closest to reference, typically ~0)
             min_depth = min(depths)  # Deepest (bottom face, typically negative)
-            detected_thickness = max_depth - min_depth
-            log(f"\n📏 Detected part thickness: {detected_thickness:.4f}\" (from Z={max_depth:+.4f}\" to Z={min_depth:+.4f}\")")
+            thickness_str = f"{detected_thickness:.4f}" if detected_thickness is not None else "unknown"
+            log(f"\n📏 Detected part thickness: {thickness_str}\" (from Z={max(depths):+.4f}\" to Z={min_depth:+.4f}\")")
 
             # COORDINATE SYSTEM TRANSFORMATION
             # Transform from "distance from reference face" to "height above sacrifice board"
@@ -1326,7 +1686,6 @@ class OnshapeClient:
             dxf_contents = transformed_contents
             depth_metadata = transformed_metadata
         else:
-            detected_thickness = None
             log("\n⚠️  Could not detect part thickness (no depth bins)")
 
         # Merge DXFs with layer names and coordinate alignment
@@ -1336,7 +1695,8 @@ class OnshapeClient:
         # For now, just return both values
         return merged_dxf, detected_thickness
 
-    def _export_faces_group_to_dxf(self, document_id, workspace_id, element_id, face_ids_str, face_normal=None):
+    def _export_faces_group_to_dxf(self, document_id, workspace_id, element_id, face_ids_str, face_normal=None,
+                                   version_id=None, microversion_id=None):
         """
         Export multiple faces as a single DXF (helper for multi-layer export)
 
@@ -1347,7 +1707,7 @@ class OnshapeClient:
         Returns:
             DXF file content as bytes, or None if failed
         """
-        endpoint = f"/documents/d/{document_id}/w/{workspace_id}/e/{element_id}/exportinternal"
+        endpoint = f"/documents/{self._wvm_path(document_id, workspace_id, version_id, microversion_id)}/e/{element_id}/exportinternal"
 
         try:
             # Calculate view matrix based on face normal
@@ -1396,36 +1756,80 @@ class OnshapeClient:
                 return None
         except Exception as e:
             log(f"Error getting document info: {e}")
-            import traceback
             log(traceback.format_exc())
             return None
     
-    def get_element_info(self, document_id, workspace_id, element_id):
-        """Get information about an element (Part Studio, Assembly, etc.)"""
-        try:
-            # Get all elements in the document
-            response = self._make_api_request(
-                'GET',
-                f'/documents/d/{document_id}/w/{workspace_id}/elements'
+    def list_folder_documents(self, folder_id):
+        """List documents directly contained in an Onshape folder (non-recursive).
+
+        Uses the global tree nodes API with offset pagination. Subfolders are
+        ignored here (recursion can be layered on later if the corpus grows a
+        nested structure).
+
+        Returns:
+            list of {'id', 'name'} dicts, one per document node.
+        """
+        documents = []
+        offset = 0
+        limit = 50
+        while True:
+            endpoint = (
+                f'/globaltreenodes/folder/{folder_id}'
+                f'?getPathToRoot=false&offset={offset}&limit={limit}'
             )
-            if response.status_code == 200:
-                elements = response.json()
-                log(f"   Found {len(elements)} elements in document")
-                # Find the matching element
-                for element in elements:
-                    if element.get('id') == element_id:
-                        return element
-                log(f"   Element {element_id} not found in {len(elements)} elements")
-                return None
-            else:
-                log(f"Failed to get elements: HTTP {response.status_code}")
-                log(f"Response: {response.text[:200]}")
-                return None
-        except Exception as e:
-            log(f"Error getting element info: {e}")
-            import traceback
-            log(traceback.format_exc())
-            return None
+            response = self._make_api_request('GET', endpoint)
+            if response.status_code != 200:
+                log(f"Failed to list folder {folder_id}: "
+                    f"HTTP {response.status_code} {response.text[:200]}")
+                break
+            items = response.json().get('items', [])
+            for item in items:
+                # Document nodes carry resourceType 'document' (subfolders are
+                # 'folder'); jsonType is the belt-and-suspenders fallback.
+                if (item.get('resourceType') == 'document'
+                        or item.get('jsonType') == 'document-summary'):
+                    documents.append({
+                        'id': item.get('id'),
+                        'name': item.get('name', 'unnamed'),
+                    })
+            if len(items) < limit:
+                break
+            offset += len(items)
+        return documents
+
+    def list_part_studios(self, document_id, workspace_id=None):
+        """List Part Studio elements in a document's default (or given) workspace.
+
+        Returns:
+            list of {'id', 'name', 'workspace_id'} dicts, one per Part Studio.
+        """
+        if workspace_id is None:
+            doc_info = self.get_document_info(document_id)
+            if not doc_info:
+                return []
+            workspace_id = doc_info.get('defaultWorkspace', {}).get('id')
+            if not workspace_id:
+                log(f"No default workspace for document {document_id}")
+                return []
+
+        response = self._make_api_request(
+            'GET', f'/documents/d/{document_id}/w/{workspace_id}/elements'
+        )
+        if response.status_code != 200:
+            log(f"Failed to list elements for {document_id}: "
+                f"HTTP {response.status_code}")
+            return []
+
+        studios = []
+        for elem in response.json():
+            if (elem.get('type') == 'Part Studio'
+                    or elem.get('elementType') == 'PARTSTUDIO'):
+                studios.append({
+                    'id': elem.get('id'),
+                    'name': elem.get('name', 'unnamed'),
+                    'workspace_id': workspace_id,
+                })
+        return studios
 
     def get_user_session_info(self):
         """
@@ -1446,7 +1850,6 @@ class OnshapeClient:
                 return None
         except Exception as e:
             log(f"   ❌ Error getting session info: {e}")
-            import traceback
             log(traceback.format_exc())
             return None
 
@@ -1469,138 +1872,124 @@ class OnshapeClient:
                 return None
         except Exception as e:
             log(f"   ❌ Error getting companies: {e}")
-            import traceback
             log(traceback.format_exc())
             return None
 
-    def get_document_company(self, document_id):
+    def fetch_config_file(self, document_id=None):
         """
-        Get the company/team that owns a specific document
+        Search for and fetch PenguinCAM-config.yaml from the classrooms
+        (companies/teams) the authenticated user belongs to.
+
+        The user is the source of truth for which classroom's config to
+        use — the mentor of the user's classroom configures the machines
+        the user has access to, regardless of where the active CAD part
+        was designed. When the user belongs to multiple classrooms and
+        has a config in more than one, the active document's classroom
+        is used as a tie-breaker so that students working inside a
+        particular team's documents land on that team's config; we
+        never fall back to a foreign classroom's config just because a
+        part was shared from there.
 
         Args:
-            document_id: Onshape document ID
-
-        Returns:
-            dict with company info, or None if not found
-        """
-        try:
-            log("   Determining document owner company...")
-
-            # Get document info to find owner
-            doc_info = self.get_document_info(document_id)
-            if not doc_info:
-                log("   ❌ Could not get document info")
-                return None
-
-            # Documents have an 'owner' field with type and id
-            # type: 0 = user, 1 = company, 2 = team
-            owner_info = doc_info.get('owner', {})
-            owner_type = owner_info.get('type')
-            owner_id = owner_info.get('id')
-            owner_name = owner_info.get('name', 'Unknown')
-
-            log(f"   Document owner: {owner_name} (type={owner_type}, id={owner_id[:8]}...)")
-
-            # If owner is a company/team (type 1 or 2), find it in the companies list
-            if owner_type in [1, 2]:
-                companies = self.get_companies()
-                if companies:
-                    for company in companies:
-                        if company.get('id') == owner_id:
-                            log(f"   ✅ Document belongs to company: {company.get('name')}")
-                            return company
-                    log(f"   ⚠️  Document owner company not found in user's companies")
-                    return None
-            else:
-                log(f"   ℹ️  Document is owned by user (not a company/team)")
-                return None
-
-        except Exception as e:
-            log(f"   ❌ Error getting document company: {e}")
-            import traceback
-            log(traceback.format_exc())
-            return None
-
-    def fetch_config_file(self):
-        """
-        Search for and fetch PenguinCAM-config.yaml from the user's documents.
+            document_id: Optional Onshape document ID for the active
+                export. Only used as a tie-breaker among configs in the
+                user's own classrooms.
 
         Returns:
             str with raw YAML content, or None if not found or on error
         """
         try:
             log("\n🔍 Searching for PenguinCAM-config.yaml...")
+            self.last_config_url = None
 
-            # Get user's companies to filter search results
-            user_companies = self.get_companies()
-            user_company_ids = set()
-            if user_companies:
-                user_company_ids = {c.get('id') for c in user_companies if c.get('id')}
-                log(f"   User belongs to {len(user_company_ids)} company/companies")
+            user_companies = self.get_companies() or []
+            user_classroom_ids = {c.get('id') for c in user_companies if c.get('id')}
 
-            # Search for documents with the config filename (v13 API)
-            search_body = {
-                'rawQuery': 'PenguinCAM-config.yaml'
-            }
-            response = self._make_api_request('POST', '/documents/search', json=search_body)
-
-            if response.status_code != 200:
-                log(f"   ❌ Document search failed: HTTP {response.status_code}")
-                log(f"   Response: {response.text[:200]}")
+            if not user_classroom_ids:
+                log("   ❌ User belongs to no classrooms — PenguinCAM expects the config to live in a company/team-owned document")
                 return None
 
-            search_results = response.json()
-            items = search_results.get('items', [])
+            log(f"   User belongs to {len(user_classroom_ids)} classroom(s)")
 
-            log(f"   Found {len(items)} matching document(s) (may include shared from other teams)")
+            # Tie-breaker only: use the active document's classroom to disambiguate
+            # when the user has configs in multiple of their own classrooms.
+            preferred_owner_id = None
+            if document_id:
+                doc_info = self.get_document_info(document_id)
+                if doc_info:
+                    owner = doc_info.get('owner', {})
+                    # owner type: 0 = user, 1 = company, 2 = team
+                    if owner.get('type') in (1, 2) and owner.get('id') in user_classroom_ids:
+                        preferred_owner_id = owner['id']
+                        log(f"   Active document classroom: {owner.get('name', 'Unknown')}")
 
-            if not items:
-                log("   ℹ️  No PenguinCAM-config.yaml found in documents")
+            # Onshape's /documents/search accepts a single ownerId per request,
+            # so issue one scoped search per classroom and dedupe by doc ID.
+            # Mirrors the Onshape UI's own search payload (ownerId, foundIn=w,
+            # documentFilter=7) to avoid picking up publicly-shared configs
+            # from unrelated teams.
+            candidates = {}
+            for owner_id in user_classroom_ids:
+                search_body = {
+                    'ownerId': owner_id,
+                    'foundIn': 'w',
+                    'when': 'latest',
+                    'documentFilter': 7,
+                    'rawQuery': '_all:PenguinCAM-config.yaml',
+                    'limit': 50,
+                }
+                response = self._make_api_request('POST', '/documents/search', json=search_body)
+                if response.status_code != 200:
+                    log(f"   ⚠️  Search failed for owner {owner_id[:8]}: HTTP {response.status_code}")
+                    continue
+                items = response.json().get('items', [])
+                log(f"   Owner {owner_id[:8]}: {len(items)} match(es)")
+                for item in items:
+                    item_id = item.get('id')
+                    if item_id and item_id not in candidates:
+                        candidates[item_id] = item
+
+            if not candidates:
+                log("   ℹ️  No PenguinCAM-config.yaml found in your classrooms")
                 return None
 
-            # Filter to only documents owned by user's companies (not publicly shared from other teams)
-            user_configs = []
-            for item in items:
+            # Belt-and-suspenders: re-verify each candidate's owner via document
+            # metadata, in case anything other than a user-classroom doc slipped
+            # into a scoped search result.
+            verified = []
+            for item_id, item in candidates.items():
                 doc_name = item.get('name', 'unknown')
-                doc_id = item.get('id', '')
-
-                # Get document info to check owner
-                doc_info = self.get_document_info(doc_id)
+                doc_info = self.get_document_info(item_id)
                 if not doc_info:
                     continue
-
-                owner_info = doc_info.get('owner', {})
-                owner_type = owner_info.get('type')
-                owner_id = owner_info.get('id')
-                owner_name = owner_info.get('name', 'Unknown')
-
-                log(f"   - Found: {doc_name} (ID: {doc_id[:8]}..., owner: {owner_name})")
-
-                # Check if owner is one of user's companies, or the user themselves
-                # owner_type: 0 = user, 1 = company, 2 = team
-                if owner_type in [1, 2] and owner_id in user_company_ids:
-                    # Owned by user's company/team
-                    log(f"     ✓ Owned by your company: {owner_name}")
-                    user_configs.append(item)
-                elif owner_type == 0:
-                    # Owned by a user (possibly this user, or someone in their company)
-                    # We'll accept this as it's not a public share from another team
-                    log(f"     ✓ Owned by user: {owner_name}")
-                    user_configs.append(item)
+                owner = doc_info.get('owner', {})
+                owner_type = owner.get('type')
+                owner_id = owner.get('id')
+                owner_name = owner.get('name', 'Unknown')
+                log(f"   - Found: {doc_name} (ID: {item_id[:8]}, owner: {owner_name})")
+                if owner_type in (1, 2) and owner_id in user_classroom_ids:
+                    verified.append((item, owner_id))
                 else:
-                    log(f"     ✗ Owned by external company/team (ignoring)")
+                    log(f"     ✗ Owner not in user's classrooms (ignoring)")
 
-            if not user_configs:
-                log("   ℹ️  No PenguinCAM-config.yaml found in your company/workspace")
-                log("   💡 Found configs from other teams - create your own to customize settings")
+            if not verified:
+                log("   ❌ No PenguinCAM-config.yaml found in your classrooms after verification")
                 return None
 
-            # Use the first config from user's company
-            config_doc = user_configs[0]
+            def sort_key(entry):
+                item, owner_id = entry
+                is_preferred = preferred_owner_id is not None and owner_id == preferred_owner_id
+                return (1 if is_preferred else 0, item.get('modifiedAt', ''))
+
+            verified.sort(key=sort_key, reverse=True)
+            config_doc, chosen_owner_id = verified[0]
             doc_id = config_doc.get('id')
             doc_name = config_doc.get('name', 'unknown')
 
-            log(f"   ✅ Using config from your workspace: {doc_name} (ID: {doc_id[:8]}...)")
+            if len(verified) > 1:
+                log(f"   ⚠️  {len(verified)} matching configs in your classrooms — picked one")
+
+            log(f"   ✅ Using config: {doc_name} (ID: {doc_id[:8]}, owner: {chosen_owner_id[:8]})")
 
             # Get workspace ID from search results (v13 includes defaultWorkspace)
             log(f"   🔍 DEBUG: config_doc keys: {list(config_doc.keys())}")
@@ -1673,6 +2062,7 @@ class OnshapeClient:
 
             # Return raw text content
             config_yaml = response.text
+            self.last_config_url = f"{self.BASE_URL}/documents/{doc_id}/w/{workspace_id}/e/{element_id}"
             log(f"   ✅ Successfully fetched config file ({len(config_yaml)} bytes)")
             log(f"   🔍 DEBUG: Returning config_yaml (is None? {config_yaml is None})")
 
@@ -1680,45 +2070,71 @@ class OnshapeClient:
 
         except Exception as e:
             log(f"   ❌ EXCEPTION in fetch_config_file: {e}")
-            import traceback
             log(f"   Full traceback:\n{traceback.format_exc()}")
             return None
 
-    def parse_onshape_url(self, url):
-        """
-        Parse an Onshape URL to extract document/workspace/element IDs
-        
-        Args:
-            url: Onshape URL (e.g., https://cad.onshape.com/documents/d/abc.../w/def.../e/ghi...)
-            
-        Returns:
-            dict with 'document_id', 'workspace_id', 'element_id' or None if invalid
-        """
-        try:
-            parts = url.split('/')
-            
-            result = {}
-            
-            # Find document ID
-            if '/d/' in url:
-                d_idx = parts.index('d')
-                result['document_id'] = parts[d_idx + 1]
-            
-            # Find workspace ID
-            if '/w/' in url:
-                w_idx = parts.index('w')
-                result['workspace_id'] = parts[w_idx + 1]
-            
-            # Find element ID
-            if '/e/' in url:
-                e_idx = parts.index('e')
-                result['element_id'] = parts[e_idx + 1]
-            
-            return result if len(result) == 3 else None
-            
-        except Exception as e:
-            log(f"Error parsing Onshape URL: {e}")
-            return None
+
+def build_multilayer_dxf(client, did, wid, eid, face_id, body_id, face_normal,
+                         cached_faces_data=None, version_id=None, microversion_id=None):
+    """Build a single multi-layer (2.5D) DXF for the selected reference face.
+
+    Resolves the reference face's normal (if not already known) and origin, then
+    asks the Onshape client to bin all parallel faces by depth and merge them into
+    one depth-layered DXF. Returns (dxf_bytes, detected_thickness).
+
+    This is the sole home of the 2.5D DXF construction. The G-code path derives
+    the actual stock thickness from the DXF layers themselves (see the
+    postprocessor's load_dxf), so detected_thickness here is informational.
+    Raises RuntimeError with a user-facing message on failure.
+
+    Lives here (not in the Flask app) so both the web export route and the
+    headless test harness construct 2.5D DXFs the exact same way.
+    """
+    faces_data = cached_faces_data or client.list_faces(
+        did, wid, eid, version_id=version_id, microversion_id=microversion_id)
+    if not faces_data:
+        raise RuntimeError("Failed to retrieve face data from Onshape. Your "
+                           "authentication token may have expired. Please "
+                           "re-authenticate with Onshape.")
+
+    # Locate the selected reference face (for the normal fallback + origin).
+    reference_face = None
+    for body in faces_data.get('bodies', []):
+        if body_id and body.get('id') != body_id:
+            continue
+        for face in body.get('faces', []):
+            if face.get('id') == face_id:
+                reference_face = face
+                break
+        if reference_face:
+            break
+
+    if reference_face is None:
+        raise RuntimeError("Could not find the selected face for multi-layer "
+                           "export. Please select a flat top face.")
+
+    surface = reference_face.get('surface', {}) or {}
+    if not face_normal:
+        face_normal = surface.get('normal', {'x': 0, 'y': 0, 'z': 1})
+    reference_origin = surface.get('origin', {'x': 0, 'y': 0, 'z': 0})
+
+    result = client.export_multilayer_dxf(
+        did, wid, eid,
+        face_id, body_id, face_normal, reference_origin,
+        body_id=body_id, cached_faces_data=faces_data,
+        version_id=version_id, microversion_id=microversion_id
+    )
+    # Backwards-compatible unpack if the client doesn't return thickness.
+    if isinstance(result, tuple):
+        dxf_bytes, detected_thickness = result
+    else:
+        dxf_bytes, detected_thickness = result, None
+
+    if not dxf_bytes:
+        raise RuntimeError("Onshape returned no multi-layer DXF for that face. "
+                           "Make sure the selected face is a flat top face of a "
+                           "2.5D part.")
+    return dxf_bytes, detected_thickness
 
 
 class OnshapeSessionManager:

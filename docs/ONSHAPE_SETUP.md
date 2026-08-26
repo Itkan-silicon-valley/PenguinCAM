@@ -51,9 +51,9 @@ Selected part
 
 ### **Action Settings:**
 
-**Action URL:**
+**Action URL:** (the UI runs as an Onshape right-side element panel)
 ```
-https://penguincam.popcornpenguins.com/onshape/import?documentId={$documentId}&workspaceId={$workspaceId}&elementId={$elementId}&partId={$partId}
+https://penguincam.popcornpenguins.com/onshape/element-panel?documentId={$documentId}&workspaceId={$workspaceId}&elementId={$elementId}&partId={$partId}
 ```
 
 ⚠️ **IMPORTANT:** Use `{$documentId}` (dollar sign INSIDE braces), not `${documentId}`

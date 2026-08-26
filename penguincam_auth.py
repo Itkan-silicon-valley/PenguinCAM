@@ -4,7 +4,6 @@ Google OAuth 2.0 with Drive API access
 """
 
 import os
-import sys
 import json
 from functools import wraps
 from flask import session, redirect, url_for, request, jsonify
@@ -13,22 +12,7 @@ from google_auth_oauthlib.flow import Flow
 from google.auth.transport.requests import Request as GoogleRequest
 from googleapiclient.discovery import build
 import secrets
-import logging
-
-# Configure logging for Vercel
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(message)s',
-    stream=sys.stderr,
-    force=True
-)
-logger = logging.getLogger(__name__)
-
-# Logging helper for Vercel/serverless environments
-def log(*args, **kwargs):
-    """Log to stderr using Python logging module for better Vercel compatibility"""
-    message = ' '.join(str(arg) for arg in args)
-    logger.info(message)
+from logging_config import log  # shared log() + logging setup (was duplicated per module)
 
 class PenguinCAMAuth:
     """Handles Google OAuth authentication with Drive API access"""

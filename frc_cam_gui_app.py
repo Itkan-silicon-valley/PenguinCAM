@@ -4,54 +4,44 @@ PenguinCAM - FRC Team 6238 CAM Tool
 A Flask-based web interface for generating G-code from DXF files
 """
 
-from flask import Flask, render_template, request, jsonify, send_file, session, send_from_directory, redirect
+from flask import Flask, render_template, request, jsonify, send_file, session, send_from_directory, redirect, make_response
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from werkzeug.middleware.proxy_fix import ProxyFix
 import os
-import sys
+import requests
 import subprocess
 import tempfile
 import shutil
 import traceback
 from pathlib import Path
 import json
+import base64
 import secrets
 import re
+import io
+import zipfile
 import atexit
 import time
 import threading
 from datetime import datetime
-from urllib.parse import urlencode
 import ezdxf
+from shapely.ops import unary_union
 import logging
 import metrics
+import feeds_speeds
+from logging_config import log  # shared log() + base logging setup (was duplicated per module)
 
-# Configure logging for Vercel
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(message)s',
-    stream=sys.stderr,
-    force=True
-)
-logger = logging.getLogger(__name__)
-
-# Disable Werkzeug's request logging (clutters Vercel logs)
-# Try multiple approaches since WSGI environment might be tricky
+# Quiet Werkzeug's request logging (clutters Vercel logs); the base logging config and log()
+# now come from logging_config (imported above).
 logging.getLogger('werkzeug').disabled = True
 logging.getLogger('werkzeug').setLevel(logging.ERROR)  # Only show errors, not INFO
 werkzeug_logger = logging.getLogger('werkzeug')
 werkzeug_logger.handlers = []  # Remove all handlers
 
-# Logging helper for Vercel/serverless environments
-def log(*args, **kwargs):
-    """Log to stderr using Python logging module for better Vercel compatibility"""
-    message = ' '.join(str(arg) for arg in args)
-    logger.info(message)
-
 # Import Google Drive integration (optional - will work without it)
 try:
-    from google_drive_integration import upload_gcode_to_drive, GoogleDriveUploader
+    from google_drive_integration import GoogleDriveUploader
     GOOGLE_DRIVE_AVAILABLE = True
 except ImportError:
     GOOGLE_DRIVE_AVAILABLE = False
@@ -68,17 +58,20 @@ except ImportError:
 
 # Import Onshape integration (optional - will work without it)
 try:
-    from onshape_integration import get_onshape_client, session_manager
+    from onshape_integration import get_onshape_client, session_manager, build_multilayer_dxf
     ONSHAPE_AVAILABLE = True
 except ImportError:
     ONSHAPE_AVAILABLE = False
     log("⚠️  Onshape integration not available")
 
 # Import postprocessor directly (for API calls instead of subprocess)
-from frc_cam_postprocessor import FRCPostProcessor, PostProcessorResult
+from frc_cam_postprocessor import (
+    FRCPostProcessor, PostProcessorResult, assemble_job_gcode, validate_job_layout,
+)
 
 # Import team config management
-from team_config import TeamConfig
+from team_config import TeamConfig, DEFAULT_TOOL_DIAMETER_IN
+from config_validation import validate_and_sanitize_config, ConfigValidationError
 
 # ============================================================================
 # File Token Manager - Secure file access with random tokens
@@ -225,6 +218,27 @@ if secret_key:
 elif not app.secret_key:
     app.secret_key = secrets.token_hex(32)
     log("⚠️  WARNING: Using random secret key. Sessions will not persist across restarts.")
+
+# Embedded Onshape panel runs in an iframe, a third-party context. For the session
+# cookie (and thus OAuth/login) to be sent there, it MUST be SameSite=None; Secure
+# (requires HTTPS). Without this, the OAuth popup sets the cookie first-party but the
+# iframe's reload can't send it back, so the panel stays "not authenticated".
+#
+# EMBED_COOKIES explicitly forces on/off; otherwise auto-enable on deployed HTTPS
+# platforms (Railway/Vercel set PORT / platform vars, or FLASK_SECRET_KEY is set).
+# Left as Flask's default (Lax) only for local HTTP dev.
+_embed_env = os.environ.get('EMBED_COOKIES')
+if _embed_env is not None:
+    _embed_cookies = _embed_env.strip().lower() in ('1', 'true', 'yes')
+else:
+    _embed_cookies = bool(secret_key or os.environ.get('PORT')
+                          or os.environ.get('RAILWAY_ENVIRONMENT') or os.environ.get('VERCEL'))
+if _embed_cookies:
+    app.config['SESSION_COOKIE_SAMESITE'] = 'None'
+    app.config['SESSION_COOKIE_SECURE'] = True
+    log("🔒 Session cookie: SameSite=None; Secure (embeddable in Onshape iframe)")
+else:
+    log("🍪 Session cookie: default SameSite=Lax — set EMBED_COOKIES=1 for Onshape iframe embedding")
     log("   Set FLASK_SECRET_KEY environment variable for persistent sessions.")
 
 # Initialize authentication if available
@@ -250,6 +264,54 @@ limiter = Limiter(
     headers_enabled=True  # Send X-RateLimit headers in responses
 )
 log("✅ Rate limiting enabled (200 requests/hour default)")
+
+# ============================================================================
+# Cloudflare Turnstile — bot-gate for the anonymous DXF-upload flow
+# ============================================================================
+# The full-page upload flow has NO Onshape OAuth. Instead the frontend solves a
+# Turnstile challenge and POSTs the token to /session/verify, which we verify
+# server-side and use to mint an anonymous session (`session['app_verified']`)
+# that the compute endpoints require. The Onshape-panel flow is unaffected — its
+# OAuth session is its gate. When the secret key is unset (local dev / tests /
+# an unkeyed run), verification is BYPASSED with a loud warning so nothing
+# breaks; set both keys on any public host.
+TURNSTILE_SITE_KEY = os.environ.get('TURNSTILE_SITE_KEY', '')
+TURNSTILE_SECRET_KEY = os.environ.get('TURNSTILE_SECRET_KEY', '')
+TURNSTILE_VERIFY_URL = 'https://challenges.cloudflare.com/turnstile/v0/siteverify'
+if TURNSTILE_SITE_KEY and TURNSTILE_SECRET_KEY:
+    log("🛡️  Turnstile bot-gate ENABLED for the upload flow")
+else:
+    log("⚠️  Turnstile keys not set — upload-flow bot-gate DISABLED "
+        "(set TURNSTILE_SITE_KEY / TURNSTILE_SECRET_KEY on any public host)")
+
+
+def _client_ip():
+    """Real client IP. Behind Cloudflare the true client is in CF-Connecting-IP;
+    fall back to the proxied remote address otherwise."""
+    return request.headers.get('CF-Connecting-IP') or get_remote_address()
+
+
+def _turnstile_enabled():
+    return bool(TURNSTILE_SITE_KEY and TURNSTILE_SECRET_KEY)
+
+
+def _verify_turnstile_token(token):
+    """Verify a Turnstile token with Cloudflare. Returns True on success — or when
+    Turnstile isn't configured (dev/test bypass). Never raises."""
+    if not _turnstile_enabled():
+        return True  # unconfigured: dev/test bypass (warned at startup)
+    if not token:
+        return False
+    try:
+        resp = requests.post(TURNSTILE_VERIFY_URL, data={
+            'secret': TURNSTILE_SECRET_KEY,
+            'response': token,
+            'remoteip': _client_ip(),
+        }, timeout=10)
+        return bool(resp.ok and resp.json().get('success'))
+    except Exception as e:
+        log(f"Turnstile verification error: {e}")
+        return False
 
 # Directory for temporary files
 # Serverless platforms (Vercel, Lambda) have /tmp as only writable location
@@ -302,44 +364,50 @@ def load_local_team_config_into_session():
     Load the local YAML config for standalone localhost/manual-upload usage.
 
     This keeps hosted Onshape behavior unchanged while letting local runs use
-    yaml/PenguinCAM-config.yaml without storing it in Onshape.
+    yaml/PenguinCAM-config.yaml without storing it in Onshape. Local mode uses
+    the upstream anonymous-upload config slot so every render and compute route
+    resolves the same machine configuration.
     """
     if not is_local_mode():
         return False
 
     config_path = get_local_config_path()
     if not config_path.exists():
-        if not session.get('team_config_data'):
-            team_config = TeamConfig()
-            session['team_config_data'] = {}
-            session['team_config'] = team_config.to_dict()
-            session['team_number'] = team_config.team_number
-            session['using_default_config'] = True
+        session.pop('upload_config_data', None)
+        session.pop('upload_config_url', None)
         log(f"⚠️  Local config not found at {config_path}; using defaults")
         return False
 
     try:
         config_yaml = config_path.read_text()
-        team_config = TeamConfig.from_yaml(config_yaml)
-        session['team_config_data'] = team_config._data
-        session['team_config'] = team_config.to_dict()
-        session['team_number'] = team_config.team_number
-        session['team_name'] = team_config.team_name
-        session['using_default_config'] = False
+        config_data, warnings = validate_and_sanitize_config(config_yaml, strict=False)
+        for warning in warnings:
+            log(f"⚠️  Local config: {warning}")
+        team_config = TeamConfig.from_dict(config_data)
+        session['upload_config_data'] = team_config._data
+        session.pop('upload_config_url', None)
         log(f"✅ Local config loaded: {team_config.team_name} (#{team_config.team_number}) from {config_path}")
         return True
     except Exception as e:
-        team_config = TeamConfig()
-        session['team_config_data'] = {}
-        session['team_config'] = team_config.to_dict()
-        session['team_number'] = team_config.team_number
-        session['using_default_config'] = True
+        session.pop('upload_config_data', None)
+        session.pop('upload_config_url', None)
         log(f"⚠️  Failed to load local config from {config_path}: {e}; using defaults")
         return False
 
 def get_current_user_id():
     """Get the current user ID from session"""
     return session.get('user_email', 'default_user')
+
+def normalize_material(material):
+    """Canonicalize a material id from the request form. 'aluminum_tube' -> 'aluminum' (a
+    UI-only id that uses the aluminum preset) and 'polycarb' -> 'polycarbonate' (legacy);
+    everything else, including custom materials, passes through unchanged."""
+    m = str(material).lower()
+    if m == 'aluminum_tube':
+        return 'aluminum'
+    if m == 'polycarb':
+        return 'polycarbonate'
+    return material
 
 def get_onshape_client_or_401():
     """
@@ -359,183 +427,508 @@ def get_onshape_client_or_401():
 
     return client, None, None
 
-def extract_onshape_params(params):
-    """Extract Onshape parameters from request params dict"""
-    return {
-        'document_id': params.get('documentId') or params.get('did'),
-        'workspace_id': params.get('workspaceId') or params.get('wid'),
-        'element_id': params.get('elementId') or params.get('eid'),
-        'face_id': params.get('faceId') or params.get('fid'),
-        'body_id': params.get('partId') or params.get('bodyId') or params.get('bid')
-    }
-
-def fetch_face_normal_and_body(client, document_id, workspace_id, element_id, face_id, body_id):
-    """
-    Fetch face normal and body information for a given face_id.
-
-    Returns:
-        tuple: (face_normal dict, auto_selected_body_id, part_name_from_body)
-    """
-    log(f"Face ID provided: {face_id}, fetching face normal...")
-
-    face_normal = None
-    auto_selected_body_id = None
-    part_name_from_body = None
-
-    try:
-        # Get all faces to find the normal for the selected face
-        faces_data = client.list_faces(document_id, workspace_id, element_id)
-
-        if faces_data and 'bodies' in faces_data:
-            # Debug: Log all face IDs to find mismatch
-            all_face_ids = []
-            for body in faces_data['bodies']:
-                for face in body.get('faces', []):
-                    all_face_ids.append(face.get('id'))
-            log(f"🔍 All face IDs in response ({len(all_face_ids)} total): {all_face_ids[:20]}{'...' if len(all_face_ids) > 20 else ''}")
-            log(f"🔍 Looking for face_id: {face_id}")
-
-            # Search through all bodies and faces to find the matching face_id
-            for body in faces_data['bodies']:
-                bid = body.get('id')
-                for face in body.get('faces', []):
-                    if face.get('id') == face_id:
-                        # Found the matching face! Extract its normal
-                        surface = face.get('surface', {})
-                        face_normal = surface.get('normal', {})
-                        part_name_from_body = body.get('properties', {}).get('name', 'Unnamed')
-
-                        # Set body_id if not already provided
-                        if not body_id:
-                            auto_selected_body_id = bid
-
-                        log(f"✅ Found face {face_id} in body {bid} ({part_name_from_body})")
-                        log(f"   Normal: ({face_normal.get('x', 0):.3f}, {face_normal.get('y', 0):.3f}, {face_normal.get('z', 0):.3f})")
-                        break
-                if face_normal:
-                    break
-
-        if not face_normal:
-            log(f"⚠️  Warning: Could not find normal for face {face_id}, using default view")
-
-    except Exception as e:
-        log(f"⚠️  Warning: Error fetching face normal: {e}")
-        log("   Continuing with default view matrix")
-
-    return face_normal, auto_selected_body_id, part_name_from_body
-
-def generate_onshape_filename(doc_name, part_name):
-    """
-    Generate a clean filename from Onshape document and part names.
-    Falls back to timestamp if names are unavailable or generic.
-    """
-    # Clean function for filename sanitization
-    def clean_name(name):
-        return re.sub(r'[^\w\s-]', '', name).strip().replace(' ', '_')[:50]
-
-    if doc_name and part_name:
-        # Best case: combine both
-        doc_clean = clean_name(doc_name)
-        part_clean = clean_name(part_name)
-        return f"{doc_clean}_{part_clean}"
-
-    elif part_name:
-        # Fallback: part name only
-        part_clean = clean_name(part_name)
-        if part_clean and part_clean != 'Unnamed_Part':
-            return part_clean
-
-    # Last resort: timestamp (server's local time)
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    return f"Onshape_Part_{timestamp}"
-
 # ============================================================================
 # Routes
 # ============================================================================
 
-@app.route('/')
-def index():
-    """Render the main GUI page"""
-    # ========================================================================
-    # AUTHENTICATION GATE: Require Onshape OAuth to access app
-    # ========================================================================
-    # This restricts access to authenticated Onshape users only, providing:
-    # - Natural security gate (no anonymous internet users)
-    # - Known user/team identity for configs and tracking
-    # - Better protection from abuse and cost control
-    #
-    # TO MAKE APP WIDE OPEN (allow anonymous browser access):
-    # Simply comment out or remove the code block below (lines until "End gate")
-    # ========================================================================
-    if ONSHAPE_AVAILABLE and not is_local_mode():
-        user_id = get_current_user_id()
-        client = session_manager.get_client(user_id)
-        if not client:
-            # No Onshape session - redirect to OAuth
-            log("⛔ Access denied: No Onshape authentication, redirecting to /onshape/auth")
-            return redirect('/onshape/auth')
-    elif is_local_mode():
-        load_local_team_config_into_session()
-    # ========================================================================
-    # End authentication gate
-    # ========================================================================
+# Team config is fetched from Onshape at login and cached in the session cookie. Re-fetch
+# it when the cached copy is older than this, so a returning user picks up a config their
+# mentor edited since login - without having to clear cookies or re-authenticate.
+TEAM_CONFIG_TTL_SECONDS = 600  # 10 minutes
 
-    # Get user/team info from session (if coming from Onshape)
-    user_name = session.get('user_name')
-    team_name = session.get('team_name')
 
-    # Reconstruct TeamConfig
-    team_config_data = session.get('team_config_data', {})
+def _load_team_config_into_session(client):
+    """Fetch PenguinCAM-config.yaml from the user's Onshape classroom and store it in the
+    session. Single source of truth for how config lands in the session - used by the OAuth
+    callback (initial load), the /config/refresh route, and the TTL auto-refresh below."""
+    config_yaml = client.fetch_config_file() if client else None
+    # Validate/sanitize even the Onshape-hosted config: a mentor can commit crappy YAML to
+    # their classroom just as easily as an upload user can host it. Lenient mode never raises
+    # -- it drops out-of-range values (reverting them to defaults) and sanitizes strings for
+    # G-code safety, so a bad config degrades instead of breaking the page.
+    config_data = None
+    if config_yaml:
+        config_data, warnings = validate_and_sanitize_config(config_yaml, strict=False)
+        for w in warnings:
+            log(f"⚠️  Team config: {w}")
+    if config_data:
+        team_config = TeamConfig.from_dict(config_data)
+        log(f"✅ Team config loaded: {team_config.team_name} (#{team_config.team_number})")
+        session['team_config_data'] = team_config._data
+        session['team_config'] = team_config.to_dict()
+        session['team_number'] = team_config.team_number
+        session['team_config_url'] = getattr(client, 'last_config_url', None)
+        session['using_default_config'] = False
+    else:
+        log("⚠️  No team config found - using defaults")
+        team_config = TeamConfig()
+        session['team_config_data'] = {}
+        session['team_config'] = team_config.to_dict()
+        session['team_number'] = team_config.team_number
+        session.pop('team_config_url', None)
+        session['using_default_config'] = True
+    session['team_config_fetched_at'] = time.time()
+    # Persist any token refresh triggered by the Onshape API calls above.
+    if client:
+        session_manager.update_session_tokens(client)
+    return team_config
+
+
+def _maybe_refresh_team_config():
+    """Best-effort TTL refresh of the cached team config (see TEAM_CONFIG_TTL_SECONDS).
+    Runs on every page render but only actually re-fetches once the cached copy goes stale.
+    Silently keeps the existing session copy if Onshape is unreachable or the re-fetch
+    fails, so a transient error never blocks the page."""
+    if not ONSHAPE_AVAILABLE:
+        return
+    if time.time() - session.get('team_config_fetched_at', 0) < TEAM_CONFIG_TTL_SECONDS:
+        return
+    client = session_manager.get_client(get_current_user_id())
+    if not client:
+        return
+    try:
+        _load_team_config_into_session(client)
+    except Exception as e:
+        log(f"⚠️  Team config TTL refresh failed, keeping cached copy: {e}")
+        # Bump the timestamp so a persistent failure doesn't re-hit Onshape every render.
+        session['team_config_fetched_at'] = time.time()
+
+
+def _active_team_config():
+    """The TeamConfig that applies to the current COMPUTE request (/process, /process-job,
+    /part-outline). Upload-supplied config (from the anonymous flow's POST /session/config)
+    takes precedence when present; otherwise the Onshape classroom config cached in the
+    session; otherwise Team 6238 defaults. Single resolver so the compute endpoints agree
+    with what the page rendered. Note: only the upload flow ever sets `upload_config_data`,
+    so an Onshape user (who never hits /session/config) transparently keeps their config."""
+    if session.get('upload_config_data'):
+        return TeamConfig.from_dict(session['upload_config_data'])
+    return TeamConfig.from_dict(session.get('team_config_data', {}))
+
+
+def _app_template_context(force_defaults=False):
+    """Build the shared template context (machines, materials, tool, bed size) used by
+    both the legacy single-part page and the multi-part wizard.
+
+    force_defaults=True (the anonymous upload flow) skips the Onshape config refresh
+    entirely and NEVER reads the Onshape `team_config_data` (so a prior Onshape login in the
+    same browser can't leak in). It instead uses the upload flow's own `upload_config_data`
+    -- the team config that flow supplied via POST /session/config -- or the built-in Team
+    6238 defaults when none has been supplied. Either way it makes NO Onshape calls."""
+    if not force_defaults:
+        _maybe_refresh_team_config()  # opportunistic TTL refresh before we read the cached copy
+    user_name = None if force_defaults else session.get('user_name')
+    team_name = None if force_defaults else session.get('team_name')
+
+    if force_defaults:
+        team_config_data = session.get('upload_config_data', {})
+        using_default = not bool(team_config_data)
+    else:
+        team_config_data = session.get('team_config_data', {})
+        using_default = session.get('using_default_config', False)
     team_config = TeamConfig(team_config_data)
 
-    # Get available machines
     machines = team_config.get_available_machines()
-
-    # Get current machine (from session, or use default)
     current_machine_id = session.get('machine_id', team_config.default_machine_id)
 
-    # Get machine-specific config dict
     team_config_dict = team_config.to_dict(current_machine_id)
     drive_enabled = team_config_dict.get('google_drive_enabled', False)
-    default_tool_diameter = team_config_dict.get('default_tool_diameter', 0.157)
-    machine_x_max = team_config_dict.get('machine_x_max', 48.0)
-    machine_y_max = team_config_dict.get('machine_y_max', 96.0)
+    # Use `or` (not .get default) so an explicit None in the config doesn't render as
+    # the string "None" into a numeric <input value="...">.
+    default_tool_diameter = team_config_dict.get('default_tool_diameter') or DEFAULT_TOOL_DIAMETER_IN
+    default_tool_diameter_text = team_config_dict.get('default_tool_diameter_text') or '4mm'
+    machine_x_max = team_config_dict.get('machine_x_max') or 48.0
+    machine_y_max = team_config_dict.get('machine_y_max') or 96.0
 
-    # Get available materials for current machine
     available_materials = team_config.get_available_materials(current_machine_id)
-
-    # Add 'aluminum_tube' as a special UI-only material (uses aluminum preset)
     available_materials['aluminum_tube'] = {
         **available_materials.get('aluminum', {}),
         'name': 'Aluminum Tube'
     }
 
-    # Check for incomplete materials (custom materials missing required params)
     incomplete_materials = {
         material_id for material_id in available_materials.keys()
         if not team_config.is_material_complete(material_id, current_machine_id) and material_id != 'aluminum_tube'
     }
 
-    return render_template('index.html',
-                         user_name=user_name,
-                         team_name=team_name,
-                         drive_enabled=drive_enabled,
-                         default_tool_diameter=default_tool_diameter,
-                         machine_x_max=machine_x_max,
-                         machine_y_max=machine_y_max,
-                         using_default_config=session.get('using_default_config', False),
-                         machines=machines,
-                         current_machine_id=current_machine_id,
-                         materials=available_materials,
-                         incomplete_materials=incomplete_materials,
-                         detected_thickness=None)
+    # Per-machine data so the client can update bed size, tool default, and the material
+    # list when the user picks a different machine (without a page reload). Keyed by id.
+    machines_info = {}
+    for mid in machines.keys():
+        md = team_config.to_dict(mid)
+        mats = team_config.get_available_materials(mid)
+        machines_info[mid] = {
+            'name': md.get('machine_name') or mid,
+            'x_max': md.get('machine_x_max'),
+            'y_max': md.get('machine_y_max'),
+            'tool': md.get('default_tool_diameter'),
+            'tool_text': md.get('default_tool_diameter_text'),
+            'materials': [
+                {'id': matid, 'name': m.get('name') or matid}
+                for matid, m in mats.items() if matid != 'aluminum_tube'
+            ],
+        }
+
+    return {
+        'user_name': user_name,
+        'team_name': team_name,
+        'drive_enabled': drive_enabled,
+        'default_tool_diameter': default_tool_diameter,
+        'default_tool_diameter_text': default_tool_diameter_text,
+        'machine_x_max': machine_x_max,
+        'machine_y_max': machine_y_max,
+        'using_default_config': using_default,
+        # Display fields for the header "Config: N (name)" banner, sourced per-flow so both
+        # the upload flow (upload_config_url) and the Onshape flow (team_config_url) render
+        # correctly server-side (before JS runs / on reload).
+        'config_team_number': team_config.team_number,
+        'config_team_name': team_config.team_name,
+        'config_url': (session.get('upload_config_url') if force_defaults
+                       else session.get('team_config_url')),
+        'machines': machines,
+        'machines_info': machines_info,
+        'current_machine_id': current_machine_id,
+        'materials': available_materials,
+        'incomplete_materials': incomplete_materials,
+        'detected_thickness': None,
+    }
+
+
+def _require_onshape_auth():
+    """Apply the Onshape OAuth gate. Returns a redirect response if unauthenticated,
+    else None. Shared by the app pages."""
+    if ONSHAPE_AVAILABLE:
+        user_id = get_current_user_id()
+        client = session_manager.get_client(user_id)
+        if not client:
+            log("⛔ Access denied: No Onshape authentication, redirecting to /onshape/auth")
+            return redirect('/onshape/auth')
+    return None
+
+
+def _has_onshape_session():
+    """True when the current browser has an authenticated Onshape client (the
+    Onshape-panel flow). Its OAuth is its gate — unchanged by the upload flow."""
+    return bool(ONSHAPE_AVAILABLE and session_manager.get_client(get_current_user_id()))
+
+
+def _require_app_session():
+    """Gate for the shared compute endpoints (/process, /process-job, /part-outline).
+
+    Authorized when EITHER the browser has an Onshape session (Onshape-panel flow,
+    behavior unchanged) OR it has passed the Turnstile bot-gate for the anonymous
+    upload flow (`session['app_verified']`). Returns a (response, 401) tuple when
+    neither holds, else None. Note: when Turnstile is unconfigured the upload flow
+    marks itself verified on /session/verify, so this still passes in dev."""
+    if _has_onshape_session():
+        return None
+    if session.get('app_verified'):
+        return None
+    return jsonify({'error': 'Session verification required.', 'need_verification': True}), 401
+
+
+def _compute_dxf_outline(path):
+    """Load a DXF and return its perimeter outline + dims + holes for the wizard layout
+    canvas/thumbnail. Coordinates normalized so the bounding-box minimum is (0,0).
+    Returns a dict (width, height, outline, holes) or None if there is no geometry."""
+    team_config = _active_team_config()
+    pp = FRCPostProcessor(material_thickness=0.25, tool_diameter=0.125,
+                          units='inch', config=team_config)
+    pp.load_dxf(path)
+    pp.transform_coordinates('bottom-left', 0, enforce_bounds=False)
+    pp.identify_perimeter_and_pockets()
+    pp.classify_holes()
+    bbox = pp.bounding_box()
+    if not bbox:
+        return None
+    minx, miny, maxx, maxy = bbox
+    width, height = maxx - minx, maxy - miny
+    outline = []
+    if pp.perimeter:
+        outline = [[round(x - minx, 4), round(y - miny, 4)] for (x, y) in pp.perimeter]
+    # For negative-space 2.5D (HATCH) parts the detected "perimeter" is often an
+    # interior feature (e.g. a central bore), because the true outer profile isn't a
+    # filled polygon in this representation. When the outline doesn't span the part,
+    # fall back to the convex hull of all layer geometry so the layout footprint and
+    # thumbnail match the real bounding box. Rendering only — G-code has its own path.
+    def _span(pts):
+        if not pts:
+            return 0.0, 0.0
+        xs = [p[0] for p in pts]; ys = [p[1] for p in pts]
+        return max(xs) - min(xs), max(ys) - min(ys)
+    ow, oh = _span(outline)
+    if pp.layer_data and (ow < 0.9 * width or oh < 0.9 * height):
+        all_polys = [poly for info in pp.layer_data.values()
+                     for poly in info.get('polygons', [])]
+        if all_polys:
+            hull = unary_union(all_polys).convex_hull
+            if hull.geom_type == 'Polygon':
+                outline = [[round(x - minx, 4), round(y - miny, 4)]
+                           for (x, y) in hull.exterior.coords]
+    if len(outline) < 3:
+        outline = [[0, 0], [round(width, 4), 0],
+                   [round(width, 4), round(height, 4)], [0, round(height, 4)]]
+    holes = [{'cx': round(h['center'][0] - minx, 4),
+              'cy': round(h['center'][1] - miny, 4),
+              'r': round(h['diameter'] / 2.0, 4)}
+             for h in (pp.holes or [])]
+    # For 2.5D parts the interesting features (pockets/rings/steps) live in the depth
+    # layers as HATCH-derived polygons, not as holes/circles — so the thumbnail would
+    # otherwise show just the bare perimeter. Surface each layer polygon's rings as
+    # `inner` outlines so the layout preview is recognizable. Dedupe by rounded bounds
+    # and drop rings that coincide with the perimeter (already drawn as `outline`).
+    inner = []
+    if pp.layer_data:
+        seen = set()
+        perim_key = (0.0, 0.0, round(width, 2), round(height, 2))
+        for info in pp.layer_data.values():
+            for poly in info.get('polygons', []):
+                for ring in [poly.exterior, *poly.interiors]:
+                    rminx, rminy, rmaxx, rmaxy = ring.bounds
+                    # Skip degenerate slivers (sub-0.02" in a dimension): they're
+                    # slicing artifacts that would litter the thumbnail with dashes.
+                    if (rmaxx - rminx) < 0.02 or (rmaxy - rminy) < 0.02:
+                        continue
+                    key = tuple(round(v, 2) for v in ring.bounds)
+                    if key in seen or key == perim_key:
+                        continue
+                    seen.add(key)
+                    inner.append([[round(x - minx, 4), round(y - miny, 4)]
+                                  for (x, y) in ring.coords])
+                    if len(inner) >= 400:  # guard against pathological part counts
+                        break
+    else:
+        # Single-layer part: interior pockets are closed paths that are neither the
+        # perimeter nor circular holes, so surface them as inner outlines too —
+        # otherwise the thumbnail shows only the outline + holes and omits pockets.
+        for pocket in (pp.pockets or []):
+            if len(pocket) >= 3:
+                inner.append([[round(x - minx, 4), round(y - miny, 4)]
+                              for (x, y) in pocket])
+    return {'width': round(width, 4), 'height': round(height, 4),
+            'outline': outline, 'holes': holes, 'inner': inner}
+
+
+@app.route('/session/verify', methods=['POST'])
+@limiter.limit("30 per minute")
+def session_verify():
+    """Establish an anonymous upload session by verifying a Cloudflare Turnstile
+    token. Only the non-Onshape upload flow uses this. When Turnstile is
+    unconfigured (dev/test) verification passes and the session is still minted,
+    so the compute-endpoint gate keeps working locally."""
+    data = request.get_json(silent=True) or {}
+    token = data.get('token') or request.form.get('cf-turnstile-response')
+    if _verify_turnstile_token(token):
+        session['app_verified'] = True
+        return jsonify({'ok': True})
+    return jsonify({'ok': False, 'error': 'Verification failed.'}), 403
+
+
+def _config_status_payload():
+    """JSON-safe snapshot of the upload flow's current config (team name, machine/material/
+    tool/bed context) so the client can apply a newly-loaded config in place without a full
+    page reload. Mirrors the template context used on initial render."""
+    ctx = dict(_app_template_context(force_defaults=True))
+    # incomplete_materials is a set (not JSON-serializable); the rest is plain data.
+    ctx['incomplete_materials'] = sorted(ctx.get('incomplete_materials', []))
+    team_config = _active_team_config()
+    ctx['team_name'] = team_config.team_name
+    ctx['team_number'] = team_config.team_number
+    ctx['config_url'] = session.get('upload_config_url')
+    return ctx
+
+
+@app.route('/session/config', methods=['POST'])
+@limiter.limit("30 per minute")
+def session_config():
+    """Set (or clear) the team config for the anonymous UPLOAD flow.
+
+    The browser fetches a team-hosted YAML config client-side (from a CORS-friendly host)
+    and POSTs its text here; we validate/sanitize it STRICTLY (rejecting bad input with a
+    user-facing message) and store the result under `upload_config_data` -- kept separate
+    from the Onshape `team_config_data` so the two flows never cross-contaminate. An empty or
+    absent `yaml` clears back to Team 6238 defaults. Gated like the compute endpoints, so
+    only a verified session can set it."""
+    gate = _require_app_session()
+    if gate:
+        return gate
+    data = request.get_json(silent=True) or {}
+    yaml_text = data.get('yaml')
+    source_url = (data.get('url') or '').strip() or None
+
+    # Empty content -> clear the upload config, revert to defaults.
+    if not yaml_text or not yaml_text.strip():
+        session.pop('upload_config_data', None)
+        session.pop('upload_config_url', None)
+        log("🧹 Upload team config cleared - using defaults")
+        return jsonify({'ok': True, 'cleared': True, **_config_status_payload()})
+
+    try:
+        config_dict, warnings = validate_and_sanitize_config(yaml_text, strict=True)
+    except ConfigValidationError as e:
+        return jsonify({'ok': False, 'error': e.message}), 400
+
+    team_config = TeamConfig.from_dict(config_dict)
+    session['upload_config_data'] = team_config._data
+    session['upload_config_url'] = source_url
+    # Newline-strip the URL before logging (avoid log-forging via the user-supplied value).
+    safe_url = (source_url or '').replace('\n', ' ').replace('\r', ' ')[:200]
+    log(f"✅ Upload team config set: {team_config.team_name} (#{team_config.team_number})"
+        + (f" from {safe_url}" if safe_url else ""))
+    return jsonify({'ok': True, 'warnings': warnings, **_config_status_payload()})
+
+
+def _serve_wizard_upload():
+    """Render the multi-part wizard full-screen in DXF-upload (non-Onshape) mode.
+
+    Shared by the root route and the `/app` alias. NO Onshape OAuth: the anonymous
+    upload flow is bot-gated by Cloudflare Turnstile (see /session/verify) and
+    always uses DEFAULT team config — it never calls an Onshape API (no
+    permissions in this scenario). The Onshape-panel flow is served separately by
+    `_serve_onshape_panel` and is unchanged.
+    """
+    if is_local_mode():
+        load_local_team_config_into_session()
+    return render_template('wizard.html', source='upload', authenticated=True,
+                           onshape_ctx={}, theme='dark',
+                           turnstile_sitekey=TURNSTILE_SITE_KEY,
+                           **_app_template_context(force_defaults=True))
+
+
+@app.route('/')
+def index():
+    """Render the main app: the multi-part wizard, full-screen, in DXF-upload mode."""
+    return _serve_wizard_upload()
+
+
+@app.route('/config/refresh')
+def refresh_config():
+    """Force an immediate re-fetch of the team config from Onshape (the subtle reload glyph
+    next to the config link). Same fetch-and-store as login and the TTL refresh; returns
+    the user to wherever they were."""
+    if ONSHAPE_AVAILABLE:
+        client = session_manager.get_client(get_current_user_id())
+        if client:
+            try:
+                _load_team_config_into_session(client)
+            except Exception as e:
+                log(f"⚠️  Manual team config refresh failed: {e}")
+    return redirect(request.referrer or '/')
+
+
+@app.route('/app')
+def wizard_app():
+    """Alias for the root route: the standalone (DXF upload) wizard. Kept so existing
+    links to /app keep working; both it and / render the same full-screen upload wizard."""
+    return _serve_wizard_upload()
+
+
+def _clean_onshape_id(value):
+    """Return a usable Onshape id, or '' if the value is an unsubstituted URL-template
+    placeholder. When Onshape launches our element panel it fills placeholders like
+    {$workspaceId}/{$versionId} in the configured URL - but only for ids that exist in
+    the current context. Opened on an older VERSION, a document has no workspace, so
+    {$workspaceId} arrives literally (e.g. '{$workspaceId}' / '%7B$workspaceId%7D').
+    Treat any value containing '{' or '$' (or empty) as absent so the wvm resolver can
+    fall back to the version/microversion id that DID substitute."""
+    if not value:
+        return ''
+    s = str(value).strip()
+    if '{' in s or '$' in s:
+        return ''
+    return s
+
+
+def _serve_onshape_panel():
+    """Render the multi-part wizard for embedding in the Onshape right-side panel.
+
+    Does NOT hard-redirect to OAuth when unauthenticated (the iframe cannot frame
+    Onshape's login). Instead it passes an `authenticated` flag and the wizard shows
+    a Connect button that runs OAuth in a popup. Sets framing + cookie headers so the
+    iframe and its OAuth/session work inside Onshape."""
+    # Pass the launch ids through RAW (do NOT clean placeholders here). These feed the
+    # wizard's Onshape postMessage calls (applicationInit / requestSelection), and
+    # Onshape's selection channel breaks if we hand it an EMPTY workspaceId - it
+    # tolerates the unsubstituted '{$workspaceId}' literal (version context) but not ''.
+    # Placeholder cleaning + wvm resolution happens at the real API boundary instead:
+    # /onshape/export-face cleans the POST body via _clean_onshape_id before any call.
+    onshape_ctx = {
+        'documentId': request.args.get('documentId', ''),
+        'workspaceId': request.args.get('workspaceId', ''),
+        # A panel opened on an older version/microversion gets these instead of a
+        # workspace id; carried through so the export path can address that snapshot.
+        'versionId': request.args.get('versionId', ''),
+        'microversionId': request.args.get('microversionId', ''),
+        'elementId': request.args.get('elementId', ''),
+        'server': request.args.get('server', 'https://cad.onshape.com'),
+    }
+    # Onshape passes the user's current theme (e.g. ?theme=light|dark) when it loads the
+    # panel iframe; mirror it so the panel matches Onshape's light/dark preference.
+    theme = 'dark' if request.args.get('theme', 'light').lower() == 'dark' else 'light'
+    authenticated = bool(ONSHAPE_AVAILABLE and session_manager.get_client(get_current_user_id()))
+    log(f"[PANEL] render did={onshape_ctx['documentId'][:8]} authed={authenticated} theme={theme}")
+    resp = make_response(render_template('wizard.html', source='onshape',
+                                         authenticated=authenticated, onshape_ctx=onshape_ctx,
+                                         theme=theme, **_app_template_context()))
+    # Allow embedding only within Onshape; allow the session cookie to ride in the iframe.
+    resp.headers['Content-Security-Policy'] = "frame-ancestors https://*.onshape.com"
+    resp.headers.pop('X-Frame-Options', None)
+    return resp
+
+
+@app.route('/onshape-panel')
+def onshape_panel():
+    """Canonical wizard panel route."""
+    return _serve_onshape_panel()
+
+def _detect_tube_dims(dxf_path, rotation):
+    """Detect a tube face's width x length from a DXF's geometry bounds.
+
+    Returns (tube_width, tube_length) in inches, or (None, None) if bounds could
+    not be read. Rotation of 90/270 swaps width and length to match how the part
+    is placed in the jig.
+    """
+    try:
+        doc = ezdxf.readfile(dxf_path)
+        msp = doc.modelspace()
+        all_x, all_y = [], []
+        for entity in msp:
+            if entity.dxftype() == 'CIRCLE':
+                center = entity.dxf.center
+                radius = entity.dxf.radius
+                all_x.extend([center.x - radius, center.x + radius])
+                all_y.extend([center.y - radius, center.y + radius])
+            elif entity.dxftype() in ['LWPOLYLINE', 'POLYLINE']:
+                points = list(entity.get_points())
+                if points:
+                    all_x.extend([p[0] for p in points])
+                    all_y.extend([p[1] for p in points])
+            elif entity.dxftype() == 'LINE':
+                all_x.extend([entity.dxf.start.x, entity.dxf.end.x])
+                all_y.extend([entity.dxf.start.y, entity.dxf.end.y])
+
+        if not (all_x and all_y):
+            return None, None
+        dxf_width = max(all_x) - min(all_x)
+        dxf_height = max(all_y) - min(all_y)
+        # Account for rotation: swap dimensions if rotated 90 or 270 degrees.
+        if rotation in [90, 270]:
+            return dxf_height, dxf_width
+        return dxf_width, dxf_height
+    except Exception as e:
+        log(f"⚠️  Could not extract tube dimensions from DXF: {e}")
+        return None, None
+
 
 @app.route('/process', methods=['POST'])
 @limiter.limit("10 per minute")  # Strict limit - CPU intensive operation
 def process_file():
     """Process uploaded DXF file and generate G-code"""
+    gate = _require_app_session()
+    if gate:
+        return gate
     try:
-        if is_local_mode() and not session.get('team_config_data'):
+        if is_local_mode() and not session.get('upload_config_data'):
             load_local_team_config_into_session()
 
         # Get uploaded file
@@ -553,19 +946,12 @@ def process_file():
         material = request.form.get('material', 'plywood')
         is_aluminum_tube = (material.lower() == 'aluminum_tube')
         machine_id = request.form.get('machine_id', None)  # Optional machine selection
+        material = normalize_material(material)  # aluminum_tube->aluminum, polycarb->polycarbonate
 
-        # Map special cases:
-        # - 'aluminum_tube' -> 'aluminum' (aluminum_tube is UI-only, uses aluminum preset)
-        # - 'polycarb' -> 'polycarbonate' (legacy compatibility)
-        # All other materials pass through as-is (including custom materials from config)
-        if material.lower() == 'aluminum_tube':
-            material = 'aluminum'
-        elif material.lower() == 'polycarb':
-            material = 'polycarbonate'
-
-        tool_diameter = float(request.form.get('tool_diameter', 0.157))
+        tool_diameter = float(request.form.get('tool_diameter', DEFAULT_TOOL_DIAMETER_IN))
         origin_corner = request.form.get('origin_corner', 'bottom-left')
         rotation = int(request.form.get('rotation', 0))
+        mirror = request.form.get('mirror', '0') == '1'  # "flip over" (horizontal mirror)
         suggested_filename = request.form.get('suggested_filename', '')
 
         # Get timestamp from client (in user's local timezone)
@@ -591,44 +977,9 @@ def process_file():
         tube_width = None
         tube_length = None
         if is_aluminum_tube:
-            try:
-                doc = ezdxf.readfile(input_path)
-                msp = doc.modelspace()
-
-                # Collect all geometry bounds
-                all_x = []
-                all_y = []
-
-                for entity in msp:
-                    if entity.dxftype() == 'CIRCLE':
-                        center = entity.dxf.center
-                        radius = entity.dxf.radius
-                        all_x.extend([center.x - radius, center.x + radius])
-                        all_y.extend([center.y - radius, center.y + radius])
-                    elif entity.dxftype() in ['LWPOLYLINE', 'POLYLINE']:
-                        points = list(entity.get_points())
-                        if points:
-                            all_x.extend([p[0] for p in points])
-                            all_y.extend([p[1] for p in points])
-                    elif entity.dxftype() == 'LINE':
-                        all_x.extend([entity.dxf.start.x, entity.dxf.end.x])
-                        all_y.extend([entity.dxf.start.y, entity.dxf.end.y])
-
-                if all_x and all_y:
-                    dxf_width = max(all_x) - min(all_x)
-                    dxf_height = max(all_y) - min(all_y)
-
-                    # Account for rotation: swap dimensions if rotated 90° or 270°
-                    if rotation in [90, 270]:
-                        tube_width = dxf_height
-                        tube_length = dxf_width
-                        log(f"📏 Detected tube dimensions (after {rotation}° rotation): {tube_width:.3f}\" x {tube_length:.3f}\"")
-                    else:
-                        tube_width = dxf_width
-                        tube_length = dxf_height
-                        log(f"📏 Detected tube dimensions: {tube_width:.3f}\" x {tube_length:.3f}\"")
-            except Exception as e:
-                log(f"⚠️  Could not extract tube dimensions from DXF: {e}")
+            tube_width, tube_length = _detect_tube_dims(input_path, rotation)
+            if tube_width is not None:
+                log(f"📏 Detected tube dimensions (after {rotation}° rotation): {tube_width:.3f}\" x {tube_length:.3f}\"")
 
         # Generate suggested filename base (without extension or timestamp)
         if suggested_filename:
@@ -642,41 +993,54 @@ def process_file():
 
         log(f"🚀 Running post-processor API...")
 
-        # Get team config from session (if available)
-        config_data = session.get('team_config_data', {})
-        log(f"🔍 DEBUG: Session team_config_data keys: {list(config_data.keys()) if config_data else 'EMPTY'}")
-        log(f"🔍 DEBUG: Session has {len(config_data)} top-level keys in team_config_data")
-        team_config = TeamConfig.from_dict(config_data)
+        # Get the team config that applies to this request (upload-supplied, Onshape, or
+        # defaults). Single resolver so /process matches what the page rendered.
+        team_config = _active_team_config()
         log(f"📋 Using team config: {team_config}")
         log(f"🔍 DEBUG: TeamConfig internals: team={team_config.team_number}, name={team_config.team_name}")
 
         # Call post-processor API based on mode
         try:
             if is_aluminum_tube:
-                # Tube mode - use tube-pattern API
-                pp = FRCPostProcessor(
-                    material_thickness=thickness,
-                    tool_diameter=tool_diameter,
-                    units='inch',
-                    config=team_config
-                )
-
-                # Store tube height for Z-offset calculations
-                pp.tube_height = tube_height
-
-                # Apply material preset (for specific machine if selected)
-                pp.apply_material_preset(material, machine_id)
-
-                # Add user name if authenticated
+                # Tube mode - use tube-pattern API. Each face is prepared identically;
+                # face 2 (if provided) carries a distinct pattern for the opposite side.
                 user_name = session.get('user_name')
-                if user_name:
-                    pp.user_name = user_name
 
-                # Load and process DXF
-                pp.load_dxf(input_path)
-                pp.transform_coordinates('bottom-left', rotation)  # Tube jig is always bottom-left
-                pp.identify_perimeter_and_pockets()  # Must come BEFORE classify_holes to remove perimeter circles
-                pp.classify_holes()
+                def _prepare_tube_face(dxf_path):
+                    face_pp = FRCPostProcessor(
+                        material_thickness=thickness,
+                        tool_diameter=tool_diameter,
+                        units='inch',
+                        config=team_config
+                    )
+                    face_pp.tube_height = tube_height  # Store for Z-offset calculations
+                    face_pp.apply_material_preset(material, machine_id)
+                    if user_name:
+                        face_pp.user_name = user_name
+                    face_pp.load_dxf(dxf_path)
+                    face_pp.transform_coordinates('bottom-left', rotation)  # Tube jig is always bottom-left
+                    face_pp.identify_perimeter_and_pockets()  # Must come BEFORE classify_holes to remove perimeter circles
+                    face_pp.classify_holes()
+                    return face_pp
+
+                pp = _prepare_tube_face(input_path)
+
+                # Optional distinct second face. When absent, face 1 is mirrored onto the
+                # opposite side (one-face mode).
+                second_face_pp = None
+                face2 = request.files.get('file_face2')
+                if face2 is not None and face2.filename:
+                    if not face2.filename.lower().endswith('.dxf'):
+                        return jsonify({'error': 'Second face must be a DXF file'}), 400
+                    face2_path = os.path.join(UPLOAD_FOLDER, 'input_face2.dxf')
+                    face2.save(face2_path)
+                    second_face_pp = _prepare_tube_face(face2_path)
+                    # Both faces are opposite walls of the same tube, so their widths
+                    # should match; warn (don't fail) if they differ noticeably.
+                    f2_width, _ = _detect_tube_dims(face2_path, rotation)
+                    if tube_width and f2_width and abs(f2_width - tube_width) > 0.05:
+                        log(f"⚠️  Tube face widths differ: face1={tube_width:.3f}\" face2={f2_width:.3f}\" "
+                            f"(using face1 width for both)")
 
                 # Generate G-code using API
                 result = pp.generate_tube_pattern_gcode(
@@ -686,7 +1050,8 @@ def process_file():
                     tube_width=tube_width,
                     tube_length=tube_length,
                     suggested_filename=base_name,
-                    timestamp=timestamp_str
+                    timestamp=timestamp_str,
+                    second_face_pp=second_face_pp
                 )
             else:
                 # Standard mode - use standard API
@@ -710,7 +1075,7 @@ def process_file():
 
                 # Load and process DXF
                 pp.load_dxf(input_path)
-                pp.transform_coordinates(origin_corner, rotation)
+                pp.transform_coordinates(origin_corner, rotation, mirror=mirror)
                 pp.identify_perimeter_and_pockets()  # Must come BEFORE classify_holes to remove perimeter circles
                 pp.classify_holes()
 
@@ -806,6 +1171,228 @@ def process_file():
         log(traceback.format_exc())
         return jsonify({'error': f'Unexpected error: {str(e)}'}), 500
 
+
+@app.route('/process-job', methods=['POST'])
+@limiter.limit("10 per minute")  # CPU intensive
+def process_job():
+    """Process a multi-part job: several DXF parts placed on one stock sheet, emitted
+    as a single G-code program. 2D standard mode only (2.5D is single-part via /process).
+
+    Request (multipart/form-data):
+      - file_0, file_1, ... : one DXF per distinct part
+      - job : JSON {material, tool_diameter, thickness, tab_spacing, machine_id,
+                    stock:{width,height}, name,
+                    parts:[{file_index, name, place_x, place_y, rotation}]}
+      - timestamp : client-local timestamp string
+
+    Response: {success, filename(token), gcode, cycle_time, stock, parts:[...]}
+              or {success:false, part_errors:[{part_index, name, error}]}.
+    """
+    gate = _require_app_session()
+    if gate:
+        return gate
+    job_dir = None
+    try:
+        job_raw = request.form.get('job')
+        if not job_raw:
+            return jsonify({'error': 'Missing job specification'}), 400
+        try:
+            job = json.loads(job_raw)
+        except (ValueError, TypeError):
+            return jsonify({'error': 'Invalid job JSON'}), 400
+
+        parts_spec = job.get('parts', [])
+        if not parts_spec:
+            return jsonify({'error': 'Job has no parts'}), 400
+
+        # Shared job parameters (one tool/material per job in v1).
+        material = normalize_material(job.get('material', 'plywood'))  # aluminum_tube->aluminum, polycarb->polycarbonate
+        tool_diameter = float(job.get('tool_diameter', DEFAULT_TOOL_DIAMETER_IN))
+        thickness = float(job.get('thickness', 0.25))
+        tab_spacing = float(job.get('tab_spacing', 6.0))
+        machine_id = job.get('machine_id')
+        timestamp_str = request.form.get('timestamp', '')
+
+        # Stock size (and G54 origin) are derived server-side from the placed parts'
+        # combined bounding box; the client's stock field is advisory only. This avoids
+        # a client/server bbox mismatch flagging a part as "outside" its own stock.
+
+        # Save each uploaded DXF to a distinct path so parts don't clobber each other.
+        job_dir = tempfile.mkdtemp(prefix='job_', dir=UPLOAD_FOLDER)
+        saved_paths = {}
+        for key in list(request.files.keys()):
+            if not key.startswith('file_'):
+                continue
+            f = request.files[key]
+            if not f.filename.lower().endswith('.dxf'):
+                return jsonify({'error': f'{f.filename} is not a DXF file'}), 400
+            try:
+                idx = int(key.split('_', 1)[1])
+            except (ValueError, IndexError):
+                continue
+            p = os.path.join(job_dir, f'part_{idx}.dxf')
+            f.save(p)
+            saved_paths[idx] = p
+
+        team_config = _active_team_config()
+        user_name = session.get('user_name')
+        machine_x = team_config.machine_x_max
+        machine_y = team_config.machine_y_max
+
+        log(f"[JOB] {len(parts_spec)} parts, tool {tool_diameter}, material {material}, thickness {thickness}")
+
+        # Pass 1: build + place each part; collect footprints for layout validation.
+        prepared = []
+        placed = []
+        gen_errors = []
+        for i, part in enumerate(parts_spec):
+            fidx = part.get('file_index', i)
+            if fidx not in saved_paths:
+                gen_errors.append({'part_index': i, 'name': part.get('name'),
+                                   'error': f"Missing DXF upload for part {i + 1}"})
+                continue
+            name = part.get('name') or Path(saved_paths[fidx]).stem
+            place_x = float(part.get('place_x', 0.0))
+            place_y = float(part.get('place_y', 0.0))
+            rotation = float(part.get('rotation', 0))
+            mirror = bool(part.get('mirror'))
+
+            pp = FRCPostProcessor(material_thickness=thickness, tool_diameter=tool_diameter,
+                                  units='inch', config=team_config)
+            pp.apply_material_preset(material, machine_id)
+            if user_name:
+                pp.user_name = user_name
+            pp.tab_spacing = tab_spacing
+            pp.load_dxf(saved_paths[fidx])
+            pp.transform_coordinates('bottom-left', rotation,
+                                     placement_offset=(place_x, place_y),
+                                     enforce_bounds=False, mirror=mirror)
+            pp.identify_perimeter_and_pockets()
+            pp.classify_holes()
+            bbox = pp.bounding_box()
+            placed.append({'name': name, 'bbox': bbox, 'polygon': pp.placed_polygon()})
+            prepared.append({'pp': pp, 'bbox': bbox, 'name': name,
+                             'place_x': place_x, 'place_y': place_y, 'rotation': rotation})
+
+        if gen_errors:
+            return jsonify({'success': False, 'part_errors': gen_errors}), 400
+
+        # Stock = the parts' combined bounding box (server-authoritative).
+        boxes = [p['bbox'] for p in placed if p.get('bbox')]
+        if boxes:
+            stock_w = max(b[2] for b in boxes) - min(b[0] for b in boxes)
+            stock_h = max(b[3] for b in boxes) - min(b[1] for b in boxes)
+        else:
+            stock_w = stock_h = 0.0
+
+        # Validate before the expensive body generation: the combined bbox must fit the
+        # machine, and parts must not overlap (kerf = tool diameter).
+        layout_errors = validate_job_layout(placed, machine_x, machine_y, min_gap=tool_diameter)
+        if layout_errors:
+            log(f"[JOB] layout invalid: {layout_errors}")
+            return jsonify({'success': False, 'part_errors': layout_errors}), 400
+
+        # Pass 2: generate each part's toolpath body, then stitch into one program.
+        part_jobs = []
+        response_parts = []
+        for i, item in enumerate(prepared):
+            phases = item['pp'].generate_part_phases()
+            if phases['errors']:
+                for e in phases['errors']:
+                    gen_errors.append({'part_index': i, 'name': item['name'], 'error': e})
+                continue
+            part_jobs.append({
+                'name': item['name'], 'place_x': item['place_x'],
+                'place_y': item['place_y'], 'rotation': item['rotation'],
+                'interior': phases['interior'], 'perimeter': phases['perimeter'],
+                'tab_removal': phases['tab_removal'],
+            })
+            minx, miny, maxx, maxy = item['bbox']
+            response_parts.append({
+                'index': i, 'name': item['name'],
+                'place_x': item['place_x'], 'place_y': item['place_y'], 'rotation': item['rotation'],
+                'bbox': {'minX': minx, 'minY': miny, 'maxX': maxx, 'maxY': maxy},
+            })
+
+        if gen_errors:
+            return jsonify({'success': False, 'part_errors': gen_errors}), 400
+        if not part_jobs:
+            return jsonify({'error': 'No parts could be generated'}), 400
+
+        result = assemble_job_gcode(part_jobs, header_pp=prepared[0]['pp'],
+                                    timestamp=timestamp_str or None,
+                                    suggested_filename=job.get('name', 'job'))
+
+        output_path = os.path.join(OUTPUT_FOLDER, result.filename)
+        with open(output_path, 'w') as fh:
+            fh.write(result.gcode)
+        output_token = file_token_manager.register_file(output_path, result.filename)
+
+        log(f"[JOB] assembled {result.stats['num_parts']} parts, "
+            f"{result.stats['total_lines']} lines, {result.stats['cycle_time_display']}")
+
+        metrics.log_event('job_generated',
+                          team_number=session.get('team_number'),
+                          user_email=session.get('user_email'),
+                          metadata={'material': material, 'num_parts': len(part_jobs)})
+
+        return jsonify({
+            'success': True,
+            'filename': output_token,
+            'gcode': result.gcode,
+            'cycle_time': result.stats.get('cycle_time_display'),
+            'cycle_time_seconds': result.stats.get('cycle_time_seconds'),
+            'stock': {'width': round(stock_w, 4), 'height': round(stock_h, 4)},
+            'parts': response_parts,
+        })
+
+    except ValueError as e:
+        return jsonify({'error': f'Invalid parameter value: {str(e)}'}), 400
+    except Exception as e:
+        log(traceback.format_exc())
+        return jsonify({'error': f'Unexpected error: {str(e)}'}), 500
+    finally:
+        if job_dir:
+            shutil.rmtree(job_dir, ignore_errors=True)
+
+
+@app.route('/part-outline', methods=['POST'])
+@limiter.limit("30 per minute")
+def part_outline():
+    """Return the perimeter outline + dimensions of an uploaded DXF, for the layout
+    canvas and parts-list thumbnail. Stateless: the browser keeps the DXF bytes and
+    re-submits them at /process-job time (serverless-safe). Coordinates are normalized
+    so the part's bounding-box minimum sits at (0,0)."""
+    gate = _require_app_session()
+    if gate:
+        return gate
+    path = None
+    try:
+        if 'file' not in request.files:
+            return jsonify({'error': 'No file uploaded'}), 400
+        f = request.files['file']
+        if not f.filename.lower().endswith('.dxf'):
+            return jsonify({'error': 'File must be a DXF'}), 400
+
+        tmp = tempfile.NamedTemporaryFile(suffix='.dxf', delete=False, dir=UPLOAD_FOLDER)
+        path = tmp.name
+        tmp.close()
+        f.save(path)
+
+        geo = _compute_dxf_outline(path)
+        if not geo:
+            return jsonify({'error': 'No geometry found in DXF'}), 400
+        geo['success'] = True
+        geo['name'] = Path(f.filename).stem
+        return jsonify(geo)
+    except Exception as e:
+        log(traceback.format_exc())
+        return jsonify({'error': str(e)}), 500
+    finally:
+        if path and os.path.exists(path):
+            os.remove(path)
+
+
 @app.route('/download/<token>')
 @limiter.limit("30 per minute")
 def download_file(token):
@@ -850,8 +1437,9 @@ def download_file(token):
 @limiter.limit("30 per minute")
 def debug_download_dxf():
     """
-    Debug endpoint: Download the multi-layer DXF file from the most recent Onshape import.
-    This allows manual testing of the postprocessor with the exact DXF that was generated.
+    Debug endpoint: Download the exact DXF from the most recent Onshape face export
+    (flat or 2.5D multi-layer). Lets you reproduce a part offline against the
+    postprocessor with the identical geometry the server generated.
     """
     try:
         # Get DXF token from session
@@ -859,7 +1447,7 @@ def debug_download_dxf():
         if not dxf_token:
             return jsonify({
                 'error': 'No debug DXF available',
-                'message': 'Import a part from Onshape first. The DXF is only available for multi-layer (2.5D) imports.'
+                'message': 'Import a part from Onshape first.'
             }), 404
 
         # Look up file by token
@@ -888,6 +1476,40 @@ def debug_download_dxf():
     except Exception as e:
         log(f"❌ Debug DXF download error: {e}")
         return jsonify({'error': str(e)}), 500
+
+
+@app.route('/debug/download-raw-dxf')
+@limiter.limit("30 per minute")
+def debug_download_raw_dxf():
+    """
+    Debug endpoint: Download a zip of the RAW per-depth DXFs from the most recent 2.5D
+    Onshape import — exactly as Onshape returned them, BEFORE our HATCH reconstruction.
+    Use this to inspect what the outer-profile boundary geometry looks like at the source.
+    """
+    try:
+        token = session.get('debug_raw_dxf_token')
+        if not token:
+            return jsonify({
+                'error': 'No raw debug DXF available',
+                'message': 'Import a 2.5D part from Onshape first.'
+            }), 404
+
+        file_info = file_token_manager.get_file(token)
+        if not file_info or not os.path.exists(file_info['filepath']):
+            return jsonify({
+                'error': 'Raw DXF zip not found or expired',
+                'message': 'It may have been cleaned up. Import the part again.'
+            }), 404
+
+        real_filename = session.get('debug_raw_dxf_filename', 'raw-layers.zip')
+        log(f"🐛 Debug RAW DXF zip download: {real_filename} "
+            f"({os.path.getsize(file_info['filepath'])} bytes)")
+        return send_file(file_info['filepath'], as_attachment=True,
+                         download_name=real_filename, mimetype='application/zip')
+    except Exception as e:
+        log(f"❌ Debug raw DXF download error: {e}")
+        return jsonify({'error': str(e)}), 500
+
 
 @app.route('/uploads/<token>')
 @limiter.limit("30 per minute")
@@ -1083,6 +1705,13 @@ def onshape_auth():
         # Store state in session for verification
         session['onshape_oauth_state'] = state
 
+        # Popup mode (from the embedded panel): remember so the callback closes the
+        # popup and notifies the opener instead of navigating the whole window.
+        if request.args.get('popup'):
+            session['onshape_oauth_popup'] = True
+        else:
+            session.pop('onshape_oauth_popup', None)
+
         # Get authorization URL
         auth_url = client.get_authorization_url(state=state)
 
@@ -1138,55 +1767,215 @@ def onshape_oauth_callback():
             session['user_name'] = user_name
             session['user_email'] = user_email
 
-        # Check if there's a pending import (came from Onshape extension)
-        pending_import = session.get('pending_onshape_import')
-
-        # Only load config during auth if NOT coming from Onshape extension
-        # (Extension flow will load config during export endpoint)
-        if not pending_import:
-            log("ℹ️  Direct authentication (not from Onshape) - loading config now")
-            config_yaml = client.fetch_config_file()
-            if config_yaml:
-                log(f"🔍 DEBUG: Raw YAML length: {len(config_yaml)} bytes")
-                log(f"🔍 DEBUG: First 500 chars of YAML: {config_yaml[:500]}")
-                team_config = TeamConfig.from_yaml(config_yaml)
-                log(f"✅ Team config loaded: {team_config.team_name} (#{team_config.team_number})")
-                log(f"🔍 DEBUG: team_config._data keys: {list(team_config._data.keys())}")
-                log(f"🔍 DEBUG: team_config._data has 'team' key? {'team' in team_config._data}")
-                if 'team' in team_config._data:
-                    log(f"🔍 DEBUG: team_config._data['team'] = {team_config._data['team']}")
-                session['team_config_data'] = team_config._data
-                session['team_config'] = team_config.to_dict()
-                session['team_number'] = team_config.team_number
-                session['using_default_config'] = False
-            else:
-                log("⚠️  No team config found - using defaults")
-                team_config = TeamConfig()
-                session['team_config_data'] = {}
-                session['team_config'] = team_config.to_dict()
-                session['team_number'] = team_config.team_number
-                session['using_default_config'] = True
-        else:
-            log("ℹ️  Authentication from Onshape extension - will load config during export")
+        # Load the team's config file (lives in the user's own Onshape documents).
+        _load_team_config_into_session(client)
 
         log("="*60 + "\n")
 
         # Clean up OAuth state
         session.pop('onshape_oauth_state', None)
 
-        # Get pending import (if any)
-        pending_import = session.pop('pending_onshape_import', None)
+        # Safeguard: browsers drop cookies over ~4KB, which would silently lose the
+        # tokens we just wrote. Warn if the session is getting close.
+        try:
+            _total = sum(len(json.dumps(v, default=str)) for v in session.values())
+            if _total > 3500:
+                log(f"[ONSHAPE-AUTH] WARNING: session ~{_total}B nearing the 4KB cookie limit")
+        except Exception:
+            pass
 
-        if pending_import:
-            # Redirect back to import with original parameters
-            params = urlencode({k: v for k, v in pending_import.items() if v})
-            return redirect(f'/onshape/import?{params}')
+        # Popup mode (embedded panel connect): close the popup; the panel detects the
+        # close and verifies auth.
+        if session.pop('onshape_oauth_popup', None):
+            return redirect('/onshape/auth-complete')
 
-        # Otherwise redirect to main page with success message
+        # Direct (non-popup) auth: back to the app.
         return redirect('/?onshape_connected=true')
         
     except Exception as e:
         return f"OAuth callback error: {str(e)}", 500
+
+
+@app.route('/onshape/auth-complete')
+def onshape_auth_complete():
+    """Tiny page shown in the OAuth popup after a successful connect: close the popup.
+    The embedded panel detects the close (popup.closed) and verifies auth."""
+    return """<!doctype html><html><head><meta charset="utf-8"><title>Connected</title></head>
+<body style="font-family:-apple-system,sans-serif;background:#0f1419;color:#e6edf3;text-align:center;padding:2rem">
+<p>Connected to Onshape. You can close this window.</p>
+<script>setTimeout(function () { window.close(); }, 300);</script></body></html>"""
+
+
+@app.route('/onshape/authed')
+def onshape_authed():
+    """Cheap session-only auth check (no Onshape API call) for the panel's connect
+    poll. The embedded iframe polls this after opening the OAuth popup and reloads
+    once tokens land in the session — avoids relying on window.opener/postMessage,
+    which cross-origin OAuth navigation often severs."""
+    authed = bool(ONSHAPE_AVAILABLE and session_manager.get_client(get_current_user_id()))
+    return jsonify({'authenticated': authed})
+
+
+@app.route('/onshape/export-face', methods=['POST'])
+@limiter.limit("30 per minute")
+def onshape_export_face():
+    """Export a selected Onshape face and return its DXF bytes (base64) plus the
+    outline/dims for the layout canvas. The browser holds the DXF bytes and
+    re-submits them at /process-job time (serverless-safe; no server cache).
+
+    In 2.5D mode (request field multilayer=true) this builds a depth-layered DXF
+    of all parallel faces; otherwise it exports a single flat face."""
+    client, err_resp, err_code = get_onshape_client_or_401()
+    if err_resp:
+        return err_resp, err_code
+
+    data = request.get_json(force=True, silent=True) or {}
+    did = _clean_onshape_id(data.get('documentId'))
+    # Onshape addresses element data by workspace (live), version, or microversion.
+    # A panel launched on an older version sends versionId with workspaceId left as an
+    # unsubstituted placeholder, so clean all three and require at least one.
+    wid = _clean_onshape_id(data.get('workspaceId'))
+    vid = _clean_onshape_id(data.get('versionId'))
+    mvid = _clean_onshape_id(data.get('microversionId'))
+    eid = _clean_onshape_id(data.get('elementId'))
+    fid = data.get('faceId')
+    bid = data.get('partId') or data.get('bodyId')
+    multilayer = str(data.get('multilayer', '')).lower() in ('true', '1', 'yes')
+    if not all([did, eid, fid]) or not (wid or vid or mvid):
+        return jsonify({'error': 'Missing selection IDs (need document/workspace-or-version/element/face).'}), 400
+
+    log(f"[EXPORT] face did={str(did)[:8]} eid={str(eid)[:8]} fid={fid} bid={bid} "
+        f"ctx={'w/'+wid[:8] if wid else ('v/'+vid[:8] if vid else 'm/'+mvid[:8])} "
+        f"mode={'2.5D' if multilayer else 'flat'}")
+    path = None
+    keep_dxf = False  # set once the DXF is registered for debug download (see finally)
+    try:
+        # Resolve the selected face's normal (for correct flatten orientation) and the
+        # part name (for the parts list) in one bodydetails call. Reused below for the
+        # 2.5D depth-layer construction so we don't re-fetch faces.
+        face_normal = None
+        reference_origin = None   # selected face's plane origin; needed to probe stock thickness
+        name = data.get('name')
+        faces = None
+        resolved_bid = None
+        try:
+            faces = client.list_faces(did, wid, eid, version_id=vid, microversion_id=mvid)
+            for body in (faces or {}).get('bodies', []):
+                for fc in body.get('faces', []):
+                    if fc.get('id') == fid:
+                        surface = fc.get('surface') or {}
+                        face_normal = surface.get('normal')
+                        reference_origin = surface.get('origin')
+                        resolved_bid = body.get('id')
+                        if not name:
+                            name = (body.get('properties') or {}).get('name')
+                        break
+                if resolved_bid:
+                    break
+        except Exception:
+            pass
+
+        # Scope the export to the selected part's body. Onshape's face-selection message
+        # doesn't reliably include a part/body id, and without one the 2.5D depth search
+        # spans EVERY body in the Part Studio and pulls in other parts (e.g. an Origin
+        # Cube). The body that actually OWNS the selected face is the authoritative scope
+        # (it comes from the same bodydetails response the depth search filters on), so
+        # prefer it over whatever id the client sent, which may be a different id form.
+        if resolved_bid and resolved_bid != bid:
+            log(f"[EXPORT] scoping to body {resolved_bid} that owns the selected face (client sent bid={bid})")
+            bid = resolved_bid
+
+        detected_thickness = None
+        if multilayer:
+            dxf_bytes, detected_thickness = build_multilayer_dxf(
+                client, did, wid, eid, fid, bid, face_normal, cached_faces_data=faces,
+                version_id=vid, microversion_id=mvid
+            )
+        else:
+            dxf_bytes = client.export_face_to_dxf(did, wid, eid, fid, body_id=bid, face_normal=face_normal,
+                                                  version_id=vid, microversion_id=mvid)
+            # Seed the (still-editable) 2D thickness field from the part's designed stock
+            # height, reusing the same parallel-face depth discovery 2.5D uses. Best-effort:
+            # on any failure detected_thickness stays None and the UI keeps its default.
+            if face_normal and reference_origin is not None:
+                try:
+                    detected_thickness = client.detect_stock_thickness(
+                        did, wid, eid, face_normal, reference_origin,
+                        body_id=bid, cached_faces_data=faces,
+                        version_id=vid, microversion_id=mvid)
+                except Exception as e:
+                    log(f"[EXPORT] 2D thickness discovery failed (non-fatal): {e}")
+        session_manager.update_session_tokens(client)
+        if not dxf_bytes:
+            return jsonify({'error': 'Onshape returned no DXF for that face.'}), 502
+
+        tmp = tempfile.NamedTemporaryFile(suffix='.dxf', delete=False, dir=UPLOAD_FOLDER)
+        path = tmp.name
+        tmp.close()
+        with open(path, 'wb') as fh:
+            fh.write(dxf_bytes)
+
+        geo = _compute_dxf_outline(path)
+        if not geo:
+            return jsonify({'error': 'Exported DXF had no usable geometry.'}), 500
+
+        geo['name'] = name or 'Onshape part'
+        geo['success'] = True
+        geo['multilayer'] = multilayer
+        # Thickness discovered from the CAD part server-side: authoritative in 2.5D, and a
+        # seed for the editable field in 2D. Pass it back when we found one.
+        if detected_thickness:
+            geo['thickness'] = detected_thickness
+        geo['dxf'] = base64.b64encode(dxf_bytes).decode('ascii')
+
+        # Retain the exact DXF behind a session token so it can be re-downloaded
+        # for debugging via /debug/download-dxf. Invaluable for reproducing a bad
+        # part offline against the postprocessor. The token manager expires the
+        # file after ~1 hour; until then it owns the file (don't delete it below).
+        debug_filename = '{}{}.dxf'.format(geo['name'], '-2.5D' if multilayer else '')
+        session['debug_dxf_token'] = file_token_manager.register_file(path, debug_filename)
+        session['debug_dxf_filename'] = debug_filename
+        keep_dxf = True
+
+        # Also retain the RAW per-depth DXFs (exactly as Onshape returned them, before
+        # _convert_geometry_to_solid_hatch reconstructs the geometry) as a zip, so we can
+        # inspect what the outer-profile boundary looks like pre-conversion. Debug only;
+        # served at /debug/download-raw-dxf. Token manager expires it after ~1 hour.
+        raw_layers = getattr(client, 'last_raw_depth_dxfs', None) if multilayer else None
+        if raw_layers:
+            zbuf = io.BytesIO()
+            with zipfile.ZipFile(zbuf, 'w', zipfile.ZIP_DEFLATED) as zf:
+                for depth, content in raw_layers.items():
+                    zf.writestr('raw_depth_{:+.4f}.dxf'.format(depth), content)
+            ztmp = tempfile.NamedTemporaryFile(suffix='.zip', delete=False, dir=UPLOAD_FOLDER)
+            ztmp.write(zbuf.getvalue())
+            ztmp.close()
+            raw_zip_name = '{}-raw-layers.zip'.format(geo['name'])
+            session['debug_raw_dxf_token'] = file_token_manager.register_file(ztmp.name, raw_zip_name)
+            session['debug_raw_dxf_filename'] = raw_zip_name
+
+        metrics.log_event('onshape_import',
+                          team_number=session.get('team_number'),
+                          user_email=session.get('user_email'),
+                          metadata={'part_name': geo['name'], 'multilayer': multilayer})
+
+        detail = ' (2.5D, t={:.4f}")'.format(detected_thickness) if detected_thickness else ''
+        log(f"[EXPORT] ok name='{geo['name']}' {geo['width']}x{geo['height']}{detail}")
+        return jsonify(geo)
+    except RuntimeError as e:
+        # Expected, user-facing failures from the 2.5D builder (bad face selection,
+        # expired auth, no parallel faces).
+        log(f"[EXPORT] multilayer failed: {e}")
+        return jsonify({'error': str(e)}), 502
+    except Exception as e:
+        log(traceback.format_exc())
+        return jsonify({'error': f'Face export failed: {str(e)}'}), 500
+    finally:
+        # Remove the temp DXF unless it was registered for debug download, in which
+        # case the token manager owns its lifecycle.
+        if path and not keep_dxf and os.path.exists(path):
+            os.remove(path)
+
 
 @app.route('/onshape/status')
 @limiter.limit("30 per minute")
@@ -1235,6 +2024,42 @@ def docs_redirect():
     """Redirect /docs to the static documentation"""
     return redirect('/static/docs/index.html')
 
+@app.route('/docs/feeds-speeds')
+def feeds_speeds_page():
+    """Serve the standalone feeds & speeds calculator page."""
+    return redirect('/static/docs/feeds-speeds.html')
+
+@app.route('/api/feeds-speeds/presets')
+def feeds_speeds_presets():
+    """Expose the model's machine/material/tool presets for the calculator UI."""
+    return jsonify({
+        'machines': feeds_speeds.MACHINES,
+        'materials': feeds_speeds.MATERIALS,
+        'tools': feeds_speeds.TOOL_PRESETS,
+        'reference_tool': feeds_speeds.REFERENCE_TOOL,
+    })
+
+@app.route('/api/feeds-speeds', methods=['POST'])
+@limiter.limit("120 per minute")
+def api_feeds_speeds():
+    """Compute derived feeds & speeds from machine + material + tool inputs.
+
+    Body: {machine, material, tool: {diameter, flutes}, operation}. The machine and
+    material may each be a preset key or an inline dict of overrides (see
+    feeds_speeds._resolve), so the public calculator works without PenguinCAM presets.
+    """
+    data = request.get_json(silent=True) or {}
+    try:
+        result = feeds_speeds.calculate_feeds(
+            data.get('machine', 'omio_x8'),
+            data.get('material', 'plywood'),
+            data.get('tool') or feeds_speeds.TOOL_PRESETS['4mm_1f'],
+            operation=data.get('operation', 'profile'),
+        )
+    except (ValueError, TypeError, KeyError) as exc:
+        return jsonify({'error': str(exc)}), 400
+    return jsonify(result)
+
 @app.route('/set-machine', methods=['POST'])
 @limiter.limit("30 per minute")
 def set_machine():
@@ -1245,8 +2070,7 @@ def set_machine():
             return jsonify({'error': 'No machine_id provided'}), 400
 
         # Verify machine exists in config
-        team_config_data = session.get('team_config_data', {})
-        team_config = TeamConfig(team_config_data)
+        team_config = _active_team_config()
         machines = team_config.get_available_machines()
 
         if machine_id not in machines:
@@ -1272,7 +2096,11 @@ def set_machine():
 @app.route('/debug/session')
 @limiter.limit("30 per minute")
 def debug_session():
-    """Debug endpoint to see session contents (especially team config)"""
+    """Debug endpoint to see session contents (especially team config). Admin-only: it
+    exposes the user's email and team config."""
+    auth_error = require_admin()
+    if auth_error:
+        return auth_error
     return jsonify({
         'user_name': session.get('user_name'),
         'user_email': session.get('user_email'),
@@ -1285,7 +2113,11 @@ def debug_session():
 @app.route('/debug/onshape/faces')
 @limiter.limit("10 per minute")
 def debug_onshape_faces():
-    """Debug endpoint to test Onshape face listing"""
+    """Debug endpoint to test Onshape face listing. Admin-only: it makes live Onshape API
+    calls on the caller's behalf and returns raw tracebacks."""
+    auth_error = require_admin()
+    if auth_error:
+        return auth_error
     if not ONSHAPE_AVAILABLE:
         return jsonify({'error': 'Onshape integration not available'}), 400
 
@@ -1355,726 +2187,18 @@ def debug_onshape_faces():
         })
 
     except Exception as e:
-        import traceback
         return jsonify({
             'success': False,
             'error': str(e),
             'traceback': traceback.format_exc()
         }), 500
 
-@app.route('/onshape/import', methods=['GET', 'POST'])
-@limiter.limit("20 per minute")  # Moderate limit - authenticated via Onshape OAuth
-def onshape_import():
-    """
-    Import a DXF from Onshape
-    Accepts parameters from Onshape extension or direct URL
-    """
-    if not ONSHAPE_AVAILABLE:
-        return jsonify({'error': 'Onshape integration not available'}), 400
-
-    try:
-        log(f"\n{'='*70}")
-        log(f"ONSHAPE IMPORT REQUEST")
-        log(f"{'='*70}")
-        log(f"Request URL: {request.url}")
-
-        # Get parameters (either from query string or JSON body)
-        if request.method == 'POST':
-            raw_params = request.json or {}
-            log(f"Source: POST body (JSON)")
-        else:
-            raw_params = request.args.to_dict()
-            log(f"Source: Query string")
-
-        log(f"\n📝 RAW PARAMETERS RECEIVED:")
-        for key, value in sorted(raw_params.items()):
-            log(f"   {key}: {value!r}")
-
-        params = extract_onshape_params(raw_params)
-
-        log(f"\n🔧 EXTRACTED PARAMETERS:")
-        log(f"   document_id: {params['document_id']!r}")
-        log(f"   workspace_id: {params['workspace_id']!r}")
-        log(f"   element_id: {params['element_id']!r}")
-        log(f"   face_id: {params['face_id']!r}")
-        log(f"   body_id: {params['body_id']!r}")
-
-        document_id = params['document_id']
-        workspace_id = params['workspace_id']
-        element_id = params['element_id']
-        face_id = params['face_id']
-        body_id = params['body_id']  # Optional - for part selection
-
-        # Get Onshape server and user info that IS being sent
-        onshape_server = raw_params.get('server', 'https://cad.onshape.com')
-        onshape_userid = raw_params.get('userId')
-
-        log(f"\n🔍 PARAMETER ANALYSIS:")
-        if face_id:
-            log(f"   ✓ face_id provided: {face_id}")
-            if not face_id.startswith('J'):
-                log(f"   ⚠️  WARNING: face_id doesn't start with 'J' (unusual for Onshape IDs)")
-            if len(face_id) < 10:
-                log(f"   ⚠️  WARNING: face_id seems too short (Onshape IDs are usually longer)")
-        else:
-            log(f"   ℹ️  No face_id - will auto-select")
-
-        if body_id:
-            log(f"   ✓ body_id provided: {body_id}")
-        else:
-            log(f"   ℹ️  No body_id - will search all parts")
-
-        log(f"{'='*70}\n")
-        
-        # WORKAROUND: If params have placeholder strings, we can't proceed
-        if (document_id and ('${' in str(document_id) or document_id.startswith('$'))):
-            log("❌ Onshape variable substitution failed!")
-            log(f"Received literal: documentId={document_id}")
-
-            # Show helpful error page
-            return render_template('index.html',
-                                 error_message='Onshape integration error: Variable substitution not working. Please contact support or use manual DXF upload.',
-                                 debug_info={
-                                     'issue': 'Onshape extension not substituting variables',
-                                     'received_params': str(raw_params),
-                                     'workaround': 'Export DXF manually from Onshape and upload it here'
-                                 },
-                                 using_default_config=session.get('using_default_config', False),
-                                 detected_thickness=None), 400
-
-        if not all([document_id, workspace_id, element_id]):
-            return jsonify({
-                'error': 'Missing required parameters',
-                'required': ['documentId', 'workspaceId', 'elementId'],
-                'received': raw_params,
-                'help': 'Onshape variable substitution not working. Check extension configuration or use manual DXF upload.'
-            }), 400
-
-        # Get Onshape client for this user
-        user_id = get_current_user_id()
-        client = session_manager.get_client(user_id)
-
-        if not client:
-            # Store import parameters in session before redirecting to OAuth
-            session['pending_onshape_import'] = {
-                'documentId': document_id,
-                'workspaceId': workspace_id,
-                'elementId': element_id,
-                'faceId': face_id
-            }
-
-            # Redirect to Onshape OAuth
-            return redirect('/onshape/auth')
-
-        # Reload team config on every export (allows users to update config without re-authenticating)
-        log("\n" + "="*60)
-        log("🔄 Refreshing team config from Onshape...")
-        config_yaml = client.fetch_config_file()
-        if config_yaml:
-            log(f"🔍 DEBUG: Raw YAML length: {len(config_yaml)} bytes")
-            log(f"🔍 DEBUG: First 500 chars of YAML: {config_yaml[:500]}")
-            team_config = TeamConfig.from_yaml(config_yaml)
-            log(f"✅ Team config loaded: {team_config.team_name} (#{team_config.team_number})")
-            log(f"🔍 DEBUG: team_config._data keys: {list(team_config._data.keys())}")
-            log(f"🔍 DEBUG: team_config._data has 'team' key? {'team' in team_config._data}")
-            if 'team' in team_config._data:
-                log(f"🔍 DEBUG: team_config._data['team'] = {team_config._data['team']}")
-            session['team_config_data'] = team_config._data
-            session['team_config'] = team_config.to_dict()
-            session['team_number'] = team_config.team_number
-            session['using_default_config'] = False
-        else:
-            log("⚠️  No team config found - using defaults")
-            team_config = TeamConfig()
-            session['team_config_data'] = {}
-            session['team_config'] = team_config.to_dict()
-            session['team_number'] = team_config.team_number
-            session['using_default_config'] = True
-        log("="*60 + "\n")
-
-        # Get document's owning company/classroom (Onshape Education context)
-        # This requires a document, so we fetch it here rather than during OAuth
-        doc_company = client.get_document_company(document_id)
-        if doc_company:
-            team_name = doc_company.get('name')
-            log(f"📚 Document company: {team_name}")
-            session['team_name'] = team_name
-
-        # If no face_id provided, auto-select the top face
-        part_name_from_body = None
-        auto_selected_body_id = None
-        face_normal = None  # Initialize face_normal for when face_id is provided
-        if not face_id:
-            log("No face ID provided, auto-selecting top face...")
-
-            try:
-                # First, try to list all faces for debugging
-                faces_data = client.list_faces(document_id, workspace_id, element_id)
-
-                if not faces_data:
-                    error_msg = "Failed to retrieve data from Onshape. Your authentication token may have expired. Please re-authenticate with Onshape."
-                    log(f"❌ {error_msg}")
-                    return render_template('index.html',
-                                         error_message=error_msg,
-                                         from_onshape=True,
-                                         using_default_config=session.get('using_default_config', False),
-                                         detected_thickness=None), 401
-
-                body_count = len(faces_data.get('bodies', []))
-                log(f"📊 Found {body_count} bodies/parts in document")
-
-                # If multiple parts and no bodyId specified, show part selection modal
-                if body_count > 1 and not body_id:
-                    log("🔍 Multiple parts detected, showing part selector...")
-
-                    # Get detailed info about each part (reuse cached faces_data)
-                    part_selection_data = []
-
-                    # Get body faces using cached data to avoid duplicate API call
-                    bodies_with_faces = client.get_body_faces(document_id, workspace_id, element_id, cached_faces_data=faces_data)
-
-                    if not bodies_with_faces:
-                        error_msg = "Failed to retrieve body/face data from Onshape. Your authentication may have expired."
-                        log(f"❌ {error_msg}")
-                        return render_template('index.html',
-                                             error_message=error_msg,
-                                             from_onshape=True,
-                                             using_default_config=session.get('using_default_config', False),
-                                             detected_thickness=None), 401
-
-                    # Find the largest part by top face area
-                    largest_body_id = None
-                    largest_area = 0
-
-                    for bid, body_data in bodies_with_faces.items():
-                        # Get all planar faces
-                        planar_faces = [f for f in body_data['faces'] if f['surfaceType'] == 'PLANE']
-
-                        if planar_faces:
-                            # Find largest planar face
-                            largest_face = max(planar_faces, key=lambda f: f.get('area', 0))
-                            face_area = largest_face.get('area', 0)
-
-                            if face_area > largest_area:
-                                largest_area = face_area
-                                largest_body_id = bid
-
-                        part_selection_data.append({
-                            'body_id': bid,
-                            'name': body_data['name'],
-                            'face_count': len(body_data['faces']),
-                            'is_largest': False  # Will set this after loop
-                        })
-
-                    # Mark the largest part
-                    for part in part_selection_data:
-                        if part['body_id'] == largest_body_id:
-                            part['is_largest'] = True
-                            break
-
-                    # Sort by size (largest first)
-                    part_selection_data.sort(key=lambda p: p['face_count'] * (1 if p['is_largest'] else 0), reverse=True)
-
-                    # Render template with part selection
-                    return render_template('index.html',
-                                         part_selection={
-                                             'parts': part_selection_data,
-                                             'document_id': document_id,
-                                             'workspace_id': workspace_id,
-                                             'element_id': element_id
-                                         },
-                                         from_onshape=True,
-                                         using_default_config=session.get('using_default_config', False),
-                                         detected_thickness=None)
-
-                # This now returns (face_id, body_id, part_name, normal)
-                # Pass body_id if user selected a specific part in Onshape, and cached data to avoid duplicate API call
-                face_id, auto_selected_body_id, part_name_from_body, face_normal = client.auto_select_top_face(document_id, workspace_id, element_id, body_id, faces_data)
-
-                if not face_id:
-                    # Provide helpful error with face list
-                    error_msg = 'No horizontal plane faces found. '
-                    if faces_data:
-                        face_count = len(faces_data.get('bodies', []))
-                        error_msg += f'Found {face_count} bodies total. '
-                    error_msg += 'Try selecting a face manually in Onshape.'
-
-                    # Render error page instead of JSON
-                    return render_template('index.html',
-                                         error_message=error_msg,
-                                         from_onshape=True,
-                                         debug_info={
-                                             'documentId': document_id,
-                                             'workspaceId': workspace_id,
-                                             'elementId': element_id,
-                                             'bodies_found': face_count if faces_data else 0
-                                         },
-                                         using_default_config=session.get('using_default_config', False),
-                                         detected_thickness=None), 400
-
-                log(f"Auto-selected face: {face_id} from part: {part_name_from_body}")
-
-            except Exception as e:
-                log(f"Error in face detection: {str(e)}")
-                return jsonify({
-                    'error': 'Face detection failed',
-                    'message': str(e)
-                }), 400
-        else:
-            # face_id was provided (e.g., from element panel), but we need to fetch the face normal
-            face_normal, auto_selected_body_id, part_name_from_body = fetch_face_normal_and_body(
-                client, document_id, workspace_id, element_id, face_id, body_id
-            )
-
-        # Check if multi-layer export is requested (default: true)
-        multilayer = raw_params.get('multilayer', 'true').lower() in ('true', '1', 'yes')
-
-        # Fetch DXF from Onshape
-        # Use body_id from URL parameter if provided, otherwise use the one from auto-selection
-        export_body_id = body_id if body_id else auto_selected_body_id
-        log(f"Exporting with body_id: {export_body_id} (from {'URL param' if body_id else 'auto-selection'})")
-
-        if multilayer:
-            log("🔷 Multi-layer export requested")
-
-            # For multi-layer export, we need the reference face normal and origin
-            if not face_normal:
-                log("⚠️  No face normal available, fetching...")
-                faces_data = client.list_faces(document_id, workspace_id, element_id)
-
-                if not faces_data:
-                    error_msg = "Failed to retrieve face data from Onshape. Your authentication token may have expired. Please re-authenticate with Onshape."
-                    log(f"❌ {error_msg}")
-                    return jsonify({'error': error_msg}), 401
-
-                # Find the reference face
-                reference_face = None
-
-                # If face_id is provided, find that specific face
-                if face_id:
-                    for body in faces_data.get('bodies', []):
-                        if export_body_id and body.get('id') != export_body_id:
-                            continue
-                        for face in body.get('faces', []):
-                            if face.get('id') == face_id:
-                                reference_face = face
-                                break
-                        if reference_face:
-                            break
-                else:
-                    # No face_id provided (one-click flow): auto-select largest upward-facing plane
-                    log("⚠️  No face_id provided, auto-selecting reference face...")
-                    largest_area = 0
-                    for body in faces_data.get('bodies', []):
-                        if export_body_id and body.get('id') != export_body_id:
-                            continue
-                        for face in body.get('faces', []):
-                            surface = face.get('surface', {})
-                            if surface.get('type') == 'PLANE':
-                                normal = surface.get('normal', {})
-                                # Check if pointing up (z > 0.9)
-                                if normal.get('z', 0) > 0.9:
-                                    area = face.get('area', 0)
-                                    if area > largest_area:
-                                        largest_area = area
-                                        reference_face = face
-                                        face_id = face.get('id')  # Update face_id for later use
-
-                    if reference_face:
-                        log(f"✅ Auto-selected reference face: {face_id} (area: {largest_area:.6f} m²)")
-
-                if reference_face:
-                    surface = reference_face.get('surface', {})
-                    face_normal = surface.get('normal', {'x': 0, 'y': 0, 'z': 1})
-                else:
-                    log("❌ Could not find reference face for multi-layer export")
-                    return jsonify({'error': 'Could not find reference face for multi-layer export. Please select a flat top face.'}), 500
-
-            # Get reference origin from face
-            faces_data = client.list_faces(document_id, workspace_id, element_id)
-
-            if not faces_data:
-                error_msg = "Failed to retrieve face data from Onshape. Your authentication token may have expired. Please re-authenticate with Onshape."
-                log(f"❌ {error_msg}")
-                return jsonify({'error': error_msg}), 401
-
-            reference_origin = None
-            for body in faces_data.get('bodies', []):
-                if export_body_id and body.get('id') != export_body_id:
-                    continue
-                for face in body.get('faces', []):
-                    if face.get('id') == face_id:
-                        surface = face.get('surface', {})
-                        reference_origin = surface.get('origin', {'x': 0, 'y': 0, 'z': 0})
-                        break
-                if reference_origin:
-                    break
-
-            if not reference_origin:
-                log("⚠️  Could not find reference origin, using default")
-                reference_origin = {'x': 0, 'y': 0, 'z': 0}
-
-            # Export multi-layer DXF
-            result = client.export_multilayer_dxf(
-                document_id, workspace_id, element_id,
-                face_id, export_body_id, face_normal, reference_origin,
-                body_id=export_body_id, cached_faces_data=faces_data
-            )
-            # Unpack tuple: (dxf_content, detected_thickness)
-            if isinstance(result, tuple):
-                dxf_content, detected_thickness = result
-            else:
-                # Backwards compatibility if export function doesn't return thickness
-                dxf_content = result
-                detected_thickness = None
-        else:
-            log("📄 Single-layer export")
-            dxf_content = client.export_face_to_dxf(
-                document_id, workspace_id, element_id, face_id, export_body_id, face_normal
-            )
-            detected_thickness = None  # Not applicable for single-layer
-
-        if not dxf_content:
-            error_msg = f"Failed to export DXF from Onshape. "
-            if export_body_id:
-                error_msg += f"Attempted to export body/part: {export_body_id}. "
-            else:
-                error_msg += "No body/part ID available for export. "
-            error_msg += "Check Onshape API logs above for details."
-
-            return jsonify({
-                'error': 'Failed to export DXF from Onshape',
-                'message': error_msg,
-                'details': {
-                    'face_id': face_id,
-                    'body_id': export_body_id,
-                    'document_id': document_id,
-                    'element_id': element_id
-                }
-            }), 500
-        
-        log(f"📄 DXF content received: {len(dxf_content)} bytes")
-
-        # Generate filename: try to combine document name + part name
-        doc_name = None
-
-        # Try to get document name (optional, may fail with 404)
-        try:
-            log("📝 Attempting to fetch document name...")
-            doc_info = client.get_document_info(document_id)
-            if doc_info:
-                doc_name = doc_info.get('name')
-                log(f"   ✅ Got document name: {doc_name}")
-            else:
-                log(f"   ⚠️  Document API returned None")
-        except Exception as e:
-            log(f"   ⚠️  Document API failed (will use part name only): {e}")
-
-        # Save potentially-refreshed tokens back to session
-        session_manager.update_session_tokens(client)
-
-        # Build filename from whatever we have
-        suggested_filename = generate_onshape_filename(doc_name, part_name_from_body)
-        log(f"✅ Generated filename: {suggested_filename}.nc")
-
-        # Save DXF to temp file in uploads folder
-        temp_dxf = tempfile.NamedTemporaryFile(
-            suffix='.dxf',
-            dir=UPLOAD_FOLDER,
-            delete=False
-        )
-        temp_dxf.write(dxf_content)
-        temp_dxf.close()
-
-        dxf_filename = os.path.basename(temp_dxf.name)
-        dxf_path = temp_dxf.name
-
-        log(f"✅ DXF imported from Onshape: {dxf_filename}")
-        log(f"📂 Saved to: {dxf_path}")
-        log(f"📏 File size on disk: {os.path.getsize(dxf_path)} bytes")
-
-        # Log metrics
-        team_number = session.get('team_number')
-        user_email = session.get('user_email')
-        metrics.log_event('onshape_import',
-                         team_number=team_number,
-                         user_email=user_email,
-                         metadata={
-                             'document_name': doc_name,
-                             'part_name': part_name_from_body
-                         })
-
-        # Register DXF file with token manager for secure access
-        dxf_token = file_token_manager.register_file(dxf_path, f"{suggested_filename}.dxf")
-        log(f"🔗 Will be served at: /uploads/{dxf_token[:16]}...")
-
-        # Store DXF token in session for debug downloads
-        session['debug_dxf_token'] = dxf_token
-        session['debug_dxf_filename'] = f"{suggested_filename}.dxf"
-        log(f"🐛 Debug DXF available at: /debug/download-dxf")
-
-        # Render main page with DXF auto-loaded
-        # The frontend will detect the dxf_file parameter and auto-upload it
-
-        # Reconstruct TeamConfig to get materials list
-        team_config_data = session.get('team_config_data', {})
-        team_config = TeamConfig(team_config_data)
-
-        # Get available machines
-        machines = team_config.get_available_machines()
-
-        # Get current machine (from session, or use default)
-        current_machine_id = session.get('machine_id', team_config.default_machine_id)
-
-        # Get machine-specific config dict
-        team_config_dict = team_config.to_dict(current_machine_id)
-        drive_enabled = team_config_dict.get('google_drive_enabled', False)
-        machine_x_max = team_config_dict.get('machine_x_max', 48.0)
-        machine_y_max = team_config_dict.get('machine_y_max', 96.0)
-        default_tool_diameter = team_config_dict.get('default_tool_diameter', 0.157)
-
-        # Get user/team info
-        user_name = session.get('user_name')
-        team_name = session.get('team_name')
-
-        # Get available materials for current machine
-        available_materials = team_config.get_available_materials(current_machine_id)
-
-        # Add 'aluminum_tube' as a special UI-only material (uses aluminum preset)
-        available_materials['aluminum_tube'] = {
-            **available_materials.get('aluminum', {}),
-            'name': 'Aluminum Tube'
-        }
-
-        # Check for incomplete materials
-        incomplete_materials = {
-            material_id for material_id in available_materials.keys()
-            if not team_config.is_material_complete(material_id, current_machine_id) and material_id != 'aluminum_tube'
-        }
-
-        return render_template('index.html',
-                             dxf_file=dxf_token,  # Pass token instead of filename
-                             from_onshape=True,
-                             document_id=document_id,
-                             face_id=face_id,
-                             suggested_filename=suggested_filename or '',
-                             detected_thickness=detected_thickness,  # Auto-detected part thickness (multilayer only)
-                             user_name=user_name,
-                             team_name=team_name,
-                             drive_enabled=drive_enabled,
-                             machine_x_max=machine_x_max,
-                             machine_y_max=machine_y_max,
-                             default_tool_diameter=default_tool_diameter,
-                             using_default_config=session.get('using_default_config', False),
-                             machines=machines,
-                             current_machine_id=current_machine_id,
-                             materials=available_materials,
-                             incomplete_materials=incomplete_materials)
-        
-    except Exception as e:
-        return jsonify({
-            'error': f'Import failed: {str(e)}'
-        }), 500
-
-@app.route('/onshape/save-dxf', methods=['GET', 'POST'])
-@limiter.limit("20 per minute")  # Moderate limit - authenticated via Onshape OAuth
-def onshape_save_dxf():
-    """
-    Save a DXF from Onshape directly to Google Drive without generating G-code.
-    Accepts parameters from Onshape extension or direct URL.
-    """
-    if not ONSHAPE_AVAILABLE:
-        return jsonify({'error': 'Onshape integration not available'}), 400
-
-    if not GOOGLE_DRIVE_AVAILABLE:
-        return jsonify({'error': 'Google Drive integration not available'}), 400
-
-    try:
-        log(f"\n💾 Onshape Save DXF request: {request.url}")
-        log(f"   Method: {request.method}")
-
-        # Get parameters (either from query string or JSON body)
-        if request.method == 'POST':
-            raw_params = request.json or {}
-        else:
-            raw_params = request.args.to_dict()
-
-        params = extract_onshape_params(raw_params)
-        document_id = params['document_id']
-        workspace_id = params['workspace_id']
-        element_id = params['element_id']
-        face_id = params['face_id']
-        body_id = params['body_id']
-
-        log(f"Onshape params: doc={document_id}, workspace={workspace_id}, element={element_id}, face={face_id}, body={body_id}")
-
-        if not all([document_id, workspace_id, element_id]):
-            return jsonify({
-                'error': 'Missing required parameters',
-                'required': ['documentId', 'workspaceId', 'elementId']
-            }), 400
-
-        # Get Onshape client
-        user_id = get_current_user_id()
-        client = session_manager.get_client(user_id)
-
-        if not client:
-            return jsonify({
-                'error': 'Not authenticated with Onshape',
-                'auth_url': '/onshape/auth'
-            }), 401
-
-        # Auto-select face if needed (use existing helper function)
-        part_name_from_body = None
-        auto_selected_body_id = None
-        face_normal = None
-
-        if not face_id:
-            log("No face ID, auto-selecting top face...")
-            try:
-                # Use existing auto_select_top_face helper
-                face_id, auto_selected_body_id, part_name_from_body, face_normal = client.auto_select_top_face(
-                    document_id, workspace_id, element_id, body_id
-                )
-
-                if not face_id:
-                    return jsonify({
-                        'error': 'Could not auto-select a face',
-                        'message': 'No top face found on any part'
-                    }), 400
-
-            except Exception as e:
-                log(f"Error in face detection: {str(e)}")
-                return jsonify({
-                    'error': 'Face detection failed',
-                    'message': str(e)
-                }), 400
-        else:
-            # face_id was provided (e.g., from element panel), but we need to fetch the face normal
-            face_normal, auto_selected_body_id, part_name_from_body = fetch_face_normal_and_body(
-                client, document_id, workspace_id, element_id, face_id, body_id
-            )
-
-        # Export DXF from Onshape
-        export_body_id = body_id if body_id else auto_selected_body_id
-        log(f"Exporting DXF with body_id: {export_body_id}")
-
-        dxf_content = client.export_face_to_dxf(
-            document_id, workspace_id, element_id, face_id, export_body_id, face_normal
-        )
-
-        if not dxf_content:
-            return jsonify({
-                'error': 'Failed to export DXF from Onshape',
-                'details': {
-                    'face_id': face_id,
-                    'body_id': export_body_id
-                }
-            }), 500
-
-        log(f"📄 DXF exported: {len(dxf_content)} bytes")
-
-        # Generate filename with timestamp
-        doc_name = None
-        try:
-            doc_info = client.get_document_info(document_id)
-            if doc_info:
-                doc_name = doc_info.get('name')
-                log(f"📝 Document name: {doc_name}")
-        except Exception as e:
-            log(f"⚠️  Could not get document name: {e}")
-
-        # Save potentially-refreshed tokens back to session
-        session_manager.update_session_tokens(client)
-
-        base_filename = generate_onshape_filename(doc_name, part_name_from_body)
-
-        # Add timestamp (server's local time)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        dxf_filename = f"{base_filename}_{timestamp}.dxf"
-
-        log(f"✅ Generated filename: {dxf_filename}")
-
-        # Save DXF to temp file
-        temp_dxf = tempfile.NamedTemporaryFile(
-            suffix='.dxf',
-            dir=OUTPUT_FOLDER,  # Use OUTPUT_FOLDER so it's accessible for upload
-            delete=False
-        )
-        temp_dxf.write(dxf_content)
-        temp_dxf.close()
-
-        dxf_path = temp_dxf.name
-        log(f"💾 Saved temp DXF: {dxf_path}")
-
-        # Upload to Google Drive
-        creds = None
-        if AUTH_AVAILABLE and auth.is_enabled():
-            creds = auth.get_credentials()
-            if not creds:
-                os.unlink(dxf_path)  # Clean up temp file
-                return jsonify({
-                    'error': 'Not authenticated with Google Drive'
-                }), 401
-
-        uploader = GoogleDriveUploader(credentials=creds)
-
-        if not uploader.authenticate():
-            os.unlink(dxf_path)  # Clean up temp file
-            return jsonify({
-                'error': 'Failed to authenticate with Google Drive'
-            }), 500
-
-        log("📤 Uploading to Google Drive...")
-        result = uploader.upload_file(dxf_path, dxf_filename)
-
-        # Clean up temp file
-        try:
-            os.unlink(dxf_path)
-        except:
-            pass
-
-        if result and result.get('success'):
-            log(f"✅ Upload successful: {result.get('web_link')}")
-            return jsonify({
-                'success': True,
-                'message': f'✅ DXF saved to Google Drive: {dxf_filename}',
-                'filename': dxf_filename,
-                'file_id': result.get('file_id'),
-                'web_view_link': result.get('web_link')
-            })
-        else:
-            return jsonify({
-                'success': False,
-                'error': 'Upload to Google Drive failed',
-                'message': result.get('message') if result else 'Unknown error'
-            }), 500
-
-    except Exception as e:
-        log(f"❌ Error in save-dxf: {str(e)}")
-        log(traceback.format_exc())
-        return jsonify({
-            'error': f'Save DXF failed: {str(e)}'
-        }), 500
-
 @app.route('/onshape/element-panel')
 def onshape_element_panel():
-    """
-    Serve the Onshape element right panel extension
-    This page will be embedded as an iframe in Onshape
-    """
-    # Get Onshape context from query parameters
-    # These are passed by Onshape when the iframe loads
-    document_id = request.args.get('documentId', '')
-    workspace_id = request.args.get('workspaceId', '')
-    element_id = request.args.get('elementId', '')
-    server = request.args.get('server', 'https://cad.onshape.com')
-
-    return render_template('onshape_panel.html',
-                         document_id=document_id,
-                         workspace_id=workspace_id,
-                         element_id=element_id,
-                         server=server)
+    """Legacy panel URL that existing Onshape app configs point at. Now serves the
+    new multi-part wizard (same handler as /onshape-panel), so no Onshape-side
+    reconfiguration is needed. The old onshape_panel.html is no longer used."""
+    return _serve_onshape_panel()
 
 # ============================================================================
 # ADMIN ENDPOINTS (Metrics)

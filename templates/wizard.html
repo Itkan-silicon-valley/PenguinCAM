@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="{{ theme|default('dark') }}">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PenguinCAM</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='wizard.css') }}">
+</head>
+<body data-source="{{ source }}">
+    <div id="wizard">
+        <header id="wiz-header">
+            <div class="brand">PenguinCAM</div>
+            <!-- Loaded team configuration (so the user can confirm it resolved correctly,
+                 even in the Onshape panel). Clickable when we know the config file URL. -->
+            <div class="config-info">
+                {% if not using_default_config and config_team_number %}
+                <p class="config-status">Config:
+                    {% if config_url %}
+                    <a href="{{ config_url }}" target="_blank" rel="noopener">{{ config_team_number }} ({{ config_team_name or 'Unknown' }})</a>
+                    {% else %}
+                    {{ config_team_number }} ({{ config_team_name or 'Unknown' }})
+                    {% endif %}
+                    {% if source != 'upload' %}
+                    <a href="/config/refresh" class="config-refresh" title="Reload team configuration from Onshape" aria-label="Reload team configuration">&#8635;</a>
+                    {% endif %}
+                </p>
+                {% else %}
+                <p class="config-status config-status-default">Using default configuration</p>
+                {% endif %}
+            </div>
+            <ol id="stepbar" aria-label="Steps">
+                <li data-step="setup" data-num="1" class="active" role="button" tabindex="0">Setup</li>
+                <li data-step="parts" data-num="2" role="button" tabindex="0">Parts</li>
+                <li data-step="layout" data-num="3" role="button" tabindex="0">Layout</li>
+                <li data-step="preview" data-num="4" role="button" tabindex="0">Preview</li>
+            </ol>
+        </header>
+
+        <main id="wiz-body">
+            <!-- Running summary of decisions made on earlier steps (grows as you advance). -->
+            <div id="wiz-summary" hidden aria-label="Job summary"></div>
+
+            <!-- ===== SETUP ===== -->
+            <section class="step" data-step="setup">
+                <h2>Setup</h2>
+
+                {% if source == 'upload' %}
+                <!-- Team configuration source (upload flow only). The browser fetches the
+                     YAML client-side from a CORS-friendly host and posts it to /session/config;
+                     the URL is remembered (localStorage + ?config= param) so a shared bookmark
+                     auto-loads it. See wizard.js bindConfigSource/autoLoadConfig. -->
+                <div class="field config-source" id="config-source">
+                    <span class="field-label">Team configuration</span>
+                    <p class="hint">
+                        Optional — point PenguinCAM at your team's config file (machines,
+                        materials, feeds &amp; speeds). Host it on <strong>GitHub (raw)</strong>
+                        or a gist; Google&nbsp;Drive and Dropbox links won't work. Leave blank
+                        to use the built-in defaults.
+                    </p>
+                    <div class="config-source-row">
+                        <input type="url" id="f-config-url" inputmode="url" autocomplete="off"
+                               spellcheck="false" placeholder="https://raw.githubusercontent.com/.../PenguinCAM-config.yaml">
+                        <button type="button" id="config-load-btn" class="btn small">Load</button>
+                        <button type="button" id="config-reset-btn" class="btn small config-reset" hidden>Use defaults</button>
+                    </div>
+                    <p id="config-source-loaded" class="config-source-loaded" hidden></p>
+                    <p id="config-source-status" class="config-source-status" role="status" aria-live="polite"></p>
+                </div>
+                {% endif %}
+
+                {% if machines and machines|length > 1 %}
+                <label class="field">
+                    <span>Machine</span>
+                    <select id="f-machine">
+                        {% for mid, m in machines.items() %}
+                        <option value="{{ mid }}" {% if mid == current_machine_id %}selected{% endif %}>{{ m.name }}</option>
+                        {% endfor %}
+                    </select>
+                </label>
+                {% endif %}
+
+                <fieldset class="field">
+                    <legend>Mode</legend>
+                    <label class="radio"><input type="radio" name="mode" value="2d" checked> 2D — flat plate (one or more parts)</label>
+                    <label class="radio" id="opt-mode-25d"><input type="radio" name="mode" value="2.5d"> 2.5D — derive thickness from CAD (single part)</label>
+                    <label class="radio"><input type="radio" name="mode" value="tubing"> Tubing — machine both faces of a tube</label>
+                </fieldset>
+
+                <label class="field">
+                    <span>Tool diameter (in or mm)</span>
+                    <input type="text" id="f-tool" inputmode="text" autocomplete="off" spellcheck="false"
+                           placeholder='e.g. 0.157" or 4mm' value="{{ default_tool_diameter_text }}">
+                </label>
+
+                <label class="field" id="material-field">
+                    <span>Material</span>
+                    <select id="f-material">
+                        {% for mid, m in materials.items() if mid != 'aluminum_tube' %}
+                        <option value="{{ mid }}" {% if mid == 'plywood' %}selected{% endif %}>{{ m.name }}</option>
+                        {% endfor %}
+                    </select>
+                </label>
+
+                <label class="field" id="thickness-field">
+                    <span id="thickness-label">Material thickness (in or mm)</span>
+                    <input type="text" id="f-thickness" inputmode="text" autocomplete="off" spellcheck="false"
+                           placeholder='e.g. 0.25" or 6mm' value="0.25">
+                </label>
+                <p class="hint" id="thickness-derived" style="display:none">
+                    Thickness is derived from the CAD part in 2.5D mode.
+                </p>
+
+                <!-- Tubing-only settings (shown when mode = tubing). -->
+                <div id="tube-fields" hidden>
+                    <label class="field">
+                        <span>Tube height (in or mm)</span>
+                        <input type="text" id="f-tube-height" inputmode="text" autocomplete="off" spellcheck="false"
+                               placeholder='e.g. 1" or 25mm' value="1.0">
+                    </label>
+                    <label class="field inline">
+                        <input type="checkbox" id="f-square-end">
+                        <span>Square the tube end before machining</span>
+                    </label>
+                    <label class="field inline">
+                        <input type="checkbox" id="f-cut-to-length">
+                        <span>Machine the far end to length</span>
+                    </label>
+                </div>
+            </section>
+
+            <!-- ===== PARTS ===== -->
+            <section class="step" data-step="parts" hidden>
+                <h2>Parts</h2>
+                <div id="upload-source">
+                    <div id="dropzone" tabindex="0">
+                        <p>Drop a DXF here or click to browse</p>
+                        <input type="file" id="f-dxf" accept=".dxf" hidden>
+                    </div>
+                </div>
+                <div id="onshape-source" hidden>
+                    <div id="select-status" class="select-status">Select a face in Onshape…</div>
+                    <p class="hint">Pick a planar face in the model — it imports automatically, then you can pick another.</p>
+                </div>
+                <p class="hint" id="parts-mode-note"></p>
+                <ul id="parts-list" aria-live="polite"></ul>
+            </section>
+
+            <!-- ===== LAYOUT ===== -->
+            <section class="step" data-step="layout" hidden>
+                <h2>Layout</h2>
+                <p class="hint" id="layout-hint">↔ Widen the panel for easier layout. Click to select (Shift-click for multiple), drag to move, drag the round handle to rotate (snaps to 45°). The dotted box is the stock; its lower-left is the G54 origin.</p>
+                <div id="layout-info">
+                    <span><strong id="info-machine-name"></strong></span>
+                    <span>Bed: <span id="info-machine-size"></span></span>
+                    <span>Tool: <span id="info-tool"></span> kerf</span>
+                </div>
+                <div id="layout-toolbar">
+                    <button type="button" class="btn small" id="btn-flip" disabled>Flip over</button>
+                    <span class="spacer"></span>
+                    <button type="button" class="btn small" id="btn-zoom-out" title="Zoom out">&minus;</button>
+                    <button type="button" class="btn small" id="btn-zoom-in" title="Zoom in">+</button>
+                </div>
+                <canvas id="layout-canvas" width="600" height="400"></canvas>
+                <div id="layout-errors" class="errors" aria-live="polite"></div>
+            </section>
+
+            <!-- ===== PREVIEW ===== -->
+            <section class="step" data-step="preview" hidden>
+                <h2>Preview &amp; Save</h2>
+                <div id="gen-status" class="hint"></div>
+                <div id="preview-result" hidden>
+                    <div id="preview-stats"></div>
+                    <div id="viewer-container">
+                        <div class="empty-state" id="viewer-empty">G-code preview will appear here</div>
+                        <canvas id="gcode-canvas"></canvas>
+                    </div>
+                    <div class="scrubber-container" id="scrubber-container" style="display:none">
+                        <div class="scrubber-header">
+                            <span id="scrubber-label">Move 1 of 1</span>
+                            <span id="scrubber-op" class="scrubber-op"></span>
+                        </div>
+                        <input type="range" id="toolpath-scrubber" min="0" max="100" value="0" step="1">
+                    </div>
+                    <div class="playback-controls" id="playback-controls" style="display:none">
+                        <button type="button" class="btn small" id="play-button" title="Play/Pause">&#9654; / &#10073;&#10073;</button>
+                        <button type="button" class="btn small" id="restart-button" title="Restart">&#9198;</button>
+                        <label class="speed">Speed
+                            <select id="playback-speed">
+                                <option value="10">0.25x</option>
+                                <option value="20">0.5x</option>
+                                <option value="40" selected>1x</option>
+                                <option value="80">2x</option>
+                                <option value="160">4x</option>
+                                <option value="320">8x</option>
+                            </select>
+                        </label>
+                        <button type="button" class="btn small" id="reset-view">Reset view</button>
+                    </div>
+                    <p class="hint">Origin (0,0,0) = lower-left, sacrifice board. Drag to orbit, scroll to zoom.</p>
+                </div>
+                <div id="preview-errors" class="errors" aria-live="polite"></div>
+            </section>
+        </main>
+
+        <footer id="wiz-nav">
+            <button type="button" id="btn-back" class="btn" disabled>Back</button>
+            <button type="button" id="btn-next" class="btn primary">Next</button>
+            <!-- Final action (Preview step). Split button: main action + a caret to switch
+                 between Download and Send to Google Drive (caret only when Drive is configured). -->
+            <div id="final-action" class="split-btn" hidden>
+                <button type="button" id="btn-do" class="btn primary" disabled>Download Program</button>
+                <button type="button" id="btn-do-caret" class="btn primary split-caret" aria-label="Choose action" hidden>&#9662;</button>
+                <ul id="do-menu" class="do-menu" role="menu" hidden>
+                    <li role="menuitem" data-action="download">Download Program</li>
+                    <li role="menuitem" data-action="drive">Send to Google Drive</li>
+                </ul>
+            </div>
+        </footer>
+    </div>
+
+    {% if source == 'upload' and turnstile_sitekey %}
+    <!-- Blocking bot-gate for the anonymous upload flow. Rendered VISIBLE (no hidden
+         attribute) so it blocks the wizard from first paint; JS hides it once the
+         Turnstile check verifies and the session is minted. Only present when
+         Turnstile is configured (otherwise the upload flow is open, e.g. local dev). -->
+    <div id="verify-overlay">
+        <div class="connect-card">
+            <h2>Quick check</h2>
+            <p>Confirming you're human before we start.</p>
+            <div class="cf-turnstile" data-sitekey="{{ turnstile_sitekey }}"
+                 data-callback="onTurnstileToken" data-error-callback="onTurnstileError"
+                 data-expired-callback="onTurnstileExpired" data-theme="auto"></div>
+            <p class="hint" id="verify-status"></p>
+            <p class="hint">If this doesn't load, allow this site and disable ad/tracking blockers, then reload.</p>
+        </div>
+    </div>
+    {% endif %}
+
+    <div id="connect-overlay" hidden>
+        <div class="connect-card">
+            <h2>Connect to Onshape</h2>
+            <p>PenguinCAM needs access to your Onshape document to read parts.</p>
+            <button type="button" id="btn-connect" class="btn primary">Connect to Onshape</button>
+            <p class="hint" id="connect-status"></p>
+            <p class="hint">Sign-in opens in a pop-up. If it doesn't work, allow pop-ups and disable ad/tracking blockers for onshape.com and popcornpenguins.com.</p>
+        </div>
+    </div>
+
+    <div id="debug-overlay" hidden>
+        <strong>debug</strong>
+        <pre id="debug-content"></pre>
+    </div>
+
+    <script>
+      window.PenguinCAM = {
+        source: {{ source|tojson }},
+        theme: {{ (theme if theme is defined else 'dark')|tojson }},
+        authenticated: {{ (authenticated if authenticated is defined else True)|tojson }},
+        onshape: {{ (onshape_ctx if onshape_ctx is defined else {})|tojson }},
+        bed: { width: {{ machine_x_max|tojson }}, height: {{ machine_y_max|tojson }} },
+        machineName: {{ ((machines.get(current_machine_id) or {}).get('name') or 'Machine')|tojson }},
+        machines: {{ (machines_info if machines_info is defined else {})|tojson }},
+        defaultTool: {{ default_tool_diameter|tojson }},
+        defaultToolText: {{ (default_tool_diameter_text if default_tool_diameter_text is defined else '4mm')|tojson }},
+        driveEnabled: {{ (drive_enabled if drive_enabled is defined else False)|tojson }},
+        turnstileSiteKey: {{ (turnstile_sitekey if turnstile_sitekey is defined else '')|tojson }},
+        // Upload-flow config state, so the client can tell whether the server has already
+        // applied the ?config= URL (and skip a redundant fetch+reload -- see wizard.js).
+        usingDefault: {{ (using_default_config if using_default_config is defined else True)|tojson }},
+        configUrl: {{ (config_url if config_url is defined else None)|tojson }},
+        configTeamNumber: {{ (config_team_number if config_team_number is defined else None)|tojson }},
+        configTeamName: {{ (config_team_name if config_team_name is defined else None)|tojson }},
+      };
+      // Turnstile bot-gate token bridge (upload flow). Cloudflare's async widget may
+      // fire its callback before OR after wizard.js loads, so buffer the token and
+      // let wizard.js register a handler that also drains any token already received.
+      window.__ptToken = null;
+      window.onTurnstileToken = function (t) {
+        window.__ptToken = t;
+        if (window.__ptOnToken) window.__ptOnToken(t);
+      };
+    </script>
+    {% if source == 'upload' and turnstile_sitekey %}
+    <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
+    {% endif %}
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+    <script src="{{ url_for('static', filename='gcode_viewer.js') }}"></script>
+    {% if source == 'onshape' %}
+    <script src="{{ url_for('static', filename='source_onshape.js') }}"></script>
+    {% endif %}
+    <script src="{{ url_for('static', filename='wizard.js') }}"></script>
+</body>
+</html>

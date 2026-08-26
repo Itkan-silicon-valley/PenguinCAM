@@ -15,6 +15,7 @@
         <a href="index.html">Introduction</a>
         <a href="usage.html">How to Use</a>
         <a href="configuration.html" class="active">Configuration</a>
+        <a href="feeds-speeds.html">Feeds &amp; Speeds</a>
         <a href="roadmap.html">Roadmap</a>
         <div class="nav-divider"></div>
         <a href="/" class="nav-external">← Back to App</a>
@@ -24,8 +25,10 @@
         <h1>Team Configuration</h1>
 
         <p class="lead">
-            Customize PenguinCAM for your team's specific CNC machines by uploading a
-            <code>PenguinCAM-config.yaml</code> file to your Onshape documents.
+            Customize PenguinCAM for your team's specific CNC machines with a
+            <code>PenguinCAM-config.yaml</code> file. The same file works two ways: Onshape users
+            keep it in their Onshape documents, and everyone else hosts it at a URL and points
+            PenguinCAM at it. The format is identical &mdash; only how PenguinCAM finds it differs.
         </p>
 
         <div class="info-box">
@@ -36,7 +39,22 @@
             </div>
         </div>
 
-        <h2>Quick Setup</h2>
+        <h2>How PenguinCAM Finds Your Config</h2>
+        <p>
+            The config format is the same everywhere; only how PenguinCAM loads it depends on how
+            you use the app:
+        </p>
+        <ul>
+            <li><strong>In Onshape:</strong> keep <code>PenguinCAM-config.yaml</code> in your
+                Onshape documents. When you authenticate, PenguinCAM loads it automatically. (See
+                <a href="#onshape-setup">Onshape Setup</a>.)</li>
+            <li><strong>Direct upload (no Onshape):</strong> host the file at a public URL and point
+                PenguinCAM at it &mdash; either by pasting the URL into the Setup screen or by adding
+                a <code>?config=</code> parameter to the app link. (See
+                <a href="#url-setup">Hosting Your Config at a URL</a>.)</li>
+        </ul>
+
+        <h2 id="onshape-setup">Onshape Setup</h2>
 
         <div class="step-list">
             <div class="step">
@@ -74,23 +92,116 @@
             <div class="step">
                 <div class="step-number">4</div>
                 <div class="step-content">
-                    <h3>Share with Your Team and PenguinCAM</h3>
+                    <h3>Share with Your Team</h3>
                     <p>
-                        Share the Onshape document with:
-                    </p>
-                    <ul>
-                        <li><strong>Your team members or company</strong> - so everyone can access the settings</li>
-                        <li><strong>The PenguinCAM app</strong> - in the Onshape sharing dialog, use the "Share with applications" tab
-                        and grant access to PenguinCAM</li>
-                    </ul>
-                    <p>
-                        Everyone who authenticates with PenguinCAM from your organization will use your custom settings.
+                        Share the Onshape document with your team members or classroom, so that everyone can access the settings.
+                        Everyone who authenticates with PenguinCAM from your organization will load and use your custom settings.
                     </p>
                 </div>
             </div>
         </div>
 
+        <h2 id="url-setup">Hosting Your Config at a URL</h2>
+
+        <p>
+            If you don't use Onshape (you upload DXF files directly), host your
+            <code>PenguinCAM-config.yaml</code> somewhere your browser can fetch it, then point
+            PenguinCAM at that URL. Your whole team can then share a single link.
+        </p>
+
+        <div class="warning-box info-box">
+            <div class="info-icon">⚠️</div>
+            <div>
+                <strong>Host it on GitHub or a gist &mdash; not Google Drive or Dropbox.</strong>
+                Your browser fetches the file directly, so the host has to allow cross-origin
+                requests (CORS). GitHub's raw file URLs and gists do; Google Drive and Dropbox
+                share links do not, so those won't load. (This browser-side fetch is also why your
+                config URL never touches our server.)
+            </div>
+        </div>
+
+        <div class="step-list">
+            <div class="step">
+                <div class="step-number">1</div>
+                <div class="step-content">
+                    <h3>Host the File</h3>
+                    <p>
+                        Commit <code>PenguinCAM-config.yaml</code> to a public GitHub repository, or
+                        put it in a <a href="https://gist.github.com" target="_blank" rel="noopener">gist</a>
+                        if it's just the one file. Keeping it in Git also gives you edit history and
+                        an easy way to share updates with your team.
+                    </p>
+                </div>
+            </div>
+
+            <div class="step">
+                <div class="step-number">2</div>
+                <div class="step-content">
+                    <h3>Copy the Raw URL</h3>
+                    <p>
+                        Open the file on GitHub and click <strong>Raw</strong>, then copy the
+                        address. It looks like:
+                    </p>
+                    <pre><code>https://raw.githubusercontent.com/YOUR-TEAM/YOUR-REPO/main/PenguinCAM-config.yaml</code></pre>
+                    <p>
+                        The <code>raw.githubusercontent.com</code> host is the important part &mdash;
+                        a normal <code>github.com/.../blob/...</code> page URL is an HTML page, not
+                        the file itself, and won't load.
+                    </p>
+                </div>
+            </div>
+
+            <div class="step">
+                <div class="step-number">3</div>
+                <div class="step-content">
+                    <h3>Load It in PenguinCAM</h3>
+                    <p>
+                        On the Setup screen, paste the URL into the <strong>Team configuration</strong>
+                        field and click <strong>Load</strong>. PenguinCAM fetches and validates it,
+                        shows the team it parsed (e.g. <em>Loaded config for team 1234</em>), and
+                        remembers it in your browser for next time.
+                    </p>
+                </div>
+            </div>
+
+            <div class="step">
+                <div class="step-number">4</div>
+                <div class="step-content">
+                    <h3>Share the Link with Your Team</h3>
+                    <p>
+                        Once you load a URL, PenguinCAM adds it to the page address as a
+                        <code>?config=</code> parameter (properly encoded). Bookmark or share that
+                        address and anyone who opens it loads the same config automatically:
+                    </p>
+                    <pre><code>https://penguincam.popcornpenguins.com/?config=https://raw.githubusercontent.com/YOUR-TEAM/YOUR-REPO/main/PenguinCAM-config.yaml</code></pre>
+                </div>
+            </div>
+        </div>
+
+        <div class="info-box">
+            <div class="info-icon">ℹ️</div>
+            <div>
+                <strong>Editing later:</strong> PenguinCAM re-fetches the file from the URL each
+                visit, so you (or a teammate) can update the hosted config and everyone picks up the
+                change next time they open the app &mdash; nothing to re-enter. To go back to the
+                built-in defaults, click <strong>Use defaults</strong> on the Setup screen.
+            </div>
+        </div>
+
         <h2>Configuration Structure</h2>
+
+        <div class="info-box">
+            <div class="info-icon">📏</div>
+            <div>
+                <strong>Units:</strong> Dimension values default to <strong>inches</strong>, but you can add a
+                unit to any dimension &mdash; quote it so YAML reads it as text:
+                <code>diameter: "4mm"</code>, <code>x_max: "1200mm"</code>, <code>width: "0.25in"</code>, or a
+                fraction like <code>"1/8"</code>. Supported units: <code>in</code>/<code>"</code>,
+                <code>mm</code>, <code>cm</code>, <code>m</code>, <code>ft</code>/<code>'</code>, <code>yd</code>.
+                A plain number (no unit) is inches. Non-dimension values (feed rates, RPM, angles, ratios) are
+                always plain numbers.
+            </div>
+        </div>
 
         <h3>Team Information</h3>
         <p>
@@ -143,41 +254,71 @@
             </tbody>
         </table>
 
-        <h3>Park Position (Machine Coordinates)</h3>
+        <h3>Park Position (Machine Coordinates) &mdash; optional</h3>
         <p>
-            Configure where the machine parks at the end of programs for safe part access.
-            These use G53 (machine coordinates), not work coordinates:
+            Optionally park the gantry at a fixed machine location at the end of a program for
+            easy part access. This uses <strong>G53 machine coordinates</strong>, and it is the
+            <em>only</em> thing that puts <code>G53</code> in the output:
         </p>
         <pre><code>park_position:
   x: 0.5       # X position in machine coords
   y: 0.5       # Y position in machine coords
-  z: -0.5      # Z safe clearance below home</code></pre>
+  z: -0.5      # safe machine Z to raise to before parking</code></pre>
 
-        <div class="info-box">
+        <div class="warning-box info-box">
             <div class="info-icon">⚠️</div>
             <div>
-                <strong>Important for machines with soft limits:</strong> Some controllers (like standalone Omio with Digital Dream)
-                have soft limits near the home position. If your machine trips soft limits when parking at Z=0,
-                set <code>park_z</code> to a negative value (e.g., -0.125 for 3mm clearance from limit).
-                Negative values move <em>below</em> the home position.
+                <strong>Leave this out for GRBL / Easel and other non-G53 controllers.</strong>
+                Without <code>park_position</code>, PenguinCAM emits <strong>portable, G54 work-coordinate
+                only</strong> G-code (start and end retracts use a work-coordinate safe height, no
+                <code>G53</code>). If a machine plunges at the origin or mishandles the safe move, remove
+                this block. Everything else works the same.
             </div>
         </div>
 
+        <h3>Coolant &mdash; optional</h3>
+        <p>
+            Optionally emit coolant M-codes. Omit it (or set <code>None</code>) and no coolant commands
+            are written &mdash; recommended for controllers that don't support them (stock GRBL rejects
+            <code>M7</code> unless compiled with it).
+        </p>
+        <pre><code>machine:
+  coolant: "Air"   # Air/Mist -> M7 (e.g. air blast), Flood -> M8, off -> M9; None/omit -> nothing</code></pre>
+
         <h3>Default Tool</h3>
         <p>
-            Set the default tool diameter that appears when loading a new part:
+            Set the default tool diameter that appears when loading a new part. You can specify it in metric or
+            inches (see the Units note above); it's shown in the UI exactly as written. If omitted, the
+            default is <code>4mm</code>.
         </p>
         <pre><code>default_tool:
-  diameter: 0.157    # 4mm end mill</code></pre>
+  diameter: "4mm"    # or "1/8", or a plain number in inches (0.157)</code></pre>
 
         <h3>Z-Axis Reference System</h3>
         <p>
-            Configure how deep to cut and safe heights for tool changes:
+            Z=0 is the top of the sacrifice board (the bottom of your stock); the stock top
+            sits at Z = material thickness. Configure how deep to cut and how high to clear:
         </p>
         <pre><code>z_reference:
-  sacrifice_board_depth: 0.008    # Cut 0.008" into sacrifice board
-  safe_height: 1.5                # Rapid height for tool changes
-  clearance_height: 0.5           # Clearance above stock</code></pre>
+  sacrifice_board_depth: 0.008    # How far to cut into the sacrifice board (through-cuts)
+  clearance_height: 0.5           # Clearance above the stock for in-part rapids
+  safe_height: 2.0                # OPTIONAL: "clear everything" height (see below)</code></pre>
+        <p>
+            <strong><code>clearance_height</code></strong> is the small hop above the stock used
+            for rapids <em>between features within a part</em> (these stay over the stock, so they
+            only need to clear it).
+        </p>
+        <p>
+            <strong><code>safe_height</code></strong> is optional and is the "clear everything"
+            height (work coordinates, over Z=0) used only for the moves that cross the machine
+            bed: the rapid to the first cut, the final retract, multi-part rapids, and the
+            tube-flip pause. <strong>Set it above your tallest clamp or fixture</strong> so those
+            moves clear it. If you omit it, those moves fall back to
+            <code>material thickness + clearance_height</code> (just above the stock) &mdash; fine
+            for low edge clamps, but it will not clear tall fixturing. (This replaces the old
+            machine-coordinate <code>G53</code> retract, which is now opt-in via
+            <code>park_position</code>.)
+        </p>
 
         <h3>Material Presets</h3>
         <p>
@@ -233,6 +374,34 @@
                 Pushing too hard can damage tools or your machine. Always run test cuts on scrap material first.
             </div>
         </div>
+
+        <h3>Corner Feed Slowdown &mdash; optional</h3>
+        <p>
+            When clearing a pocket, the cutter takes a light bite (the stepover) along a straight edge, but
+            at a <strong>sharp interior corner</strong> it wraps around two edges at once and its engagement
+            &mdash; and cutting force &mdash; spikes. To tame that, PenguinCAM eases the feed rate down within
+            a tool-diameter of each sharp corner and ramps it back up on the straights. <strong>The toolpath
+            geometry is unchanged</strong> &mdash; only the feed changes near corners.
+        </p>
+        <p>
+            How much to slow is a per-material setting, <code>corner_min_feed_scale</code> (a fraction of the
+            material's <code>feed_rate</code>, applied at the sharpest corners):
+        </p>
+        <pre><code>materials:
+  aluminum:
+    corner_min_feed_scale: 0.4    # aggressive slowdown
+  polycarbonate:
+    corner_min_feed_scale: 0.7    # gentler slowdown</code></pre>
+        <p>
+            The right value depends on what limits the material. <strong>Aluminum</strong> is
+            <em>force-limited</em> &mdash; a sharp corner can deflect or break the tool &mdash; so an aggressive
+            floor (<code>0.4</code>, i.e. 40% of feed) is worthwhile. <strong>Softer, heat-sensitive materials</strong>
+            like polycarbonate and plywood are <em>low-force but rubbing-limited</em>: cutting the feed too far
+            drops the chip load and the tool starts rubbing instead of cutting, which builds heat (and melts
+            plastics). Those use a gentler floor (<code>0.7</code>) to keep the chips shearing. Omit the setting
+            to use PenguinCAM's built-in per-material default (0.4 for aluminum, 0.7 for softer materials); set
+            it to <code>1.0</code> to disable corner slowdown for that material entirely.
+        </p>
 
         <h3>Tab Settings</h3>
         <p>
@@ -327,6 +496,36 @@ machines:
   detection_tolerance: 0.0001         # Circularity tolerance
   min_millable_multiplier: 1.2        # Min hole = 1.2× tool diameter</code></pre>
 
+        <h3>Pocket and Hole Contouring</h3>
+        <p>
+            For large through-cut features, PenguinCAM can contour the perimeter instead of fully clearing
+            the interior. This saves significant machining time, with the trade-off that the center material
+            must be removed manually afterward (it's held in place by tabs).
+        </p>
+        <pre><code>pockets:
+  contour_threshold: 510    # Area threshold for contouring</code></pre>
+        <p>
+            The threshold determines when a feature is large enough to benefit from contouring. The formula is:
+        </p>
+        <pre><code>threshold_area = contour_threshold × tool_diameter² × stepover_percentage</code></pre>
+        <p>
+            This means tighter stepover (aluminum) has a lower threshold and will contour smaller features, since
+            those features take many more passes to clear. With the default threshold of 510:
+        </p>
+        <ul>
+            <li><strong>Aluminum (25% stepover):</strong> Contours features larger than ~2.0" diameter</li>
+            <li><strong>Plywood (65% stepover):</strong> Contours features larger than ~3.2" diameter</li>
+            <li><strong>Polycarbonate (55% stepover):</strong> Contours features larger than ~3.0" diameter</li>
+        </ul>
+        <div class="info-box">
+            <div class="info-icon">ℹ️</div>
+            <div>
+                <strong>Important:</strong> Contouring only applies to through-cuts (features that go all the way
+                through the material to Z=0). Partial-depth features are always fully cleared since they need
+                flat bottoms for functionality. Set <code>contour_threshold: 0</code> to disable contouring entirely.
+            </div>
+        </div>
+
         <h3>Tube Facing</h3>
         <p>
             For teams that machine aluminum tube, configure tube-specific parameters:
@@ -383,6 +582,13 @@ machines:
             Check the browser console (F12) after authenticating to see which config was loaded:
         </p>
         <pre><code>✅ Team config loaded: Your Team Name (#1234)</code></pre>
+        <p>
+            The same checks run whether the config comes from Onshape or a URL. Text values (names
+            and descriptions) are also sanitized to be CNC-safe &mdash; parentheses and non-ASCII
+            characters (curly quotes, arrows, the degree symbol, etc.) are removed, because they can
+            end up in G-code comments and break some controllers. If PenguinCAM adjusts anything, it
+            tells you what it changed; your machine settings themselves are unaffected.
+        </p>
 
         <h2>Troubleshooting</h2>
 
@@ -396,6 +602,21 @@ machines:
             <li>Verify the document is shared with the PenguinCAM app (use "Share with applications" tab in Onshape sharing dialog)</li>
             <li>Ensure you're authenticated with Onshape (click the login button)</li>
             <li>Verify the file is valid YAML (use a YAML validator online)</li>
+        </ul>
+
+        <h3>Config URL won't load</h3>
+        <p>
+            If pasting a URL (or opening a <code>?config=</code> link) shows a fetch or CORS error:
+        </p>
+        <ul>
+            <li>Make sure you're using a <strong>raw</strong> URL
+                (<code>raw.githubusercontent.com/...</code>), not a github.com page URL.</li>
+            <li><strong>Google Drive and Dropbox links won't work</strong> &mdash; they don't let
+                the browser fetch the file directly (CORS). Host it on GitHub or a gist instead.</li>
+            <li>Confirm the URL is public and opens the raw YAML directly when you paste it into a
+                browser tab.</li>
+            <li>A "rejected" message means the file loaded but failed validation &mdash; check that
+                it's valid YAML and that values are in range (the message says what's wrong).</li>
         </ul>
 
         <h3>Material shows warning</h3>
