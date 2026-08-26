@@ -5,6 +5,7 @@ import sys
 import json
 import tempfile
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -85,6 +86,22 @@ class TestProcessJobRoute(unittest.TestCase):
         self.assertEqual(payload['gcode'].count('M30'), 1)
         # Part B's reported footprint is shifted right by its placement.
         self.assertAlmostEqual(payload['parts'][1]['bbox']['minX'], 6.0, places=2)
+
+    def test_local_job_request_loads_machine_config_after_server_restart(self):
+        """An already-open wizard may submit before the restarted server renders a page."""
+        part = _square_dxf_bytes(1.0)
+        with patch.dict(os.environ, {'PENGUINCAM_LOCAL_MODE': '1'}):
+            resp = self._post_job(
+                parts=[{'file_index': 0, 'name': 'plate', 'place_x': 0,
+                        'place_y': 0, 'rotation': 0}],
+                files={'file_0': part},
+            )
+        self.assertEqual(resp.status_code, 200, resp.get_data(as_text=True))
+        gcode = resp.get_json()['gcode']
+        self.assertIn('(Machine: STEPCRAFT D.600)', gcode)
+        self.assertIn('(Units: Millimeters - G21)', gcode)
+        self.assertRegex(gcode, r'(?m)^G21\b')
+        self.assertNotRegex(gcode, r'(?m)^G20\b')
 
     def test_overlap_rejected(self):
         a, b = _square_dxf_bytes(4.0), _square_dxf_bytes(4.0)

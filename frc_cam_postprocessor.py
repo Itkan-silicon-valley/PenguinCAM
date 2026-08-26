@@ -51,6 +51,75 @@ class PostProcessorResult:
         }
 
 
+def _normalize_gcode_comment(line: str) -> str:
+    """Convert a legacy inline ``;`` comment to an RS274/UCCNC comment.
+
+    UCCNC defines comments with round brackets and reserves semicolons for other
+    parser syntax. Only a semicolon outside an existing comment and preceded by
+    whitespace is treated as a legacy comment marker, so expression separators
+    such as ``atan[1;2]`` remain untouched.
+    """
+    depth = 0
+    for index, char in enumerate(line):
+        if char == '(':
+            depth += 1
+        elif char == ')' and depth:
+            depth -= 1
+        elif char == ';' and depth == 0 and index > 0 and line[index - 1].isspace():
+            code = line[:index].rstrip()
+            comment = line[index + 1:].strip().replace('(', '- ').replace(')', '')
+            return f"{code} ({comment})" if comment else code
+    return line
+
+
+_GCODE_LENGTH_OR_FEED_WORD = re.compile(
+    r"(?<![A-Za-z])([XYZIJKRF])\s*([-+]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+))",
+    re.IGNORECASE,
+)
+
+
+def _convert_gcode_line_units(line: str, source_units: str, output_units: str) -> str:
+    """Convert executable motion words without changing PenguinCAM's internal geometry.
+
+    PenguinCAM is inch-native: DXF geometry, UI inputs, presets, and configuration lengths
+    remain inches. A metric UCCNC profile can request ``output_units='mm'`` so the final NC
+    uses G21 and millimeter X/Y/Z/I/J/K/R/F words. Non-length words such as G, M, S, P, and
+    H are intentionally unchanged.
+    """
+    if source_units == output_units:
+        return line
+    if (source_units, output_units) != ('inch', 'mm'):
+        raise ValueError(f"Unsupported G-code unit conversion: {source_units} to {output_units}")
+
+    if line.startswith('(Units:'):
+        return re.sub(r"Units:\s*Inches(?:\s*-\s*G20)?", "Units: Millimeters - G21", line)
+
+    comment_start = line.find('(')
+    code = line if comment_start < 0 else line[:comment_start]
+    comment = '' if comment_start < 0 else line[comment_start:]
+
+    code = re.sub(r"(?<![A-Za-z])G20(?![0-9.])", "G21", code, flags=re.IGNORECASE)
+
+    def scale_word(match):
+        letter = match.group(1).upper()
+        value = float(match.group(2)) * 25.4
+        decimals = 1 if letter == 'F' else 4
+        return f"{letter}{value:.{decimals}f}"
+
+    code = _GCODE_LENGTH_OR_FEED_WORD.sub(scale_word, code)
+    if comment.strip() == '(Inches)':
+        comment = '(Millimeters)'
+    return code.rstrip() + ((' ' + comment) if code.rstrip() and comment else comment)
+
+
+def _join_gcode(lines: List[str], source_units: str = 'inch', output_units: str = None) -> str:
+    """Serialize generated lines with portable comments and optional metric NC output."""
+    output_units = output_units or source_units
+    normalized = (_normalize_gcode_comment(line) for line in lines)
+    return '\n'.join(_convert_gcode_line_units(line, source_units, output_units)
+                     for line in normalized)
+
+
 # Material presets based on team 6238 feeds/speeds document
 MATERIAL_PRESETS = {
     'plywood': {
@@ -152,6 +221,10 @@ class FRCPostProcessor:
         self.tool_diameter = tool_diameter
         self.tool_radius = tool_diameter / 2
         self.units = units
+        # An explicit machine setting may translate the serialized NC program (for example,
+        # inch-native CAM geometry to G21 for a metric UCCNC profile). Configurations without
+        # that setting retain the caller's established output units.
+        self.output_units = config.machine_gcode_units or units
 
         # Corner slowdown for contour-parallel pocket clearing. At a sharp interior corner the
         # cutter wraps around two edges at once, so its engagement (and cutting force) spikes
@@ -267,11 +340,15 @@ class FRCPostProcessor:
             self.feed_rate = preset['feed_rate'] * 25.4
             self.ramp_feed_rate = preset['ramp_feed_rate'] * 25.4
             self.plunge_rate = preset['plunge_rate'] * 25.4
+            self.traverse_rate = preset['traverse_rate'] * 25.4
+            self.approach_rate = preset['approach_rate'] * 25.4
             self.ramp_start_clearance = preset['ramp_start_clearance'] * 25.4
         else:
             self.feed_rate = preset['feed_rate']
             self.ramp_feed_rate = preset['ramp_feed_rate']
             self.plunge_rate = preset['plunge_rate']
+            self.traverse_rate = preset['traverse_rate']
+            self.approach_rate = preset['approach_rate']
             self.ramp_start_clearance = preset['ramp_start_clearance']
 
         self.spindle_speed = preset['spindle_speed']
@@ -1519,7 +1596,7 @@ class FRCPostProcessor:
         # Return result
         return PostProcessorResult(
             success=True,
-            gcode='\n'.join(gcode),
+            gcode=_join_gcode(gcode, self.units, self.output_units),
             filename=filename,
             warnings=warnings,
             stats={
@@ -2569,7 +2646,7 @@ class FRCPostProcessor:
 
         return PostProcessorResult(
             success=True,
-            gcode='\n'.join(gcode),
+            gcode=_join_gcode(gcode, self.units, self.output_units),
             filename=filename,
             warnings=warnings,
             stats={
@@ -4681,7 +4758,7 @@ class FRCPostProcessor:
         # Return result
         return PostProcessorResult(
             success=True,
-            gcode='\n'.join(gcode),
+            gcode=_join_gcode(gcode, self.units, self.output_units),
             filename=filename,
             warnings=[],
             stats={
@@ -5004,7 +5081,7 @@ class FRCPostProcessor:
         # Return result
         return PostProcessorResult(
             success=True,
-            gcode='\n'.join(gcode),
+            gcode=_join_gcode(gcode, self.units, self.output_units),
             filename=filename,
             warnings=[],
             stats={
@@ -5564,7 +5641,7 @@ def assemble_job_gcode(part_jobs, header_pp, timestamp=None, suggested_filename=
 
     return PostProcessorResult(
         success=True,
-        gcode='\n'.join(gcode),
+        gcode=_join_gcode(gcode, header_pp.units, header_pp.output_units),
         filename=filename,
         stats={
             'num_parts': len(part_jobs),

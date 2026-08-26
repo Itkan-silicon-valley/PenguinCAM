@@ -501,6 +501,12 @@ def _active_team_config():
     session; otherwise Team 6238 defaults. Single resolver so the compute endpoints agree
     with what the page rendered. Note: only the upload flow ever sets `upload_config_data`,
     so an Onshape user (who never hits /session/config) transparently keeps their config."""
+    # A browser tab can survive a local-server restart while its Flask session cannot. In
+    # that case /process-job may be the first request to reach the new server, without a
+    # fresh page render to populate upload_config_data. Resolve the local YAML here as well
+    # so every compute route uses the configured machine even from an already-open tab.
+    if is_local_mode() and not session.get('upload_config_data'):
+        load_local_team_config_into_session()
     if session.get('upload_config_data'):
         return TeamConfig.from_dict(session['upload_config_data'])
     return TeamConfig.from_dict(session.get('team_config_data', {}))

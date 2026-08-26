@@ -16,11 +16,83 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from frc_cam_postprocessor import (
     FRCPostProcessor, MATERIAL_PRESETS, assemble_job_gcode, validate_job_layout,
-    sanitize_filename_base, build_output_filename,
+    sanitize_filename_base, build_output_filename, _normalize_gcode_comment,
+    _convert_gcode_line_units, _join_gcode,
 )
 from team_config import TeamConfig, parse_length, DEFAULT_TOOL_DIAMETER_IN
 from onshape_integration import OnshapeClient
+from gcode_sim import parse_header_metadata
 
+
+class TestGcodeCommentCompatibility(unittest.TestCase):
+    def test_legacy_inline_comment_becomes_parenthesized(self):
+        self.assertEqual(
+            _normalize_gcode_comment('S18000 M3  ; Spindle on at 18000 RPM'),
+            'S18000 M3 (Spindle on at 18000 RPM)',
+        )
+
+    def test_existing_parenthesized_comment_is_unchanged(self):
+        line = 'G1 X1.0 (keep ; inside comment)'
+        self.assertEqual(_normalize_gcode_comment(line), line)
+
+    def test_expression_semicolon_is_not_treated_as_comment(self):
+        line = '#1=atan[1;2]'
+        self.assertEqual(_normalize_gcode_comment(line), line)
+
+
+class TestMetricGcodeExport(unittest.TestCase):
+    def test_motion_and_feed_words_convert_but_modes_spindle_and_dwell_do_not(self):
+        source = [
+            'G20  ; Inches',
+            'G1 X1.0000 Y-2.0000 Z0.5000 I0.1000 J-0.2000 F10.0',
+            'G4 P2',
+            'S18000 M3',
+        ]
+        metric = _join_gcode(source, 'inch', 'mm')
+        self.assertIn('G21 (Millimeters)', metric)
+        self.assertIn('X25.4000 Y-50.8000 Z12.7000 I2.5400 J-5.0800 F254.0', metric)
+        self.assertIn('G4 P2', metric)
+        self.assertIn('S18000 M3', metric)
+        self.assertNotIn('G20', metric)
+
+    def test_metric_output_setting_is_machine_specific_and_otherwise_preserves_input(self):
+        self.assertIsNone(TeamConfig().machine_gcode_units)
+        self.assertEqual(FRCPostProcessor(0.25, 0.125, units='mm').output_units, 'mm')
+        config = TeamConfig({
+            'version': 2,
+            'default_machine': 'test',
+            'machines': {'test': {'machine': {'gcode_units': 'mm'}}},
+        })
+        self.assertEqual(config.machine_gcode_units, 'mm')
+        self.assertEqual(FRCPostProcessor(0.25, 0.125, config=config).output_units, 'mm')
+
+    def test_simulator_converts_imperial_header_dimensions_for_g21_program(self):
+        metadata = parse_header_metadata('\n'.join([
+            '(Units: Millimeters - G21)',
+            '(Material: Acetal - 0.1181" thick)',
+            '(Material top: Z=0.1181")',
+            '(Tool: 0.125" diam Flat End Mill)',
+            'G21',
+        ]))
+        self.assertEqual(metadata['units'], 'mm')
+        self.assertAlmostEqual(metadata['material_thickness'], 2.99974, places=5)
+        self.assertAlmostEqual(metadata['material_top'], 2.99974, places=5)
+        self.assertAlmostEqual(metadata['tool_diameter'], 3.175, places=5)
+
+    def test_material_preset_applies_configured_traverse_and_approach_rates(self):
+        config = TeamConfig({
+            'version': 2,
+            'default_machine': 'test',
+            'machines': {'test': {
+                'materials': {'acetal': {
+                    'name': 'Acetal', 'traverse_rate': 90.0, 'approach_rate': 15.0,
+                }},
+            }},
+        })
+        pp = FRCPostProcessor(3 / 25.4, 0.125, units='inch', config=config)
+        pp.apply_material_preset('acetal')
+        self.assertEqual(pp.traverse_rate, 90.0)
+        self.assertEqual(pp.approach_rate, 15.0)
 
 class TestControllerPortability(unittest.TestCase):
     """Default output is G54-only work-coordinate (portable to GRBL/Easel/WinCNC); the
@@ -56,7 +128,7 @@ class TestControllerPortability(unittest.TestCase):
     def test_coolant_opt_in(self):
         g = self._flat_gcode(self._cfg(coolant='Air'))
         self.assertIn('M7', g)                           # air/mist coolant on
-        self.assertIn('M9  ; Coolant off', g)
+        self.assertIn('M9 (Coolant off)', g)
         self.assertNotIn('G53', g)                       # coolant doesn't bring back G53
 
     def test_flood_coolant_uses_m8(self):
@@ -123,8 +195,8 @@ machining:
         # The rapid comes right before the first plunge feed...
         self.assertLess(rapid_i, approach_i)
         # ...and it rapids to the clearance plane (retract_height), which is below safe Z (4.0).
-        self.assertIn(f'G0 Z{retract:.4f}  ; Rapid down to clearance plane', g)
-        self.assertIn('G0 Z4.0000  ; Safe Z clearance', g)
+        self.assertIn(f'G0 Z{retract:.4f} (Rapid down to clearance plane)', g)
+        self.assertIn('G0 Z4.0000 (Safe Z clearance)', g)
         self.assertLess(retract, 4.0)
 
 

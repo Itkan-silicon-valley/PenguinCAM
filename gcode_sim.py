@@ -49,26 +49,37 @@ def parse_header_metadata(text):
 
     m = re.search(r"\(Units:\s*(\w+)", text, re.IGNORECASE)
     if m:
-        meta["units"] = "mm" if m.group(1).lower().startswith("mm") else "inch"
+        unit_label = m.group(1).lower()
+        meta["units"] = "mm" if unit_label.startswith(('mm', 'mill')) else "inch"
     elif re.search(r"^\s*G21\b", text, re.MULTILINE):
         meta["units"] = "mm"
     elif re.search(r"^\s*G20\b", text, re.MULTILINE):
         meta["units"] = "inch"
 
-    m = re.search(r"\(Material:.*?([\d.]+)\"?\s*thick", text, re.IGNORECASE)
-    if m:
-        meta["material_thickness"] = float(m.group(1))
+    def in_program_units(value, suffix):
+        """Convert an explicitly labeled header length into the program's units."""
+        value = float(value)
+        suffix = (suffix or '').lower()
+        if suffix == '"' and meta.get('units') == 'mm':
+            return value * 25.4
+        if suffix == 'mm' and meta.get('units') == 'inch':
+            return value / 25.4
+        return value
 
-    m = re.search(r"\(\s*Material top:\s*Z=([\d.\-]+)", text, re.IGNORECASE)
+    m = re.search(r"\(Material:.*?([\d.]+)\s*(\"|mm)?\s*thick", text, re.IGNORECASE)
     if m:
-        meta["material_top"] = float(m.group(1))
+        meta["material_thickness"] = in_program_units(m.group(1), m.group(2))
+
+    m = re.search(r"\(\s*Material top:\s*Z=([\d.\-]+)\s*(\"|mm)?", text, re.IGNORECASE)
+    if m:
+        meta["material_top"] = in_program_units(m.group(1), m.group(2))
 
     # Accept both the flat header "(Tool: 0.15748" diam Flat End Mill)" and the
     # tube header "( Tool: 0.157" end mill )" - just grab the first number after
     # "Tool:".
-    m = re.search(r"\(\s*Tool:\s*([\d.]+)", text, re.IGNORECASE)
+    m = re.search(r"\(\s*Tool:\s*([\d.]+)\s*(\"|mm)?", text, re.IGNORECASE)
     if m:
-        meta["tool_diameter"] = float(m.group(1))
+        meta["tool_diameter"] = in_program_units(m.group(1), m.group(2))
 
     return meta
 

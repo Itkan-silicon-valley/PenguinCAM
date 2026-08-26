@@ -238,7 +238,7 @@ class TestTubeFacingGeneration(unittest.TestCase):
             with open(output_path) as f:
                 content = f.read()
             # Work-coordinate safe Z (above the full tube: tube_height + 0.25 = 1.25")
-            self.assertIn("G0 Z1.2500  ; Safe Z clearance", content)
+            self.assertIn("G0 Z1.2500 (Safe Z clearance)", content)
             # No machine-coordinate moves by default (portable to GRBL/Easel/WinCNC)
             self.assertNotIn("G53", content)
             self.assertNotIn("G28", content)
@@ -296,7 +296,7 @@ class TestTubeFacingGeneration(unittest.TestCase):
         """With no tube WCS configured, tube ops run in G54 (operator zeros it per tube) -
         portable, with no G55 and no WCS-reset noise."""
         content = self.pp.generate_tube_facing_gcode(tube_size='1x1').gcode
-        self.assertIn("G54  ; Work coordinate system, zeroed at the tube origin", content)
+        self.assertIn("G54 (Work coordinate system, zeroed at the tube origin)", content)
         self.assertNotIn("G55", content)
         self.assertIn("Zero G54 at the tube origin", content)   # setup instruction matches
         # Never switched away from G54, so there is no "reset" line.
@@ -309,9 +309,9 @@ class TestTubeFacingGeneration(unittest.TestCase):
             'name': 'Mach', 'machine': {'tube_work_coordinate_system': 'G55'}}}})
         pp = FRCPostProcessor(0.25, 0.157, config=cfg)
         content = pp.generate_tube_facing_gcode(tube_size='1x1').gcode
-        self.assertIn("G55  ; Use fixed jig work coordinate system", content)
+        self.assertIn("G55 (Use fixed jig work coordinate system)", content)
         self.assertIn("Verify G55 is set to the fixed jig origin", content)
-        self.assertIn("G54  ; Reset to standard work coordinate system", content)
+        self.assertIn("G54 (Reset to standard work coordinate system)", content)
 
     def test_tube_wcs_invalid_falls_back_to_g54(self):
         """An out-of-range WCS value falls back to the safe G54 default rather than emitting
@@ -321,7 +321,7 @@ class TestTubeFacingGeneration(unittest.TestCase):
         pp = FRCPostProcessor(0.25, 0.157, config=cfg)
         content = pp.generate_tube_facing_gcode(tube_size='1x1').gcode
         self.assertNotIn("G99", content)
-        self.assertIn("G54  ; Work coordinate system, zeroed at the tube origin", content)
+        self.assertIn("G54 (Work coordinate system, zeroed at the tube origin)", content)
 
     def test_safe_z_before_xy_pattern(self):
         """The work-coordinate safe-Z retract precedes the first XY origin move."""
@@ -331,7 +331,7 @@ class TestTubeFacingGeneration(unittest.TestCase):
             self._generate_tube_gcode_to_file(output_path, '1x1')
             with open(output_path) as f:
                 content = f.read()
-            z_idx = content.find("G0 Z1.2500  ; Safe Z clearance")
+            z_idx = content.find("G0 Z1.2500 (Safe Z clearance)")
             xy_idx = content.find("G0 X0 Y0")
             self.assertGreaterEqual(z_idx, 0)
             self.assertGreater(xy_idx, z_idx)   # safe Z comes before the XY origin move

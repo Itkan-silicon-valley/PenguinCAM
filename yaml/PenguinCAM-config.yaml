@@ -18,13 +18,16 @@ machines:
       manufacturer: "STEPCRAFT"
       model: "D.600"
       controller: "UCCNC"
+      # Keep PenguinCAM's inch-native UI/presets, but emit G21 metric NC for the
+      # active Stepcraft2_Model600 UCCNC profile.
+      gcode_units: "mm"
 
-      # STEPCRAFT 600 working travel: 420 x 600 x 140 mm
-      # Converted to inches: 16.54 x 23.62 x 5.51
+      # Controller-safe travel from the active UCCNC profile: 417 x 597 x 137 mm
+      # Rounded down in inches so CAM bounds stay inside the configured soft limits.
       dimensions:
-        x_max: 16.54
-        y_max: 23.62
-        z_max: 5.51
+        x_max: 16.41
+        y_max: 23.50
+        z_max: 5.39
 
       park_position:
         x: 0.5
@@ -35,8 +38,38 @@ machines:
       tube_jig_work_offset: "G55"
       coolant: "None"
 
+    # Tool inventory is retained in the team configuration for setup checks and
+    # operator handoff. PenguinCAM currently consumes only default_tool.diameter;
+    # named-tool selection is not yet implemented in the GUI.
+    tool_inventory:
+      amana_51454:
+        name: "Amana Tool 51454"
+        description: "Single O-flute upcut cutter with the more rigid 1/4 in shank"
+        manufacturer: "Amana Tool"
+        part_number: "51454"
+        diameter: 0.125
+        shank_diameter: 0.250
+        cutting_length: 0.500
+        flutes: 1
+        flute_geometry: "O-flute"
+        cut_direction: "upcut"
+
+      amana_51459:
+        name: "Amana Tool 51459"
+        description: "Single O-flute upcut cutter; requires a dedicated 1/8 in ER11 collet"
+        manufacturer: "Amana Tool"
+        part_number: "51459"
+        diameter: 0.125
+        shank_diameter: 0.125
+        cutting_length: 0.500
+        overall_length: 2.000
+        flutes: 1
+        flute_geometry: "O-flute"
+        cut_direction: "upcut"
+
     default_tool:
-      diameter: 0.0625   # 1/16 inch end mill
+      inventory_id: "amana_51459"
+      diameter: 0.125   # Amana 51459: 1/8 in cutting diameter and 1/8 in shank
 
     machining:
       z_reference:
@@ -70,6 +103,24 @@ machines:
       arc_radius: 0.030
 
     materials:
+      acetal:
+        name: "Acetal - Delrin - POM"
+        description: "Conservative 3 mm sheet profile for Amana 51454 or 51459, 1/8 in single O-flute upcut"
+        spindle_speed: 18000
+        feed_rate: 45.0
+        ramp_feed_rate: 28.0
+        plunge_rate: 8.0
+        traverse_rate: 90.0
+        approach_rate: 15.0
+        ramp_angle: 6.0
+        ramp_start_clearance: 0.060
+        stepover_percentage: 0.40
+        helix_radius_multiplier: 0.60
+        max_slotting_depth: 0.060
+        peck_drill_depth: 0.060
+        tab_width: 0.20
+        tab_height: 0.04
+
       polycarbonate:
         name: "Polycarbonate"
         description: "Conservative STEPCRAFT D.600 profile for 1/8 in FTC plates"

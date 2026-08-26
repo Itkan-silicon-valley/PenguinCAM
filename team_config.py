@@ -433,6 +433,15 @@ class TeamConfig:
         return self._get('machine', 'controller')
 
     @property
+    def machine_gcode_units(self) -> Optional[str]:
+        """Requested final NC units, or ``None`` to preserve the CAM input units."""
+        configured = self._get('machine', 'gcode_units', default=None)
+        if configured is None:
+            return None
+        value = str(configured).strip().lower()
+        return 'mm' if value in {'mm', 'metric', 'millimeter', 'millimeters'} else 'inch'
+
+    @property
     def machine_park_x(self) -> float:
         """Machine park X position (machine coordinates)"""
         return self._get('machine', 'park_position', 'x')
