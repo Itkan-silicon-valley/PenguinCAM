@@ -42,3 +42,5 @@ test_output_*.nc
 
 # ...but never ignore test fixtures/goldens under tests/
 !tests/**
+tests/**/__pycache__/
+tests/**/*.pyc
