@@ -271,6 +271,98 @@ class TestLengthParsing(unittest.TestCase):
         self.assertEqual(d['default_tool_diameter_text'], '4mm')
 
 
+class TestMultiMachineConfig(unittest.TestCase):
+    """A v2 config's SELECTED machine must drive every setting, not just its materials.
+
+    Regression: TeamConfig._get() used to hardcode the default machine, so a team with two
+    machines got machine 1's tabs/pockets/z_reference/park settings no matter which machine
+    they picked - only feeds/speeds followed the selection."""
+
+    # m1: no tabs, never contour interior cutouts. m2: tabs, contour above the threshold.
+    TWO_MACHINES = {
+        'version': 2,
+        'default_machine': 'm1',
+        'machines': {
+            'm1': {
+                'name': 'Router One',
+                'machine': {'name': 'Router One', 'dimensions': {'x_max': 24.0, 'y_max': 24.0}},
+                'machining': {'tabs': {'enabled': False, 'remove_tabs': False},
+                              'pockets': {'contour_threshold': 0}},
+            },
+            'm2': {
+                'name': 'Router Two',
+                'machine': {'name': 'Router Two', 'dimensions': {'x_max': 48.0, 'y_max': 96.0}},
+                'machining': {'tabs': {'enabled': True, 'remove_tabs': True},
+                              'pockets': {'contour_threshold': 510}},
+            },
+        },
+    }
+
+    def _part_gcode(self, config):
+        """6x6 plate with a 3" through-hole, cut with a 1/8" tool: big enough to land above
+        m2's contour threshold, so the two machines take visibly different strategies."""
+        pp = FRCPostProcessor(0.25, 0.125, config=config)
+        pp.apply_material_preset('plywood')
+        pp.circles = [{'center': (3.0, 3.0), 'diameter': 3.0}]
+        pp.polylines = [[(0, 0), (6, 0), (6, 6), (0, 6), (0, 0)]]
+        pp.identify_perimeter_and_pockets()
+        pp.classify_holes()
+        result = pp.generate_gcode()
+        self.assertTrue(result.success, f"G-code generation failed: {result.errors}")
+        return result.gcode
+
+    def test_unbound_config_uses_default_machine(self):
+        cfg = TeamConfig(self.TWO_MACHINES)
+        self.assertEqual(cfg.active_machine_id, 'm1')
+        self.assertFalse(cfg.tabs_enabled)
+        self.assertEqual(cfg.machine_name, 'Router One')
+
+    def test_settings_follow_the_selected_machine(self):
+        cfg = TeamConfig(self.TWO_MACHINES).for_machine('m2')
+        self.assertEqual(cfg.active_machine_id, 'm2')
+        self.assertTrue(cfg.tabs_enabled)
+        self.assertTrue(cfg.remove_tabs)
+        self.assertEqual(cfg._get('machining', 'pockets', 'contour_threshold'), 510)
+        self.assertEqual(cfg.machine_name, 'Router Two')
+        self.assertEqual(cfg.machine_x_max, 48.0)
+
+    def test_binding_does_not_mutate_the_original(self):
+        cfg = TeamConfig(self.TWO_MACHINES)
+        bound = cfg.for_machine('m2')
+        self.assertTrue(bound.tabs_enabled)
+        self.assertFalse(cfg.tabs_enabled, "binding must not affect the shared instance")
+        self.assertIs(cfg.for_machine(None), cfg)
+
+    def test_unknown_machine_falls_back_to_default(self):
+        cfg = TeamConfig(self.TWO_MACHINES).for_machine('nope')
+        self.assertEqual(cfg.active_machine_id, 'm1')
+        self.assertFalse(cfg.tabs_enabled)
+
+    def test_missing_or_dangling_default_machine_uses_first_machine(self):
+        # Without this fallback the id resolves to a nonexistent key and EVERY setting
+        # silently reverts to the built-in Team 6238 defaults.
+        for bad in ({}, {'default_machine': 'ghost'}):
+            data = {'version': 2, 'machines': self.TWO_MACHINES['machines'], **bad}
+            cfg = TeamConfig(data)
+            self.assertEqual(cfg.default_machine_id, 'm1')
+            self.assertEqual(cfg.machine_name, 'Router One')
+
+    def test_selected_machine_drives_tabs_and_contouring_in_gcode(self):
+        """End-to-end: the same part on both machines must produce different G-code."""
+        cfg = TeamConfig(self.TWO_MACHINES)
+
+        m1 = self._part_gcode(cfg)
+        self.assertIn('PERIMETER (NO TABS)', m1)
+        self.assertIn('Tabs disabled', m1)
+        self.assertNotIn('CONTOUR ONLY', m1)  # threshold 0 -> always fully clear
+
+        m2 = self._part_gcode(cfg.for_machine('m2'))
+        self.assertIn('PERIMETER WITH TABS', m2)
+        self.assertIn('CONTOUR ONLY', m2)     # 3" hole exceeds the threshold
+        self.assertIn('TAB REMOVAL PASS', m2)
+        self.assertIn('Machine: Router Two', m2)
+
+
 class TestLowLevelUtilities(unittest.TestCase):
     """Minimal tests for low-level utilities - just verify they work"""
 

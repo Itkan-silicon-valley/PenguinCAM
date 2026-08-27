@@ -436,16 +436,23 @@ def _maybe_refresh_team_config():
         session['team_config_fetched_at'] = time.time()
 
 
-def _active_team_config():
+def _active_team_config(machine_id=None):
     """The TeamConfig that applies to the current COMPUTE request (/process, /process-job,
     /part-outline). Upload-supplied config (from the anonymous flow's POST /session/config)
     takes precedence when present; otherwise the Onshape classroom config cached in the
     session; otherwise Team 6238 defaults. Single resolver so the compute endpoints agree
     with what the page rendered. Note: only the upload flow ever sets `upload_config_data`,
-    so an Onshape user (who never hits /session/config) transparently keeps their config."""
+    so an Onshape user (who never hits /session/config) transparently keeps their config.
+
+    `machine_id` binds the returned config to the machine the job selected, so ALL of that
+    machine's settings apply (tabs, pockets, z_reference, park, coolant, bed size, ...) --
+    not just its materials. Falls back to the session's machine, then the config's default,
+    so a request that omits machine_id still matches what the page rendered."""
     if session.get('upload_config_data'):
-        return TeamConfig.from_dict(session['upload_config_data'])
-    return TeamConfig.from_dict(session.get('team_config_data', {}))
+        config = TeamConfig.from_dict(session['upload_config_data'])
+    else:
+        config = TeamConfig.from_dict(session.get('team_config_data', {}))
+    return config.for_machine(machine_id or session.get('machine_id'))
 
 
 def _app_template_context(force_defaults=False):
@@ -468,10 +475,14 @@ def _app_template_context(force_defaults=False):
     else:
         team_config_data = session.get('team_config_data', {})
         using_default = session.get('using_default_config', False)
-    team_config = TeamConfig(team_config_data)
+    # Bind to the session's machine so this context reflects the same machine the compute
+    # endpoints will use. active_machine_id resolves a stale/unknown session id back to the
+    # default machine, so a config edit that renames machines can't leave the page pointing
+    # at a machine that no longer exists.
+    team_config = TeamConfig(team_config_data).for_machine(session.get('machine_id'))
 
     machines = team_config.get_available_machines()
-    current_machine_id = session.get('machine_id', team_config.default_machine_id)
+    current_machine_id = team_config.active_machine_id
 
     team_config_dict = team_config.to_dict(current_machine_id)
     drive_enabled = team_config_dict.get('google_drive_enabled', False)
@@ -931,8 +942,8 @@ def process_file():
         log(f"🚀 Running post-processor API...")
 
         # Get the team config that applies to this request (upload-supplied, Onshape, or
-        # defaults). Single resolver so /process matches what the page rendered.
-        team_config = _active_team_config()
+        # defaults), bound to the selected machine so its full settings apply.
+        team_config = _active_team_config(machine_id)
         log(f"📋 Using team config: {team_config}")
         log(f"🔍 DEBUG: TeamConfig internals: team={team_config.team_number}, name={team_config.team_name}")
 
@@ -1171,7 +1182,7 @@ def process_job():
             f.save(p)
             saved_paths[idx] = p
 
-        team_config = _active_team_config()
+        team_config = _active_team_config(machine_id)
         user_name = session.get('user_name')
         machine_x = team_config.machine_x_max
         machine_y = team_config.machine_y_max
@@ -2006,9 +2017,11 @@ def set_machine():
         if not machine_id:
             return jsonify({'error': 'No machine_id provided'}), 400
 
-        # Verify machine exists in config
-        team_config_data = session.get('team_config_data', {})
-        team_config = TeamConfig(team_config_data)
+        # Verify machine exists in config. Uses the same resolver as the compute endpoints
+        # so the anonymous upload flow (whose config lives in `upload_config_data`) can
+        # switch machines too -- reading only `team_config_data` here rejected every machine
+        # in that flow, and the client fire-and-forgets this call, so the 400 was silent.
+        team_config = _active_team_config()
         machines = team_config.get_available_machines()
 
         if machine_id not in machines:

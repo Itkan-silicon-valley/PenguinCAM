@@ -203,6 +203,30 @@ def validate_and_sanitize_config(yaml_text, strict=True):
     if version not in (1, 2):
         return _fail(f"Unsupported configuration version: {version}. Supported versions are 1 and 2.")
 
+    if version == 2:
+        machines = data.get('machines')
+        if not isinstance(machines, dict) or not machines:
+            return _fail("A version 2 configuration needs a 'machines:' section with at "
+                         "least one machine defined under it.")
+
     warnings = []
     _walk(data, '', warnings, strict)
+
+    # Runs AFTER _walk so the comparison uses the sanitized `default_machine` value (machine
+    # ids are dict keys and aren't sanitized, so an id containing parentheses would otherwise
+    # stop matching its own key here). A missing or dangling `default_machine` is the
+    # difference between "my settings apply" and "every setting silently reverts to the
+    # built-in defaults", so repair it to the first machine listed and say so.
+    if version == 2:
+        machines = data['machines']
+        default_machine = data.get('default_machine')
+        if default_machine not in machines:
+            first = next(iter(machines))
+            if default_machine is None:
+                warnings.append(f"No 'default_machine' was set; using '{first}'.")
+            else:
+                warnings.append(f"'default_machine' refers to an undefined machine "
+                                f"'{default_machine}'; using '{first}' instead.")
+            data['default_machine'] = first
+
     return data, warnings

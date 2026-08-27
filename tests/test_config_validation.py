@@ -54,6 +54,53 @@ class TestConfigValidation(unittest.TestCase):
         with self.assertRaises(ConfigValidationError):
             validate_and_sanitize_config(payload)
 
+    def test_v2_requires_a_machines_section(self):
+        with self.assertRaises(ConfigValidationError):
+            validate_and_sanitize_config('version: 2\nteam:\n  number: 1\n')
+        with self.assertRaises(ConfigValidationError):
+            validate_and_sanitize_config('version: 2\nmachines: {}\n')
+
+    def test_v2_missing_default_machine_is_repaired(self):
+        # Left alone, a dangling/absent default_machine makes EVERY setting fall back to
+        # the built-in defaults - which reads to a team as "my config is being ignored".
+        yaml_text = ('version: 2\n'
+                     'machines:\n'
+                     '  router:\n'
+                     '    name: Router\n'
+                     '    machine:\n'
+                     '      name: Router 4896\n'
+                     '  plasma:\n'
+                     '    name: Plasma\n'
+                     '    machine:\n'
+                     '      name: Plasma 510\n')
+        data, warnings = validate_and_sanitize_config(yaml_text)
+        self.assertEqual(data['default_machine'], 'router')
+        self.assertTrue(any('default_machine' in w for w in warnings))
+        # The repaired config resolves to a real machine instead of the built-in defaults.
+        self.assertEqual(TeamConfig(data).machine_name, 'Router 4896')
+
+    def test_v2_dangling_default_machine_is_repaired(self):
+        yaml_text = ('version: 2\n'
+                     'default_machine: ghost\n'
+                     'machines:\n'
+                     '  router:\n'
+                     '    name: Router\n')
+        data, warnings = validate_and_sanitize_config(yaml_text)
+        self.assertEqual(data['default_machine'], 'router')
+        self.assertTrue(any('ghost' in w for w in warnings))
+
+    def test_v2_valid_default_machine_is_left_alone(self):
+        yaml_text = ('version: 2\n'
+                     'default_machine: plasma\n'
+                     'machines:\n'
+                     '  router:\n'
+                     '    name: Router\n'
+                     '  plasma:\n'
+                     '    name: Plasma\n')
+        data, warnings = validate_and_sanitize_config(yaml_text)
+        self.assertEqual(data['default_machine'], 'plasma')
+        self.assertEqual(warnings, [])
+
     def test_parens_stripped_from_strings(self):
         data, warnings = validate_and_sanitize_config('machine:\n  name: "Router (v2) (fast)"\n')
         self.assertNotIn('(', data['machine']['name'])
