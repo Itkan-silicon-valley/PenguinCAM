@@ -42,6 +42,32 @@ machines:
     # operator handoff. PenguinCAM currently consumes only default_tool.diameter;
     # named-tool selection is not yet implemented in the GUI.
     tool_inventory:
+      amana_51404:
+        name: "Amana Tool 51404"
+        description: "Plastic-cutting solid-carbide single O-flute upcut cutter"
+        manufacturer: "Amana Tool"
+        part_number: "51404"
+        diameter: 0.250
+        shank_diameter: 0.250
+        cutting_length: 0.750
+        overall_length: 2.000
+        flutes: 1
+        flute_geometry: "O-flute"
+        cut_direction: "upcut"
+
+      amana_51411:
+        name: "Amana Tool 51411"
+        description: "Plastic-cutting solid-carbide single O-flute upcut cutter with 1/4 in shank"
+        manufacturer: "Amana Tool"
+        part_number: "51411"
+        diameter: 0.125
+        shank_diameter: 0.250
+        cutting_length: 0.500
+        overall_length: 2.000
+        flutes: 1
+        flute_geometry: "O-flute"
+        cut_direction: "upcut"
+
       amana_51454:
         name: "Amana Tool 51454"
         description: "Single O-flute upcut cutter with the more rigid 1/4 in shank"
@@ -68,8 +94,8 @@ machines:
         cut_direction: "upcut"
 
     default_tool:
-      inventory_id: "amana_51459"
-      diameter: 0.125   # Amana 51459: 1/8 in cutting diameter and 1/8 in shank
+      inventory_id: "amana_51411"
+      diameter: 0.125   # Amana 51411: 1/8 in cutting diameter and 1/4 in shank
 
     machining:
       z_reference:
@@ -105,16 +131,16 @@ machines:
     materials:
       acetal:
         name: "Acetal - Delrin - POM"
-        description: "Conservative 3 mm sheet profile for Amana 51454 or 51459, 1/8 in single O-flute upcut"
+        description: "Conservative 3 mm sheet profile for Amana 51411, 1/8 in single O-flute upcut"
         spindle_speed: 18000
-        feed_rate: 45.0
-        ramp_feed_rate: 28.0
-        plunge_rate: 8.0
+        feed_rate: 75.0
+        ramp_feed_rate: 35.0
+        plunge_rate: 10.0
         traverse_rate: 90.0
         approach_rate: 15.0
         ramp_angle: 6.0
         ramp_start_clearance: 0.060
-        stepover_percentage: 0.40
+        stepover_percentage: 0.35
         helix_radius_multiplier: 0.60
         max_slotting_depth: 0.060
         peck_drill_depth: 0.060
